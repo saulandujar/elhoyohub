@@ -44,6 +44,7 @@ local config = {
 	key = "RightShift",
 	notify = true,
 	scale = 1,
+	hubUrl = "https://raw.githubusercontent.com/saulandujar/elhoyohub/refs/heads/main/ElHoyoHub.lua", -- para Autoexec
 }
 pcall(function()
 	if isfile and readfile and isfile(CONFIG_FILE) then
@@ -1142,19 +1143,6 @@ local function useCompass(compass)
 	clickMouse()
 end
 
-local function goTreasure()
-	local compass = findCompass()
-	local target = compass and compass:GetAttribute("TreasureTarget")
-	local hrp = getHRP()
-	if not (target and hrp) then return end
-	if (hrp.Position - target).Magnitude > 10 then
-		teleport(target + Vector3.new(0, 3, 0))
-		log(T("Sam: llevado al tesoro", "Sam: taken to the treasure"))
-		task.wait(0.5)
-	end
-	useCompass(compass)
-end
-
 local function tryClaim()
 	local npc = merchant("QuestMerchant2") -- "Quest Man"
 	if npc then
@@ -1167,64 +1155,114 @@ local function tryClaim()
 	task.wait(0.5)
 end
 
--- Sitio donde estabas antes de que Auto Sam te moviera; al terminar te devuelve ahí
-local samReturn
+-- Antes del primer viaje se apunta dónde estabas y qué arma tenías en la mano; al terminar te devuelve
+-- ahí (o a la zona segura) y te vuelve a poner esa arma (si estaba Auto Click, sigue atacando con ella).
+local samReturn, samPrevTool
+local function samRemember()
+	local hrp, char = getHRP(), player.Character
+	if samReturn or not hrp then return end
+	samReturn = hrp.CFrame
+	local tool = char and char:FindFirstChildOfClass("Tool")
+	samPrevTool = tool and tool.Name ~= "Compass" and tool or nil
+end
+
 local function samGoBack()
 	if samReturn then
 		returnTo(samReturn) -- a la zona segura si está activa
+		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if hum then
+			if samPrevTool and samPrevTool.Parent == player:FindFirstChild("Backpack") then
+				hum:EquipTool(samPrevTool)
+			elseif not samPrevTool then
+				hum:UnequipTools() -- no llevabas nada: guardar el compass
+			end
+		end
 		log(T("Sam: de vuelta a donde estabas", "Sam: back where you were"))
 	end
-	samReturn = nil
+	samReturn, samPrevTool = nil, nil
 	releaseMove("Sam")
+end
+
+-- Va al tesoro, usa el compass y espera a que se gaste (o cambie de destino) como mucho 4 s.
+-- Si tras 3 visitas el mismo destino sigue ahí, se deja ese destino para no ir y volver sin fin.
+local triesOnTarget, lastTarget = 0, nil
+local function goTreasure()
+	local compass = findCompass()
+	local target = compass and compass:GetAttribute("TreasureTarget")
+	if not target then return end
+	if target ~= lastTarget then triesOnTarget, lastTarget = 0, target end
+	if triesOnTarget >= 3 then return end
+	triesOnTarget += 1
+	teleport(target + Vector3.new(0, 3, 0))
+	log(T("Sam: llevado al tesoro", "Sam: taken to the treasure"))
+	task.wait(0.5)
+	useCompass(compass)
+	local t0 = os.clock()
+	while os.clock() - t0 < 4 do
+		local c = findCompass()
+		if not c or c:GetAttribute("TreasureTarget") ~= target then break end
+		task.wait(0.2)
+	end
+	local c = findCompass()
+	if not c then
+		log(T("Sam: compass reclamado", "Sam: compass claimed"), "ok", true)
+	elseif c:GetAttribute("TreasureTarget") ~= target then
+		log(T("Sam: el compass marca un destino nuevo", "Sam: the compass points to a new place"))
+	elseif triesOnTarget >= 3 then
+		log(T("Sam: no consigo reclamar este tesoro, lo dejo", "Sam: can't claim this treasure, giving up on it"), "warn")
+	end
+	samGoBack() -- siempre de vuelta tras usarlo; si hay destino nuevo, el siguiente ciclo vuelve a ir
 end
 
 toggle(pageAuto, "Auto Sam (compass)", function(on)
 	autoSam = on
 	if not on then samGoBack() end
 	log("Auto Sam " .. (on and "ON" or "OFF"))
-end, L("Cuando el compass está listo, va a Quest Man, lo reclama, te lleva al tesoro, lo usa y te devuelve a donde estabas.",
-	"When the compass is ready, goes to Quest Man, claims it, takes you to the treasure, uses it and brings you back."))
+end, L("Cuando el compass está listo, va a Quest Man, lo reclama, te lleva al tesoro, lo usa y te devuelve a donde estabas con el arma que tenías.",
+	"When the compass is ready, goes to Quest Man, claims it, takes you to the treasure, uses it and brings you back with the weapon you had."))
 
 local lastTry = -math.huge
-local hadCompass = false
 task.spawn(function()
 	while alive do
 		task.wait(1)
 		if autoSam then
-			local has = findCompass() ~= nil
-			if hadCompass and not has then
-				log(T("Sam: compass reclamado", "Sam: compass claimed"), "ok", true)
-				samGoBack()
-			end
-			hadCompass = has
+			local compass = findCompass()
+			local pending = compass and (compass:GetAttribute("TreasureTarget") ~= lastTarget or triesOnTarget < 3)
 			-- CompassTokenAt = hora del servidor a la que estará el siguiente compass
 			local now = workspace:GetServerTimeNow()
 			local token = player:GetAttribute("CompassTokenAt")
 			local waiting = type(token) == "number" and token > now
-			local mustClaim = not has and not waiting and now - lastTry >= SAM_EVERY
-			if (has or mustClaim) and claimMove("Sam") then
-				local hrp = getHRP()
-				if not samReturn and hrp then samReturn = hrp.CFrame end -- antes del primer viaje
+			local mustClaim = not compass and not waiting and now - lastTry >= SAM_EVERY
+			if (pending or mustClaim) and claimMove("Sam") then
+				samRemember()
 				if mustClaim then
 					lastTry = now
 					tryClaim()
 				end
-				goTreasure()
-				if not findCompass() then samGoBack() end -- no se pudo reclamar: volver igualmente
-			elseif not has and not samReturn then
-				releaseMove("Sam")
+				if findCompass() then
+					goTreasure()
+				else
+					samGoBack() -- no se pudo reclamar: volver igualmente
+				end
 			end
 		end
 	end
 end)
-
 end
 
 ------------------------------------------------------------------ Auto Chest
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
-local CHEST_WAIT = 1
+-- Velocidad elegible. "wait": tras teletransportarte, para que el servidor vea que estás al lado; "stay":
+-- cuánto se queda insistiendo (toca y clica cada 0,25 s) hasta que el cofre desaparezca. A muy rápido casi
+-- no se cogen; los que sigan ahí al acabar la ronda se reintentan en la siguiente.
+local CHEST_SPEEDS = {
+	{ name = L("Rápido", "Fast"), wait = 0.1, stay = 0.3 },
+	{ name = "Normal", wait = 0.25, stay = 1.2 },
+	{ name = L("Seguro", "Safe"), wait = 0.4, stay = 2.5 },
+}
+config.chestSpeed = math.clamp(tonumber(config.chestSpeed) or 2, 1, #CHEST_SPEEDS)
 local autoChest = false
-local tried = setmetatable({}, { __mode = "k" })
+local tried = setmetatable({}, { __mode = "k" }) -- cofres ya intentados en esta ronda
 
 local function chests()
 	local inst = workspace:FindFirstChild("Instances")
@@ -1246,96 +1284,91 @@ local function nextChest()
 	return best, left
 end
 
--- Algunos cofres no se abrían: antes se probaba una vez, 3 studs por encima, y se pasaba al siguiente.
--- Ahora te pone justo encima (las piernas lo tocan), toca todas sus piezas con todo tu cuerpo, espera a que
--- desaparezca y lo reintenta hasta 3 veces. Devuelve true si el cofre ya no está.
--- Toca todas las piezas del cofre con todas las partes de tu cuerpo y espera a que desaparezca
-local function touchChest(chest)
-	local char = player.Character
-	for _, d in chest:GetDescendants() do
-		if d:IsA("BasePart") and firetouchinterest and char then
-			for _, limb in char:GetChildren() do
-				if limb:IsA("BasePart") then
-					firetouchinterest(limb, d, 0)
-					firetouchinterest(limb, d, 1)
-				end
-			end
-		elseif d:IsA("ClickDetector") and fireclickdetector then
-			fireclickdetector(d)
-		elseif d:IsA("ProximityPrompt") and fireproximityprompt then
-			fireproximityprompt(d)
-		end
+-- Un cofre se abre con su ClickDetector (EscaneoCofre: MaxActivationDistance = 10). No tiene toques ni
+-- señales propias (EspiaRemotes no vio nada al abrirlo a mano), así que hay que estar a menos de 10 studs.
+local function clickChest(chest)
+	local cd = chest:FindFirstChildWhichIsA("ClickDetector", true)
+	if not cd then return end
+	if fireclickdetector then
+		if not pcall(fireclickdetector, cd, 0) then pcall(fireclickdetector, cd) end -- según el executor
+		return
 	end
-	local t0 = os.clock()
-	while chest.Parent and os.clock() - t0 < CHEST_WAIT do task.wait(0.1) end
+	-- Sin fireclickdetector: clic real sobre el cofre si se ve en pantalla
+	local p, onScreen = workspace.CurrentCamera:WorldToViewportPoint(chest:GetPivot().Position)
+	if onScreen then
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+	end
 end
 
--- Los cofres son del servidor: no se pueden traer de verdad. Lo más parecido es "tocarlos" desde donde
--- estás (firetouchinterest a distancia); si el servidor no lo acepta, se va al cofre como siempre.
-local chestFromHere = false
-
--- Algunos cofres no se abrían: antes se probaba una vez, 3 studs por encima, y se pasaba al siguiente.
--- Ahora te pone justo encima (las piernas lo tocan), toca todas sus piezas con todo tu cuerpo, espera a que
--- desaparezca y lo reintenta hasta 3 veces. Devuelve true si el cofre ya no está.
 local function openChest(chest)
 	tried[chest] = true
-	if chestFromHere and firetouchinterest then
-		touchChest(chest)
-		if not chest.Parent then return true end
-	end
-	for attempt = 1, 3 do
-		if not chest.Parent then return true end
-		teleport(chest:GetPivot().Position + Vector3.new(0, 1.5 + attempt * 0.5, 0))
+	local speed = CHEST_SPEEDS[config.chestSpeed]
+	teleport(chest:GetPivot().Position + Vector3.new(0, 3, 0)) -- dentro de los 10 studs del clic
+	task.wait(speed.wait) -- que el servidor vea que estás al lado antes de clicar
+	local t0 = os.clock()
+	repeat
+		clickChest(chest)
 		task.wait(0.25)
-		touchChest(chest)
-	end
-	return not chest.Parent
+	until not chest.Parent or os.clock() - t0 >= speed.stay
 end
 
 toggle(pageAuto, "Auto Chest", function(on)
 	autoChest = on
 	if not on then releaseMove("Chest") end
 	log("Auto Chest " .. (on and "ON" or "OFF"))
-end, L("Recorre los cofres del mapa del más cercano al más lejano y los abre.",
-	"Goes through the chests on the map from nearest to farthest and opens them."))
+end, L("Recorre los cofres del mapa del más cercano al más lejano y los abre lo más rápido posible.",
+	"Goes through the chests on the map from nearest to farthest and opens them as fast as possible."))
 
-toggle(pageAuto, L("Chest sin moverte (beta)", "Chest without moving (beta)"), function(on)
-	chestFromHere = on
-	if on and not firetouchinterest then
-		log(T("Tu executor no tiene firetouchinterest: no se puede", "Your executor doesn't have firetouchinterest: can't do it"), "warn")
-	end
-end, L("Auto Chest intenta abrir cada cofre desde donde estás, sin ir. Si el juego no lo acepta, va al cofre como siempre.",
-	"Auto Chest tries to open each chest from where you are, without going. If the game doesn't accept it, it goes to the chest as usual."))
+-- Velocidad de Auto Chest (chips: solo uno marcado)
+local speedGrid = grid(pageAuto, "chip")
+local speedChips = {}
+for i, sp in CHEST_SPEEDS do
+	speedChips[i] = chip(speedGrid, sp.name, function()
+		config.chestSpeed = i
+		saveConfig()
+		for j, c in speedChips do c.set(j == i) end
+	end, L("Velocidad de Auto Chest. Si se salta muchos cofres, usa una más lenta.", "Auto Chest speed. If it skips many chests, use a slower one."))
+	speedChips[i].set(i == config.chestSpeed)
+end
 
 local chestStart -- dónde estabas antes de empezar la ronda de cofres
-local opened, failed = 0, 0
+local attempted = {} -- cofres visitados en esta ronda (para contar cuántos se abrieron)
 task.spawn(function()
 	while alive do
-		task.wait(0.5)
-		if autoChest then
-			local chest, left = nextChest()
+		if not autoChest then
+			task.wait(0.5)
+		else
+			local chest = nextChest()
 			if chest and claimMove("Chest") then
 				local hrp = getHRP()
 				if not chestStart and hrp then chestStart = hrp.CFrame end
-				log(T("Chest: abriendo (quedan ", "Chest: opening (") .. left .. T(")", " left)"))
-				if openChest(chest) then opened += 1 else failed += 1 end
-				if safePart then goSafe() end -- entre cofres, esperar en la zona segura (menos tiempo a la vista)
+				table.insert(attempted, chest)
+				openChest(chest)
 				releaseMove("Chest") -- se suelta en cada cofre para que Sam pueda colarse entre medias
-			elseif not chest then
-				if chestStart or opened + failed > 0 then
-					returnTo(chestStart)
-					log(T("Chest: ronda terminada, abiertos ", "Chest: round finished, opened ") .. opened
-						.. T(", sin abrir ", ", not opened ") .. failed, opened > 0 and "ok" or "info", opened > 0)
+			elseif chest then
+				task.wait(0.2) -- otra función te está moviendo
+			else
+				-- Fin de ronda: contar, volver y empezar otra
+				local opened = 0
+				for _, c in attempted do
+					if not c.Parent then opened += 1 end
 				end
-				chestStart, opened, failed = nil, 0, 0
+				if #attempted > 0 then
+					returnTo(chestStart)
+					log(T("Chest: ronda terminada, abiertos ", "Chest: round finished, opened ") .. opened .. "/" .. #attempted,
+						opened > 0 and "ok" or "info", opened > 0)
+				end
 				releaseMove("Chest")
-				table.clear(tried) -- los que no se abrieron se reintentan en la siguiente ronda
-				task.wait(10)
+				table.clear(tried)
+				-- Sin cofres: esperar a que aparezcan. Si ninguno se abrió, no machacar al servidor.
+				task.wait(#attempted == 0 and 5 or opened == 0 and 3 or 0.3)
+				chestStart = nil
+				table.clear(attempted)
 			end
 		end
 	end
 end)
-
 end
 
 ------------------------------------------------------------------ Auto Gifts
@@ -1929,6 +1962,37 @@ fpsToggle = toggle(pageMisc, L("Desbloquear FPS", "Unlock FPS"), function(on)
 	setfpscap(on and 999 or 60)
 	log(on and T("FPS desbloqueados", "FPS unlocked") or T("FPS a 60", "FPS capped at 60"))
 end, L("Quita el límite de 60 FPS. Al apagarlo vuelve a 60.", "Removes the 60 FPS limit. Turning it off goes back to 60."))
+
+-- Auto Respawn: al morir pide reaparecer con CharacterService.RF.RequestSpawn(), igual que el botón del juego
+-- (grabado: sin argumentos, devuelve true si te deja). Justo al morir el servidor aún no deja y devuelve
+-- false, así que se reintenta cada segundo hasta que acepta o ya tienes personaje nuevo (máx. 30 s).
+local respawnRemote = getRemote("CharacterService", "RF", "RequestSpawn")
+local autoRespawn = false
+local function watchDeath(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	hum.Died:Connect(function()
+		local t0 = os.clock()
+		while alive and autoRespawn and player.Character == char and os.clock() - t0 < 30 do
+			task.wait(1)
+			local ok, accepted = call(respawnRemote, "InvokeServer")
+			if ok and accepted then
+				log(T("Auto Respawn: reapareciendo", "Auto Respawn: respawning"), "ok")
+				return
+			end
+		end
+		if alive and autoRespawn and player.Character == char then
+			log(T("Auto Respawn: el servidor no me ha dejado reaparecer en 30 s", "Auto Respawn: the server didn't let me respawn in 30 s"), "warn")
+		end
+	end)
+end
+if player.Character then task.spawn(watchDeath, player.Character) end
+table.insert(cleanup, player.CharacterAdded:Connect(watchDeath))
+toggle(pageMisc, "Auto Respawn", function(on)
+	autoRespawn = on
+	log("Auto Respawn " .. (on and "ON" or "OFF"))
+end, L("Al morir, reapareces enseguida. Con la zona segura activa, vuelves a ella.",
+	"When you die, you respawn right away. With the safe zone on, you go back to it."))
 
 button(pageMisc, L("Copiar mi posición", "Copy my position"), function()
 	local hrp = getHRP()
