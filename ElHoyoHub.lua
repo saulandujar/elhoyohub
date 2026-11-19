@@ -1504,6 +1504,14 @@ local function placeNamed(text)
 	end
 end
 
+-- El paquete es una Tool "Package" con el atributo DeliveryTarget (Vector3 del destino)
+local function heldPackage()
+	for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
+		local p = holder and holder:FindFirstChild("Package")
+		if p and typeof(p:GetAttribute("DeliveryTarget")) == "Vector3" then return p end
+	end
+end
+
 local function merlinRound()
 	local merlin, hrp = findMerlin(), getHRP()
 	if not (merlin and hrp) then
@@ -1511,58 +1519,60 @@ local function merlinRound()
 		return false
 	end
 	if not merlinStart then merlinStart = hrp.CFrame end
-	teleport(merlin:GetPivot().Position + Vector3.new(0, 3, 4))
-	task.wait(0.6)
-
-	-- Mientras se coge el paquete, apuntar qué aparece en el mapa y en la pantalla
-	local before = allAttrs()
-	local appeared = {}
-	local watch = {
-		workspace.DescendantAdded:Connect(function(d)
-			local alive = workspace:FindFirstChild("Alive")
-			if not (alive and d:IsDescendantOf(alive)) and #appeared < 40 then table.insert(appeared, d) end
-		end),
-	}
-	local ok, took = call(takeRemote, "InvokeServer")
-	if not (ok and took) then
-		for _, c in watch do c:Disconnect() end
-		log(T("Merlin: no me da paquete (", "Merlin: no package (") .. tostring(took) .. ")")
-		return false
-	end
-	task.wait(1.5)
-	for _, c in watch do c:Disconnect() end
-
-	-- 0) Lo confirmado (EscaneoPersonaje con el paquete encima): el paquete es una Tool "Package" con el atributo
-	--    DeliveryTarget = Vector3 del destino (en esa prueba, el comprador de frutas al lado de Sam). Puede tardar
-	--    un poco en llegar al inventario.
+	-- ¿Ya lo llevabas (de antes del hub o de una vuelta que falló)? Merlin no da otro: se entrega ese.
+	local package = heldPackage()
 	local dest, how
-	local package
-	local t0 = os.clock()
-	repeat
-		for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
-			local p = holder and holder:FindFirstChild("Package")
-			if p and typeof(p:GetAttribute("DeliveryTarget")) == "Vector3" then package = p end
-		end
-		if not package then task.wait(0.2) end
-	until package or os.clock() - t0 > 3
-	if package then dest, how = package:GetAttribute("DeliveryTarget"), "Package@DeliveryTarget" end
+	if package then
+		dest, how = package:GetAttribute("DeliveryTarget"), T("paquete que ya tenías", "package you already had")
+	else
+		teleport(merlin:GetPivot().Position + Vector3.new(0, 3, 4))
+		task.wait(0.6)
 
-	-- 1) Si no: un dato nuevo o cambiado (una posición, o el nombre de un NPC o de una isla)
-	for k, v in allAttrs() do
-		if before[k] ~= v then
-			log("Merlin: " .. T("dato nuevo ", "new data ") .. k .. " = " .. tostring(v))
-			if not dest and typeof(v) == "Vector3" then dest, how = v, k end
-			if not dest and placeNamed(v) then dest, how = placeNamed(v), k .. " (" .. v .. ")" end
+		-- Mientras se coge el paquete, apuntar qué aparece en el mapa y en la pantalla
+		local before = allAttrs()
+		local appeared = {}
+		local watch = {
+			workspace.DescendantAdded:Connect(function(d)
+				local alive = workspace:FindFirstChild("Alive")
+				if not (alive and d:IsDescendantOf(alive)) and #appeared < 40 then table.insert(appeared, d) end
+			end),
+		}
+		local ok, took = call(takeRemote, "InvokeServer")
+		if not (ok and took) then
+			for _, c in watch do c:Disconnect() end
+			log(T("Merlin: no me da paquete (", "Merlin: no package (") .. tostring(took) .. ")")
+			return false
 		end
-	end
-	-- 2) Algo que haya aparecido en el mapa con pinta de marca de entrega
-	for _, d in appeared do
-		local n = d.Name:lower()
-		local looksLikeMarker = n:find("package") or n:find("deliver") or n:find("merlin") or n:find("marker")
-			or n:find("waypoint") or n:find("beacon") or n:find("target") or n:find("drop")
-		if looksLikeMarker then
-			log("Merlin: " .. T("apareció ", "appeared ") .. d:GetFullName() .. " [" .. d.ClassName .. "]")
-			if not dest and (d:IsA("BasePart") or d:IsA("Model")) then dest, how = d:GetPivot().Position, d:GetFullName() end
+		task.wait(1.5)
+		for _, c in watch do c:Disconnect() end
+
+		-- 0) Lo confirmado (EscaneoPersonaje con el paquete encima): el paquete es una Tool "Package" con el atributo
+		--    DeliveryTarget = Vector3 del destino (en esa prueba, el comprador de frutas al lado de Sam). Puede tardar
+		--    un poco en llegar al inventario.
+		local t0 = os.clock()
+		repeat
+			package = heldPackage()
+			if not package then task.wait(0.2) end
+		until package or os.clock() - t0 > 3
+		if package then dest, how = package:GetAttribute("DeliveryTarget"), "Package@DeliveryTarget" end
+
+		-- 1) Si no: un dato nuevo o cambiado (una posición, o el nombre de un NPC o de una isla)
+		for k, v in allAttrs() do
+			if before[k] ~= v then
+				log("Merlin: " .. T("dato nuevo ", "new data ") .. k .. " = " .. tostring(v))
+				if not dest and typeof(v) == "Vector3" then dest, how = v, k end
+				if not dest and placeNamed(v) then dest, how = placeNamed(v), k .. " (" .. v .. ")" end
+			end
+		end
+		-- 2) Algo que haya aparecido en el mapa con pinta de marca de entrega
+		for _, d in appeared do
+			local n = d.Name:lower()
+			local looksLikeMarker = n:find("package") or n:find("deliver") or n:find("merlin") or n:find("marker")
+				or n:find("waypoint") or n:find("beacon") or n:find("target") or n:find("drop")
+			if looksLikeMarker then
+				log("Merlin: " .. T("apareció ", "appeared ") .. d:GetFullName() .. " [" .. d.ClassName .. "]")
+				if not dest and (d:IsA("BasePart") or d:IsA("Model")) then dest, how = d:GetPivot().Position, d:GetFullName() end
+			end
 		end
 	end
 	if not dest then
@@ -1600,7 +1610,7 @@ task.spawn(function()
 	while alive do
 		task.wait(1)
 		local cooldown = player:GetAttribute("MerlinCooldownEnd") -- hora del servidor en la que Merlin vuelve a dar paquete
-		local waiting = type(cooldown) == "number" and cooldown > workspace:GetServerTimeNow()
+		local waiting = type(cooldown) == "number" and cooldown > workspace:GetServerTimeNow() and not heldPackage()
 		if autoMerlin and not waiting and claimMove("Merlin") then
 			local ok, delivered = pcall(merlinRound)
 			if not ok then log("Merlin: error " .. tostring(delivered), "error") end
@@ -2258,9 +2268,10 @@ for _, island in islands do
 end
 
 -- Mapa visto desde arriba: cada isla es un círculo en su X/Z (tamaño según la isla); clic = teletransporte.
--- El punto rojo eres tú.
+-- Rueda = zoom hacia el ratón, arrastrar = mover. Los nombres solo salen si caben sin pisarse (primero las
+-- islas grandes), así al acercar van apareciendo más. El punto rojo eres tú.
 do
-	local MAP_H, PAD = 440, 34
+	local MAP_H, PAD, MAX_ZOOM = 440, 34, 6
 	local W = mapBox.flow.rw
 	local frame = Instance.new("Frame")
 	frame.Position = UDim2.fromOffset(mapBox.flow.x, mapBox.flow.y)
@@ -2268,10 +2279,23 @@ do
 	frame.BackgroundColor3 = C.bg
 	frame.BorderSizePixel = 0
 	frame.ClipsDescendants = true
+	frame.Active = true
 	frame.Parent = mapBox.flow.parent
 	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 4)
 	Instance.new("UIStroke", frame).Color = C.line
 	mapBox:advance(MAP_H)
+
+	local hint = Instance.new("TextLabel")
+	hint.Position = UDim2.fromOffset(8, MAP_H - 18)
+	hint.Size = UDim2.fromOffset(W - 16, 12)
+	hint.BackgroundTransparency = 1
+	hint.Font = FONT_SEMI
+	hint.TextSize = 10
+	hint.TextColor3 = C.dim
+	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.Text = T("Rueda: zoom · arrastrar: mover · clic en una isla: ir", "Wheel: zoom · drag: move · click an island: go")
+	hint.ZIndex = 6
+	hint.Parent = frame
 
 	local points = {}
 	local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
@@ -2280,23 +2304,47 @@ do
 		if target then
 			local p = target:GetPivot().Position
 			local ok, size = pcall(function() return island:IsA("Model") and island:GetExtentsSize() or target.Size end)
-			table.insert(points, { island = island, pos = p, size = ok and size or Vector3.zero })
+			size = ok and size or Vector3.zero
+			table.insert(points, { island = island, pos = p, size = math.max(size.X, size.Z) })
 			minX, maxX = math.min(minX, p.X), math.max(maxX, p.X)
 			minZ, maxZ = math.min(minZ, p.Z), math.max(maxZ, p.Z)
 		end
 	end
+	table.sort(points, function(a, b) return a.size > b.size end) -- prioridad de nombre: las grandes primero
 	local scale = math.min((W - 2 * PAD) / math.max(maxX - minX, 1), (MAP_H - 2 * PAD) / math.max(maxZ - minZ, 1))
 	local offX = (W - (maxX - minX) * scale) / 2
 	local offY = (MAP_H - (maxZ - minZ) * scale) / 2
-	local function toMap(p) return (p.X - minX) * scale + offX, (p.Z - minZ) * scale + offY end
+	local zoom, panX, panY = 1, 0, 0
+	local function toMap(p)
+		local bx, by = (p.X - minX) * scale + offX, (p.Z - minZ) * scale + offY
+		return (bx - W / 2) * zoom + W / 2 + panX, (by - MAP_H / 2) * zoom + MAP_H / 2 + panY
+	end
+
+	local hovered
+	local function layout()
+		-- que el mapa no se salga del marco
+		panX = math.clamp(panX, -(zoom - 1) * W / 2, (zoom - 1) * W / 2)
+		panY = math.clamp(panY, -(zoom - 1) * MAP_H / 2, (zoom - 1) * MAP_H / 2)
+		local shown = {}
+		for _, pt in points do
+			local x, y = toMap(pt.pos)
+			local d = math.clamp(pt.size * scale * zoom, 12, 90)
+			pt.dot.Position, pt.dot.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(d, d)
+			local ly = y + d / 2 + 2
+			pt.label.Position = UDim2.fromOffset(x, ly)
+			local w = pt.label.TextBounds.X + 8
+			local fits = true
+			for _, o in shown do
+				if math.abs(o.x - x) < (o.w + w) / 2 and math.abs(o.y - ly) < 13 then fits = false break end
+			end
+			if fits then table.insert(shown, { x = x, y = ly, w = w }) end
+			pt.label.Visible = fits or pt == hovered
+		end
+	end
 
 	for _, pt in points do
-		local x, y = toMap(pt.pos)
-		local d = math.clamp(math.max(pt.size.X, pt.size.Z) * scale, 12, 46)
 		local dot = Instance.new("TextButton")
 		dot.AnchorPoint = Vector2.new(0.5, 0.5)
-		dot.Position = UDim2.fromOffset(x, y)
-		dot.Size = UDim2.fromOffset(d, d)
 		dot.BackgroundColor3 = C.surface
 		dot.Text = ""
 		dot.AutoButtonColor = false
@@ -2307,18 +2355,57 @@ do
 		ring.Thickness = 1.5
 		local label = Instance.new("TextLabel")
 		label.AnchorPoint = Vector2.new(0.5, 0)
-		label.Position = UDim2.fromOffset(x, y + d / 2 + 2)
-		label.Size = UDim2.fromOffset(110, 12)
+		label.Size = UDim2.fromOffset(120, 12)
 		label.BackgroundTransparency = 1
 		label.Font = FONT_SEMI
 		label.TextSize = 10
 		label.TextColor3 = C.dim
-		label.Text = islandName(pt.island) -- shortcut: los nombres pueden solaparse si dos islas están muy juntas
+		label.Text = islandName(pt.island)
+		label.ZIndex = 2
 		label.Parent = frame
-		dot.MouseEnter:Connect(function() ring.Color, label.TextColor3 = C.accent, C.text end)
-		dot.MouseLeave:Connect(function() ring.Color, label.TextColor3 = C.line, C.dim end)
+		pt.dot, pt.label = dot, label
+		dot.MouseEnter:Connect(function()
+			hovered = pt
+			ring.Color, label.TextColor3, label.ZIndex = C.accent, C.text, 4
+			layout()
+		end)
+		dot.MouseLeave:Connect(function()
+			if hovered == pt then hovered = nil end
+			ring.Color, label.TextColor3, label.ZIndex = C.line, C.dim, 2
+			layout()
+		end)
 		dot.MouseButton1Click:Connect(function() goIsland(pt.island) end)
 	end
+
+	-- Zoom con la rueda, manteniendo fijo el punto bajo el ratón
+	frame.InputChanged:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+		local newZoom = math.clamp(zoom * (input.Position.Z > 0 and 1.25 or 0.8), 1, MAX_ZOOM)
+		local mx = input.Position.X - frame.AbsolutePosition.X
+		local my = input.Position.Y - frame.AbsolutePosition.Y
+		panX = mx - W / 2 - (mx - W / 2 - panX) * newZoom / zoom
+		panY = my - MAP_H / 2 - (my - MAP_H / 2 - panY) * newZoom / zoom
+		zoom = newZoom
+		layout()
+	end)
+	-- Arrastrar para moverse (empezando en el fondo, no en una isla)
+	local dragFrom
+	frame.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragFrom = { x = input.Position.X, y = input.Position.Y, px = panX, py = panY }
+		end
+	end)
+	table.insert(cleanup, UIS.InputChanged:Connect(function(input)
+		if dragFrom and input.UserInputType == Enum.UserInputType.MouseMovement then
+			panX = dragFrom.px + input.Position.X - dragFrom.x
+			panY = dragFrom.py + input.Position.Y - dragFrom.y
+			layout()
+		end
+	end))
+	table.insert(cleanup, UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragFrom = nil end
+	end))
+	task.defer(layout) -- TextBounds ya calculado
 
 	local me = Instance.new("Frame")
 	me.AnchorPoint = Vector2.new(0.5, 0.5)
