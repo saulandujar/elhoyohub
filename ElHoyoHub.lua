@@ -2582,7 +2582,7 @@ end
 --    Dan una fruta como Tool ("Banana", "Prickly Pear").
 --  * Exprimidor: Workspace.Map.Other.Tent2.Model.JuicingBowl (Bowl, Mixer1, Mixer2; ClickDetector 10 studs).
 --    Sale la Tool "<fruta> Juice" ("Banana Juice", "Sour Juice").
---  * Beber: con el zumo en la mano, PlayerGui.Drink tiene DrinkOne y DrinkAll ("Drink all (n)").
+--  * Beber: en la mano y clic, uno a uno (la pantalla Drink con "Drink all" es la del bar, no de estos zumos).
 -- Exprimidor (confirmado por el usuario): un clic y a los pocos segundos da los zumos de todas las frutas.
 -- Sin confirmar: si se nota un barril vacío.
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
@@ -2691,35 +2691,34 @@ local function makeJuice()
 	log(T("Auto Stats: exprimidas ", "Auto Stats: juiced ") .. (count - left) .. T(" frutas", " fruits"))
 end
 
+-- Los zumos se beben como cualquier Tool: en la mano y clic (confirmado por el usuario; no tienen "Drink all").
+-- Se beben uno tras otro sin esperas, para que todos los efectos estén activos a la vez.
 local function drinkAll()
 	local hum = humanoid()
 	if not hum then return end
-	local done = {}
+	local drank, failed = 0, 0
 	for _, d in tools() do
-		if isDrink(d) and not done[d.Name] and d.Parent then
-			done[d.Name] = true
+		if not autoStats then break end
+		if isDrink(d) and d.Parent then
 			hum:EquipTool(d)
-			-- con el zumo en la mano aparece PlayerGui.Drink con "Drink all"
-			local btn
+			task.wait(0.25)
+			d:Activate()
 			local t0 = os.clock()
-			repeat
-				local gui = player.PlayerGui:FindFirstChild("Drink")
-				local frame = gui and gui:FindFirstChild("Drink")
-				local actions = frame and frame.Visible and frame:FindFirstChild("Actions")
-				btn = actions and actions:FindFirstChild("DrinkAll")
-				if not btn then task.wait(0.1) end
-			until btn or os.clock() - t0 > 2
-			if btn then
-				task.wait(0.2)
-				pressGuiButton(btn)
-				task.wait(0.8)
-				log(T("Auto Stats: bebidos todos los ", "Auto Stats: drank every ") .. d.Name, "ok", true)
-			else
-				log(T("Auto Stats: no sale el botón Drink all con ", "Auto Stats: no Drink all button with ") .. d.Name, "warn")
+			while d.Parent and os.clock() - t0 < 1.5 do task.wait(0.1) end
+			if d.Parent then
+				clickMouse() -- si Activate no basta, clic real
+				t0 = os.clock()
+				while d.Parent and os.clock() - t0 < 1.5 do task.wait(0.1) end
 			end
+			if d.Parent then failed += 1 else drank += 1 end
 		end
 	end
 	hum:UnequipTools()
+	if drank > 0 then log(T("Auto Stats: bebidos ", "Auto Stats: drank ") .. drank .. T(" zumos", " juices"), "ok", true) end
+	if failed > 0 then
+		log(T("Auto Stats: ", "Auto Stats: ") .. failed .. T(" zumos no se gastaron al clicar (¿se bebe en varios tragos?)",
+			" juices weren't used up by clicking (several sips?)"), "warn")
+	end
 end
 
 section(pageAuto, L("Farmeo", "Farming"))
@@ -2728,8 +2727,8 @@ toggle(pageAuto, "Auto Stats (beta)", function(on)
 	juiceFailed = false
 	if not on then releaseMove("Stats") end
 	log("Auto Stats " .. (on and "ON" or "OFF"))
-end, L("Clica barriles y cajas para sacar frutas normales, las exprime en el puesto de zumos y se bebe todos los zumos de golpe (Drink all).",
-	"Clicks barrels and crates for normal fruits, juices them at the juice stand and drinks every juice at once (Drink all)."))
+end, L("Clica barriles y cajas para sacar frutas normales, las exprime en el puesto de zumos y se bebe todos los zumos seguidos.",
+	"Clicks barrels and crates for normal fruits, juices them at the juice stand and drinks every juice in a row."))
 
 task.spawn(function()
 	while alive do
