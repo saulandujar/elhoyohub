@@ -352,6 +352,7 @@ end
 win:Group(uiText(L("FARMEO", "FARMING")))
 local pageAuto = addTab(L("Automatización", "Automation"), "BOLT")
 local pageTrain = addTab("Train", "FIRE")
+local pageQuest = addTab(L("Misiones", "Quests"), "AWARD")
 local pageFruits = addTab(L("Frutas", "Fruits"), "GEM")
 win:Group(uiText(L("MUNDO", "WORLD")))
 local pageTp = addTab("Teleports", "GLOBE")
@@ -1306,8 +1307,8 @@ local function progressOf(text)
 	return tonumber(have), tonumber(need)
 end
 
-section(pageAuto, L("Combate", "Combat"))
-toggle(pageAuto, "Auto Quest (beta)", function(on)
+section(pageQuest, "Auto Quest")
+toggle(pageQuest, "Auto Quest (beta)", function(on)
 	autoQuest = on
 	if not on then releaseMove("Quest") end
 	log("Auto Quest " .. (on and "ON" or "OFF"))
@@ -1317,7 +1318,7 @@ do
 	local names = {}
 	for i, g in QUEST_GIVERS do names[i] = g.name end
 	config.questGiver = math.clamp(tonumber(config.questGiver) or 4, 1, #QUEST_GIVERS) -- 4 = Farmer Otto
-	combo(pageAuto, L("NPC de misiones", "Quest giver"), names, config.questGiver, function(i)
+	combo(pageQuest, L("NPC de misiones", "Quest giver"), names, config.questGiver, function(i)
 		config.questGiver = i
 		saveConfig()
 	end, L("A quién pide y entrega las misiones Auto Quest.", "Who Auto Quest takes and turns in quests from."))
@@ -1458,7 +1459,6 @@ do -- bloque propio: sus variables no cuentan para el límite de 200 locales del
 -- Merlin es QuestFishMerchant (junto a Farmer Otto). shortcut: no sabemos cómo marca el juego el destino; se busca
 -- como un atributo Vector3 nuevo en el jugador o el personaje tras coger el paquete; si no aparece, se prueba
 -- en el sitio de la grabación. Lo que encuentre sale en la consola para fijarlo.
-local MERLIN_FALLBACK_DEST = Vector3.new(-1253, 214, -1231)
 local takeRemote = getRemote("MerlinService", "RF", "TakePackage")
 local deliverRemote = getRemote("MerlinService", "RF", "Deliver")
 local autoMerlin = false
@@ -1471,54 +1471,100 @@ local function findMerlin()
 	return merchants:FindFirstChild("QuestFishMerchant") -- Merlin: junto a Farmer Otto (QuestFarm)
 end
 
-local function vectorAttrs()
+-- Todos los datos (atributos) del jugador, del personaje y de lo que llevas encima (por si el paquete es un
+-- objeto con el destino dentro).
+local function allAttrs()
 	local out = {}
-	for _, obj in { player, player.Character } do
-		if obj then
-			for k, v in obj:GetAttributes() do
-				if typeof(v) == "Vector3" then out[obj.Name .. "@" .. k] = v end
-			end
+	local function grab(prefix, obj)
+		for k, v in obj:GetAttributes() do out[prefix .. "@" .. k] = v end
+	end
+	grab("Jugador", player)
+	local char = player.Character
+	if char then grab("Personaje", char) end
+	for _, holder in { player:FindFirstChild("Backpack"), char } do
+		for _, t in holder and holder:GetChildren() or {} do
+			if t:IsA("Tool") then grab("Objeto " .. t.Name, t) end
 		end
 	end
 	return out
 end
 
+-- Un nombre de NPC o de isla -> su posición
+local function placeNamed(text)
+	if type(text) ~= "string" then return nil end
+	local npc = merchant(text)
+	if npc then return npc:GetPivot().Position end
+	local map = workspace:FindFirstChild("Map")
+	local islands = map and map:FindFirstChild("Islands")
+	local island = islands and islands:FindFirstChild(text)
+	if island then
+		local target = island:FindFirstChild("QuestBoard") or island:FindFirstChildWhichIsA("BasePart", true)
+		if target then return target:GetPivot().Position end
+	end
+end
+
 local function merlinRound()
 	local merlin, hrp = findMerlin(), getHRP()
 	if not (merlin and hrp) then
-		log(T("Merlin: no encuentro a Merlin en Map.Merchants", "Merlin: can't find Merlin in Map.Merchants"), "warn")
+		log(T("Merlin: no encuentro a Merlin (QuestFishMerchant)", "Merlin: can't find Merlin (QuestFishMerchant)"), "warn")
 		return false
 	end
 	if not merlinStart then merlinStart = hrp.CFrame end
 	teleport(merlin:GetPivot().Position + Vector3.new(0, 3, 4))
 	task.wait(0.6)
-	local before = vectorAttrs()
+
+	-- Mientras se coge el paquete, apuntar qué aparece en el mapa y en la pantalla
+	local before = allAttrs()
+	local appeared = {}
+	local watch = {
+		workspace.DescendantAdded:Connect(function(d)
+			local alive = workspace:FindFirstChild("Alive")
+			if not (alive and d:IsDescendantOf(alive)) and #appeared < 40 then table.insert(appeared, d) end
+		end),
+	}
 	local ok, took = call(takeRemote, "InvokeServer")
 	if not (ok and took) then
+		for _, c in watch do c:Disconnect() end
 		log(T("Merlin: no me da paquete (", "Merlin: no package (") .. tostring(took) .. ")")
 		return false
 	end
-	task.wait(0.5)
-	-- ¿Dónde hay que entregarlo? Un atributo Vector3 nuevo o que haya cambiado
-	local dest, destName
-	for k, v in vectorAttrs() do
-		if before[k] ~= v then dest, destName = v, k end
+	task.wait(1.5)
+	for _, c in watch do c:Disconnect() end
+
+	-- 1) Un dato nuevo o cambiado: una posición, o el nombre de un NPC o de una isla
+	local dest, how
+	for k, v in allAttrs() do
+		if before[k] ~= v then
+			log("Merlin: " .. T("dato nuevo ", "new data ") .. k .. " = " .. tostring(v))
+			if not dest and typeof(v) == "Vector3" then dest, how = v, k end
+			if not dest and placeNamed(v) then dest, how = placeNamed(v), k .. " (" .. v .. ")" end
+		end
 	end
-	if dest then
-		log(T("Merlin: destino en el atributo ", "Merlin: destination in attribute ") .. destName .. " = " .. tostring(dest))
-	else
-		dest = MERLIN_FALLBACK_DEST
-		log(T("Merlin: no veo el destino; pruebo en Pirate's Land", "Merlin: can't see the destination; trying Pirate's Land"), "warn")
+	-- 2) Algo que haya aparecido en el mapa con pinta de marca de entrega
+	for _, d in appeared do
+		local n = d.Name:lower()
+		local looksLikeMarker = n:find("package") or n:find("deliver") or n:find("merlin") or n:find("marker")
+			or n:find("waypoint") or n:find("beacon") or n:find("target") or n:find("drop")
+		if looksLikeMarker then
+			log("Merlin: " .. T("apareció ", "appeared ") .. d:GetFullName() .. " [" .. d.ClassName .. "]")
+			if not dest and (d:IsA("BasePart") or d:IsA("Model")) then dest, how = d:GetPivot().Position, d:GetFullName() end
+		end
 	end
-	teleport(dest + Vector3.new(0, 3, 0))
+	if not dest then
+		log(T("Merlin: tengo el paquete pero no sé dónde entregarlo. Pásame lo de arriba de la consola y EscaneoPersonaje con el paquete encima",
+			"Merlin: I have the package but don't know where to deliver it. Send me the console lines above and EscaneoPersonaje with the package on you"), "warn")
+		return false
+	end
+	log(T("Merlin: destino ", "Merlin: destination ") .. how .. " -> " .. tostring(dest))
+	teleport(dest + Vector3.new(0, 3, 4))
 	task.wait(0.6)
 	local ok2, delivered = call(deliverRemote, "InvokeServer")
 	log(T("Merlin: entrega -> ", "Merlin: delivery -> ") .. tostring(delivered), (ok2 and delivered) and "ok" or "warn", ok2 and delivered)
 	return ok2 and delivered
 end
 
-section(pageAuto, L("Farmeo", "Farming"))
-toggle(pageAuto, "Auto Merlin (beta)", function(on)
+section(pageQuest, "Merlin")
+toggle(pageQuest, "Auto Merlin (beta)", function(on)
 	autoMerlin = on
 	if not on then
 		if merlinStart then returnTo(merlinStart) end
@@ -1948,9 +1994,15 @@ end, L("Desmarca todas las frutas.", "Unselects every fruit."))
 --   vender: junto al comprador (al lado de Sam), con la fruta en la mano, FruitTradeService.RF.GetQuote() ->
 --           { Fruit = "Spin", Rarity = "Common", Beri = 25000, Id = 1, Aura, Rainbow } y luego
 --           FruitTradeService.RF.Sell("Beri", Id) -> true
--- Solo se abren cajas y se venden frutas por DEBAJO de Rare (Common y Uncommon). Nunca se vende una fruta con aura
--- o arcoíris, ni una que el comprador diga que es Rare o mejor.
-local SELL_BELOW = 3 -- rango de Rare: 1 Common, 2 Uncommon, 3 Rare, 4 Ultra Rare
+-- Qué rarezas se venden y qué cajas se abren lo eliges tú (por defecto Common y Uncommon). Se comprueba con lo
+-- que dice el comprador, no solo con el nombre. Nunca se vende una fruta con aura o arcoíris.
+-- Rangos: 1 Common, 2 Uncommon, 3 Rare, 4 Ultra Rare (las listas son de 4 verdaderos/falsos, en ese orden)
+local function rarityList(saved)
+	if type(saved) ~= "table" then return { true, true, false, false } end
+	return { saved[1] == true, saved[2] == true, saved[3] == true, saved[4] == true }
+end
+config.sellRarities = rarityList(config.sellRarities)
+config.boxRarities = rarityList(config.boxRarities)
 local RARITY_RANK = { Common = 1, Uncommon = 2, Rare = 3, ["Ultra Rare"] = 4 }
 local boxOpen = getRemote("FruitBoxService", "RE", "Open")
 local getQuote = getRemote("FruitTradeService", "RF", "GetQuote")
@@ -1998,7 +2050,7 @@ local function openBoxes()
 	local opened = 0
 	for _, tool in myTools() do
 		local rank = boxRank(tool.Name)
-		if rank and rank < SELL_BELOW and hold(tool) then
+		if rank and config.boxRarities[rank] and hold(tool) then
 			call(boxOpen, "FireServer")
 			opened += 1
 			log(T("Cajas: abierta ", "Boxes: opened ") .. tool.Name, "ok", true)
@@ -2012,7 +2064,7 @@ local function fruitsToSell()
 	local list = {}
 	for _, tool in myTools() do
 		local name = fruitOf(tool)
-		if name and not boxRank(tool.Name) and fruitRank[name] < SELL_BELOW then table.insert(list, tool) end
+		if name and not boxRank(tool.Name) and config.sellRarities[fruitRank[name]] then table.insert(list, tool) end
 	end
 	return list
 end
@@ -2034,7 +2086,7 @@ local function sellFruits()
 			local rank = ok and type(quote) == "table" and RARITY_RANK[quote.Rarity]
 			if not rank then
 				log(T("Venta: el comprador no me da precio para ", "Sell: the buyer gives no price for ") .. tool.Name, "warn")
-			elseif rank >= SELL_BELOW or quote.Aura or quote.Rainbow then
+			elseif not config.sellRarities[rank] or quote.Aura or quote.Rainbow then
 				log(T("Venta: no vendo ", "Sell: not selling ") .. tostring(quote.Fruit) .. " (" .. tostring(quote.Rarity) .. ")", "warn")
 			else
 				local sold_ok, sold = call(sellRemote, "InvokeServer", "Beri", quote.Id)
@@ -2056,17 +2108,27 @@ local function sellFruits()
 end
 
 section(pageFruits, L("Cajas y venta", "Boxes and selling"))
-toggle(pageFruits, L("Auto abrir cajas (< Rare)", "Auto open boxes (< Rare)"), function(on)
+local rarityNames = {}
+for rank, r in FRUIT_RARITIES do rarityNames[rank] = r.name end
+toggle(pageFruits, L("Auto abrir cajas", "Auto open boxes"), function(on)
 	autoBoxes = on
 	log(T("Auto abrir cajas ", "Auto open boxes ") .. (on and "ON" or "OFF"))
-end, L("Abre solas las cajas Common y Uncommon que tengas (por ejemplo las que da Sam). Las Rare o mejores no las toca.",
-	"Opens the Common and Uncommon boxes you have (e.g. the ones Sam gives). Rare or better ones are left alone."))
-toggle(pageFruits, L("Auto vender frutas (< Rare)", "Auto sell fruits (< Rare)"), function(on)
+end, L("Abre solas las cajas que tengas (por ejemplo las que da Sam) de las rarezas elegidas abajo.",
+	"Opens the boxes you have (e.g. the ones Sam gives) of the rarities chosen below."))
+multi(pageFruits, L("Cajas que abrir", "Boxes to open"), rarityNames, config.boxRarities, function(chosen)
+	config.boxRarities = rarityList(chosen)
+	saveConfig()
+end, L("Qué rarezas de caja se abren solas.", "Which box rarities are opened automatically."))
+toggle(pageFruits, L("Auto vender frutas", "Auto sell fruits"), function(on)
 	autoSell = on
 	if not on then releaseMove("Sell") end
 	log(T("Auto vender frutas ", "Auto sell fruits ") .. (on and "ON" or "OFF"))
-end, L("Lleva tus frutas Common y Uncommon al comprador que hay al lado de Sam, las vende por Beri y te devuelve. Nunca vende Rare o mejores, ni con aura o arcoíris.",
-	"Takes your Common and Uncommon fruits to the buyer next to Sam, sells them for Beri and brings you back. Never sells Rare or better, or with aura or rainbow."))
+end, L("Lleva tus frutas de las rarezas elegidas abajo al comprador que hay al lado de Sam, las vende por Beri y te devuelve. Nunca vende frutas con aura o arcoíris.",
+	"Takes your fruits of the rarities chosen below to the buyer next to Sam, sells them for Beri and brings you back. Never sells fruits with aura or rainbow."))
+multi(pageFruits, L("Frutas que vender", "Fruits to sell"), rarityNames, config.sellRarities, function(chosen)
+	config.sellRarities = rarityList(chosen)
+	saveConfig()
+end, L("Qué rarezas de fruta se venden. Se comprueba con lo que dice el comprador.", "Which fruit rarities are sold. Checked against what the buyer says."))
 
 task.spawn(function()
 	while alive do
@@ -2105,8 +2167,8 @@ NPCS = {
 	{ name = "Emote Merchant", model = "EmoteMerchant" },
 }
 
-local function npcButtons(list)
-	local g = grid(pageTp)
+local function npcButtons(page, list)
+	local g = grid(page)
 	for _, entry in list do
 		button(g, entry.name, function()
 			local npc = merchant(entry.model)
@@ -2117,9 +2179,11 @@ local function npcButtons(list)
 	end
 end
 section(pageTp, "NPCs")
-npcButtons(NPCS)
-section(pageTp, L("Misiones", "Quest givers"))
-npcButtons(QUEST_GIVERS)
+npcButtons(pageTp, NPCS)
+section(pageQuest, L("Ir a un NPC de misiones", "Go to a quest giver"))
+npcButtons(pageQuest, QUEST_GIVERS)
+section(pageQuest, "Merlin")
+npcButtons(pageQuest, { { name = "Merlin", model = "QuestFishMerchant" } })
 
 -- Nombres de las islas según la wiki del juego (datos.json) y los NPCs que hay en cada una.
 -- Las que no aparecen aquí usan su nombre interno limpio.
@@ -2529,6 +2593,17 @@ section(pageSettings, L("Interfaz", "Interface"))
 note(pageSettings, L("Idioma, tamaño del menú y estilo (tema y color de acento): pulsa tu perfil, abajo a la izquierda. Perfiles con nombre (guardar, cargar, borrar, papelera): arriba, junto al icono de guardar.",
 	"Language, menu size and style (theme and accent colour): click your profile, bottom left. Named presets (save, load, delete, bin): at the top, next to the save icon."))
 
+section(pageSettings, L("Idioma", "Language"))
+button(pageSettings, "Español", function()
+	UI:SetLanguage(1) -- la librería traduce todo y avisa al hub (syncLang)
+	log("Idioma: español", "ok", true)
+end, L("Pone el hub en español.", "Switches the hub to Spanish."))
+button(pageSettings, "English", function()
+	UI:SetLanguage(0)
+	log("Language: English", "ok", true)
+end, L("Pone el hub en inglés.", "Switches the hub to English."))
+
+section(pageSettings, L("Interfaz", "Interface"))
 local notifyToggle = toggle(pageSettings, L("Notificaciones", "Notifications"), function(on)
 	config.notify = on
 	saveConfig()
