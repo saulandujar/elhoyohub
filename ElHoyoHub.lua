@@ -1,4 +1,7 @@
 -- El Hoyo Hub
+-- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
+-- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
+local function ElHoyoHubMain()
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UIS = game:GetService("UserInputService")
@@ -61,132 +64,57 @@ local function saveConfig()
 	end)
 end
 
------------------------------------------------------------------- Estilo
--- Paletas. Dentro de cada una todos los colores son distintos: así se sabe qué color de la paleta
--- usa cada elemento y se puede cambiar de paleta en caliente.
-local PALETTE_ORDER = { "Abismo", "Pirata", "Haki", "Océano" }
-local PALETTES = {
-	Abismo = { -- fondos casi negros en capas, acento morado
-		bg = "0E0E15", surface = "15151E", card = "1B1B26", cardHover = "232332", line = "2A2A3A",
-		accent = "8B5CF6", accentSoft = "261F3D", on = "22C55E", off = "3A3A4C",
-		text = "ECECF4", dim = "8E8EA6", warn = "F59E0B", err = "EF4444",
-	},
-	Pirata = { -- azul marino, acento dorado
-		bg = "0B1622", surface = "102033", card = "15283F", cardHover = "1C324D", line = "24405F",
-		accent = "F2B33D", accentSoft = "3A3020", on = "2EC27E", off = "34465C",
-		text = "F1E9D8", dim = "9AA7B8", warn = "F59E0C", err = "EF4445",
-	},
-	Haki = { -- negro, acento rojo
-		bg = "0D0D0D", surface = "151515", card = "1C1C1C", cardHover = "252525", line = "2E2E2E",
-		accent = "E11D48", accentSoft = "3A1520", on = "22C55F", off = "3A3A3A",
-		text = "F5F5F5", dim = "9A9A9A", warn = "F59E0D", err = "EF4446",
-	},
-	["Océano"] = { -- gris azulado, acento turquesa
-		bg = "0F1417", surface = "151C21", card = "1B2329", cardHover = "222C33", line = "2C3840",
-		accent = "14B8A6", accentSoft = "133533", on = "22C560", off = "33404A",
-		text = "E6EEF2", dim = "8FA3AE", warn = "F59E0E", err = "EF4447",
-	},
-}
-local C = {}
-local function loadPalette(name)
-	for k, hex in PALETTES[name] or PALETTES.Abismo do C[k] = Color3.fromHex(hex) end
+------------------------------------------------------------------ Interfaz: El Hoyo UI
+-- La ventana la dibuja ElHoyoUI.lua (librería propia, basada en Neverlose Reloaded y adaptada a El Hoyo Hub).
+-- Se usa el archivo de la carpeta del executor si existe; si no, se descarga del mismo sitio que el hub.
+-- Aquí abajo hay una capa fina con las funciones de siempre (section, toggle, button, note...) para que las
+-- secciones de funciones no tengan que saber nada de la librería.
+local UI_URL = "https://raw.githubusercontent.com/saulandujar/elhoyohub/refs/heads/main/ElHoyoUI.lua"
+local uiSource
+pcall(function()
+	if isfile and readfile and isfile("ElHoyoUI.lua") then uiSource = readfile("ElHoyoUI.lua") end
+end)
+if not uiSource then
+	local nextToHub = config.hubUrl and config.hubUrl:gsub("ElHoyoHub%.lua$", "ElHoyoUI.lua")
+	local url = (nextToHub and nextToHub ~= config.hubUrl) and nextToHub or UI_URL
+	local ok, src = pcall(game.HttpGet, game, url)
+	if ok then uiSource = src end
 end
-loadPalette(config.palette)
-local FONT, FONT_SEMI, FONT_BOLD = Enum.Font.Gotham, Enum.Font.GothamMedium, Enum.Font.GothamBold
-local FAST, NORMAL = 0.12, 0.22 -- duraciones: interacción / transición
+assert(type(uiSource) == "string" and #uiSource > 1000,
+	"No pude cargar ElHoyoUI.lua: súbelo a GitHub junto a ElHoyoHub.lua (o ponlo en la carpeta del executor)")
+local UI = loadstring(uiSource)()
 
------------------------------------------------------------------- Idioma y colores enlazados
--- Textos fijos de la interfaz: L("español", "english"). Se actualizan solos al cambiar de idioma.
--- Mensajes que se crean en el momento (consola, avisos): T("español", "english").
--- Los colores de la paleta pasados a new() se recuerdan igual, para cambiar de paleta en caliente.
-local LANG = config.lang
+-- Colores fijos para lo que no dibuja la librería (consola, ESP, zona segura): los de la paleta Abismo roja
+local C = {
+	bg = Color3.fromRGB(13, 12, 19), surface = Color3.fromRGB(19, 18, 26), line = Color3.fromRGB(38, 34, 48),
+	accent = Color3.fromRGB(225, 29, 72), on = Color3.fromRGB(34, 197, 94), warn = Color3.fromRGB(245, 158, 11),
+	err = Color3.fromRGB(239, 68, 68), text = Color3.fromRGB(236, 236, 244), dim = Color3.fromRGB(128, 128, 150),
+}
+local FONT_SEMI = Enum.Font.GothamMedium
+
+------------------------------------------------------------------ Idioma
+-- La librería traduce sola los nombres: el texto base va en inglés y el español es su idioma 1.
+-- L("es", "en") para nombres fijos (se registran en la librería); T("es", "en") para mensajes del momento.
+local LANG = "es"
 local function L(es, en)
 	return { es = es, en = en }
 end
 local function T(es, en)
 	return LANG == "en" and en or es
 end
-local function tr(v)
-	if type(v) == "table" then return LANG == "en" and v.en or v.es end
-	return v
-end
-local function colorKey(c)
-	for k, v in C do
-		if v == c then return k end
-	end
-end
-local bindings = setmetatable({}, { __mode = "k" }) -- objeto -> { propiedad -> L(...) o nombre de color }
-local function bind(obj, prop, v)
-	local key = typeof(v) == "Color3" and colorKey(v)
-	obj[prop] = tr(v)
-	if type(v) == "table" or key then
-		bindings[obj] = bindings[obj] or {}
-		bindings[obj][prop] = key or v
-	elseif bindings[obj] then
-		bindings[obj][prop] = nil -- ahora tiene un valor fijo
-	end
-end
-local refreshHooks = {} -- cosas que se recolorean a mano (interruptores, pestaña elegida...)
-local function refreshAll()
-	for obj, props in bindings do
-		for prop, v in props do
-			obj[prop] = type(v) == "string" and C[v] or tr(v)
-		end
-	end
-	for _, f in refreshHooks do f() end
-end
-local function setLang(lang)
-	LANG = lang
-	genv.ElHoyoHubLang = lang
-	config.lang = lang
-	saveConfig()
-	refreshAll()
-end
-local function setPalette(name)
-	loadPalette(name)
-	config.palette = name
-	saveConfig()
-	refreshAll()
+local function uiText(v)
+	if type(v) ~= "table" then return v end
+	if v.es ~= v.en then UI.Translations[v.en] = { v.es } end
+	return v.en
 end
 
-local function tween(obj, props, t, style)
-	local tw = TweenService:Create(obj, TweenInfo.new(t or NORMAL, style or Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props)
-	tw:Play()
-	return tw
-end
-
-local function new(class, props)
-	local obj = Instance.new(class)
-	for k, v in props do
-		if k ~= "Parent" then bind(obj, k, v) end -- un L(...) se traduce y se vuelve a traducir al cambiar idioma
-	end
-	obj.Parent = props.Parent
-	return obj
-end
-
-local function round(obj, r)
-	new("UICorner", { CornerRadius = UDim.new(0, r or 8), Parent = obj })
-end
-
-local function outline(obj, color, transparency)
-	return new("UIStroke", {
-		Color = color or C.line,
-		Transparency = transparency or 0,
-		Thickness = 1,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-		Parent = obj,
-	})
-end
-
-local function pad(obj, x, y)
-	new("UIPadding", {
-		PaddingLeft = UDim.new(0, x),
-		PaddingRight = UDim.new(0, x),
-		PaddingTop = UDim.new(0, y or x),
-		PaddingBottom = UDim.new(0, y or x),
-		Parent = obj,
-	})
-end
+------------------------------------------------------------------ Consola
+-- Ventana propia (la librería no tiene una lista que crezca): registro de todo lo que hace el hub.
+local gui = Instance.new("ScreenGui")
+gui.Name = "ElHoyoHub"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 60
+gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
 
 local function isOver(f)
 	if not f.Visible then return false end
@@ -194,18 +122,85 @@ local function isOver(f)
 	return mouse.X >= p.X and mouse.X <= p.X + s.X and mouse.Y >= p.Y and mouse.Y <= p.Y + s.Y
 end
 
--- Arrastrar con suavidad desde "handle" moviendo "target"
-local function draggable(handle, target)
+local consoleWin = Instance.new("Frame")
+consoleWin.Size = UDim2.fromOffset(400, 250)
+consoleWin.Position = UDim2.new(1, -416, 1, -330)
+consoleWin.BackgroundColor3 = C.bg
+consoleWin.Visible = false
+consoleWin.Parent = gui
+Instance.new("UICorner", consoleWin).CornerRadius = UDim.new(0, 10)
+local consoleStroke = Instance.new("UIStroke")
+consoleStroke.Color = C.line
+consoleStroke.Parent = consoleWin
+
+local consoleHeader = Instance.new("TextButton")
+consoleHeader.Text = ""
+consoleHeader.AutoButtonColor = false
+consoleHeader.BackgroundTransparency = 1
+consoleHeader.Size = UDim2.new(1, 0, 0, 36)
+consoleHeader.Parent = consoleWin
+local consoleTitle = Instance.new("TextLabel")
+consoleTitle.BackgroundTransparency = 1
+consoleTitle.Position = UDim2.fromOffset(14, 0)
+consoleTitle.Size = UDim2.new(1, -90, 1, 0)
+consoleTitle.Font = Enum.Font.GothamBold
+consoleTitle.TextSize = 13
+consoleTitle.TextColor3 = C.text
+consoleTitle.TextXAlignment = Enum.TextXAlignment.Left
+consoleTitle.Parent = consoleHeader
+local accentBar = Instance.new("Frame")
+accentBar.BackgroundColor3 = C.accent
+accentBar.BorderSizePixel = 0
+accentBar.Position = UDim2.fromOffset(0, 35)
+accentBar.Size = UDim2.new(1, 0, 0, 1)
+accentBar.Parent = consoleWin
+
+local function headerIcon(text, x, onClick)
+	local b = Instance.new("TextButton")
+	b.Text = text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 14
+	b.TextColor3 = C.dim
+	b.BackgroundTransparency = 1
+	b.Size = UDim2.fromOffset(28, 28)
+	b.Position = UDim2.new(1, x, 0, 4)
+	b.Parent = consoleWin
+	b.MouseEnter:Connect(function() b.TextColor3 = C.accent end)
+	b.MouseLeave:Connect(function() b.TextColor3 = C.dim end)
+	b.MouseButton1Click:Connect(onClick)
+end
+
+local consoleList = Instance.new("ScrollingFrame")
+consoleList.Position = UDim2.fromOffset(0, 37)
+consoleList.Size = UDim2.new(1, 0, 1, -37)
+consoleList.BackgroundTransparency = 1
+consoleList.BorderSizePixel = 0
+consoleList.CanvasSize = UDim2.new()
+consoleList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+consoleList.ScrollBarThickness = 3
+consoleList.ScrollBarImageColor3 = C.accent
+consoleList.Parent = consoleWin
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 3)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = consoleList
+local listPad = Instance.new("UIPadding")
+listPad.PaddingLeft, listPad.PaddingRight = UDim.new(0, 12), UDim.new(0, 12)
+listPad.PaddingTop, listPad.PaddingBottom = UDim.new(0, 8), UDim.new(0, 8)
+listPad.Parent = consoleList
+
+-- Arrastrar la consola por su cabecera
+do
 	local dragging, startPos, startMouse
-	handle.InputBegan:Connect(function(i)
+	consoleHeader.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging, startPos, startMouse = true, target.Position, i.Position
+			dragging, startPos, startMouse = true, consoleWin.Position, i.Position
 		end
 	end)
 	table.insert(cleanup, UIS.InputChanged:Connect(function(i)
 		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			local d = i.Position - startMouse
-			tween(target, { Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y) }, 0.08)
+			consoleWin.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 		end
 	end))
 	table.insert(cleanup, UIS.InputEnded:Connect(function(i)
@@ -213,751 +208,178 @@ local function draggable(handle, target)
 	end))
 end
 
--- Resalte de hover y de foco (mando/teclado) para cualquier control
--- base/hover son nombres de colores de la paleta (se leen al momento: siguen a la paleta elegida)
-local function hoverFx(obj, stroke, base, hover)
-	local function on()
-		tween(obj, { BackgroundColor3 = C[hover] }, FAST)
-		if stroke then tween(stroke, { Color = C.accent, Transparency = 0.4 }, FAST) end
-	end
-	local function off()
-		tween(obj, { BackgroundColor3 = C[base] }, FAST)
-		if stroke then tween(stroke, { Color = C.line, Transparency = 0 }, FAST) end
-	end
-	obj.MouseEnter:Connect(on)
-	obj.MouseLeave:Connect(off)
-	obj.SelectionGained:Connect(on)
-	obj.SelectionLost:Connect(off)
-end
-
-local gui = new("ScreenGui", {
-	Name = "ElHoyoHub",
-	ResetOnSpawn = false,
-	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-	Parent = (gethui and gethui()) or game:GetService("CoreGui"),
-})
-
------------------------------------------------------------------- Tooltips
-local tip = new("TextLabel", {
-	Visible = false,
-	ZIndex = 60,
-	Size = UDim2.fromOffset(220, 0),
-	AutomaticSize = Enum.AutomaticSize.Y,
-	BackgroundColor3 = C.surface,
-	BackgroundTransparency = 1,
-	TextTransparency = 1,
-	TextColor3 = C.text,
-	Font = FONT,
-	TextSize = 12,
-	TextWrapped = true,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = gui,
-})
-round(tip, 6)
-pad(tip, 8, 6)
-local tipStroke = outline(tip, C.line, 1)
-local tipToken = 0
-
-local function hideTip()
-	tipToken += 1
-	local my = tipToken
-	tween(tip, { TextTransparency = 1, BackgroundTransparency = 1 }, FAST)
-	tween(tipStroke, { Transparency = 1 }, FAST)
-	task.delay(FAST, function()
-		if my == tipToken then tip.Visible = false end
-	end)
-end
-
--- Muestra "text" tras una pequeña espera con el ratón encima
-local function tooltip(obj, text)
-	if not text or text == "" then return end
-	obj.MouseEnter:Connect(function()
-		tipToken += 1
-		local my = tipToken
-		task.delay(0.45, function()
-			if my ~= tipToken or not alive then return end
-			local v = workspace.CurrentCamera.ViewportSize
-			tip.Text = tr(text)
-			tip.Position = UDim2.fromOffset(math.min(mouse.X + 14, v.X - 232), math.min(mouse.Y + 18, v.Y - 60))
-			tip.Visible = true
-			tween(tip, { TextTransparency = 0, BackgroundTransparency = 0 }, FAST)
-			tween(tipStroke, { Transparency = 0 }, FAST)
-		end)
-	end)
-	obj.MouseLeave:Connect(hideTip)
-end
-
------------------------------------------------------------------- Notificaciones
-local toastHolder = new("Frame", {
-	AnchorPoint = Vector2.new(1, 1),
-	Position = UDim2.new(1, -16, 1, -16),
-	Size = UDim2.fromOffset(280, 0),
-	AutomaticSize = Enum.AutomaticSize.Y,
-	BackgroundTransparency = 1,
-	ZIndex = 40,
-	Parent = gui,
-})
-new("UIListLayout", {
-	Padding = UDim.new(0, 8),
-	SortOrder = Enum.SortOrder.LayoutOrder,
-	VerticalAlignment = Enum.VerticalAlignment.Bottom,
-	Parent = toastHolder,
-})
-local LEVEL_KEY = { info = "text", ok = "on", warn = "warn", error = "err" }
-local function levelColor(level)
-	return C[LEVEL_KEY[level] or "text"] -- se lee en el momento: sigue a la paleta actual
-end
-local toasts, toastCount = {}, 0
-
-local function toast(msg, level)
-	toastCount += 1
-	local t = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		BackgroundColor3 = C.surface,
-		BackgroundTransparency = 1,
-		LayoutOrder = toastCount,
-		ZIndex = 40,
-		Parent = toastHolder,
-	})
-	round(t, 8)
-	local stroke = outline(t, C.line, 1)
-	local s = new("UIScale", { Scale = 0.94, Parent = t })
-	local bar = new("Frame", {
-		Size = UDim2.new(0, 3, 1, -16),
-		Position = UDim2.fromOffset(8, 8),
-		BackgroundColor3 = levelColor(level),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ZIndex = 41,
-		Parent = t,
-	})
-	round(bar, 2)
-	local label = new("TextLabel", {
-		Text = msg,
-		Font = FONT,
-		TextSize = 13,
-		TextColor3 = C.text,
-		TextTransparency = 1,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		ZIndex = 41,
-		Parent = t,
-	})
-	new("UIPadding", { PaddingLeft = UDim.new(0, 20), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), Parent = label })
-	tween(t, { BackgroundTransparency = 0 }, NORMAL)
-	tween(stroke, { Transparency = 0 }, NORMAL)
-	tween(bar, { BackgroundTransparency = 0 }, NORMAL)
-	tween(label, { TextTransparency = 0 }, NORMAL)
-	tween(s, { Scale = 1 }, NORMAL)
-	table.insert(toasts, t)
-	if #toasts > 4 then table.remove(toasts, 1):Destroy() end -- como mucho 4 a la vez
-
-	task.delay(3.5, function()
-		if not t.Parent then return end
-		tween(t, { BackgroundTransparency = 1 }, NORMAL)
-		tween(stroke, { Transparency = 1 }, NORMAL)
-		tween(bar, { BackgroundTransparency = 1 }, NORMAL)
-		tween(label, { TextTransparency = 1 }, NORMAL)
-		tween(s, { Scale = 0.94 }, NORMAL)
-		task.wait(NORMAL)
-		local i = table.find(toasts, t)
-		if i then table.remove(toasts, i) end
-		t:Destroy()
-	end)
-end
-
------------------------------------------------------------------- Consola
-local consoleWin = new("Frame", {
-	Size = UDim2.fromOffset(380, 240),
-	Position = UDim2.new(1, -396, 1, -360),
-	BackgroundColor3 = C.bg,
-	Visible = false,
-	ClipsDescendants = true,
-	Parent = gui,
-})
-round(consoleWin, 12)
-outline(consoleWin)
-local consoleScale = new("UIScale", { Parent = consoleWin })
-
-local consoleHeader = new("Frame", { Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1, Parent = consoleWin })
-new("TextLabel", {
-	Text = L("Consola", "Console"),
-	Font = FONT_BOLD,
-	TextSize = 14,
-	TextColor3 = C.text,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(16, 0),
-	Size = UDim2.new(1, -120, 1, 0),
-	Parent = consoleHeader,
-})
-draggable(consoleHeader, consoleWin)
-new("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.fromOffset(0, 40), BackgroundColor3 = C.line, BorderSizePixel = 0, Parent = consoleWin })
-
-local consoleList = new("ScrollingFrame", {
-	Position = UDim2.fromOffset(0, 41),
-	Size = UDim2.new(1, 0, 1, -41),
-	BackgroundTransparency = 1,
-	BorderSizePixel = 0,
-	CanvasSize = UDim2.new(),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	ScrollBarThickness = 3,
-	ScrollBarImageColor3 = C.accent,
-	Parent = consoleWin,
-})
-new("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder, Parent = consoleList })
-pad(consoleList, 12, 8)
-
 local MAX_LINES = 150
 local lines, lineCount = {}, 0
+local LEVEL_COLOR = { info = C.text, ok = C.on, warn = C.warn, error = C.err }
+local consoleShown = false
+local function setConsole(show)
+	consoleShown = show
+	consoleWin.Visible = show
+end
+headerIcon("×", -34, function() setConsole(false) end)
+headerIcon("⌫", -64, function()
+	for _, l in lines do l:Destroy() end
+	table.clear(lines)
+end)
 
--- notify = true también lo muestra como notificación. Errores y avisos siempre se notifican.
+-- Escribe en la consola. Avisa con una notificación los errores siempre, y lo demás si las notificaciones
+-- están activadas y es un aviso o algo importante (notify = true). No avisar cosas repetitivas.
 local function log(msg, level, notify)
 	print("[El Hoyo Hub] " .. msg)
 	if not alive then return end
 	level = level or "info"
 	lineCount += 1
-	local line = new("TextLabel", {
-		Text = os.date("%H:%M:%S") .. "  " .. msg,
-		TextColor3 = levelColor(level),
-		TextTransparency = 1,
-		Font = Enum.Font.Code,
-		TextSize = 13,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = lineCount,
-		Parent = consoleList,
-	})
-	tween(line, { TextTransparency = 0 }, NORMAL)
+	local line = Instance.new("TextLabel")
+	line.Text = os.date("%H:%M:%S") .. "  " .. msg
+	line.TextColor3 = LEVEL_COLOR[level] or C.text
+	line.Font = Enum.Font.Code
+	line.TextSize = 13
+	line.TextWrapped = true
+	line.TextXAlignment = Enum.TextXAlignment.Left
+	line.BackgroundTransparency = 1
+	line.Size = UDim2.new(1, 0, 0, 0)
+	line.AutomaticSize = Enum.AutomaticSize.Y
+	line.LayoutOrder = lineCount
+	line.Parent = consoleList
 	table.insert(lines, line)
 	if #lines > MAX_LINES then table.remove(lines, 1):Destroy() end
 	task.defer(function()
 		consoleList.CanvasPosition = Vector2.new(0, consoleList.AbsoluteCanvasSize.Y)
 	end)
-	-- Los errores siempre avisan; lo demás solo con las notificaciones activadas
-	if level == "error" or (config.notify and (notify or level == "warn")) then toast(msg, level) end
-end
-
-local consoleShown = false
-local function setConsole(show)
-	consoleShown = show
-	if show then
-		consoleWin.Visible = true
-		consoleScale.Scale = 0.96
-		tween(consoleScale, { Scale = 1 }, NORMAL)
-	else
-		tween(consoleScale, { Scale = 0.96 }, FAST)
-		task.delay(FAST, function()
-			if not consoleShown then consoleWin.Visible = false end
-		end)
+	if UI.Notify and (level == "error" or (config.notify and (notify or level == "warn"))) then
+		local title = level == "error" and "Error" or level == "warn" and T("Aviso", "Warning") or "El Hoyo Hub"
+		pcall(UI.Notify, UI, title, msg)
 	end
 end
 
--- Botón de icono sin fondo (cabeceras): se ilumina al pasar por encima y explica lo que hace
-local function iconButton(parent, text, hint, hoverColor, onClick) -- hoverColor: nombre de color de la paleta
-	local b = new("TextButton", {
-		Text = text,
-		Font = FONT_BOLD,
-		TextSize = 15,
-		TextColor3 = C.dim,
-		BackgroundColor3 = C.cardHover,
-		BackgroundTransparency = 1,
-		AutoButtonColor = false,
-		Size = UDim2.fromOffset(30, 28),
-		Parent = parent,
-	})
-	round(b, 6)
-	b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0, TextColor3 = C[hoverColor] }, FAST) end)
-	b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1, TextColor3 = C.dim }, FAST) end)
-	b.MouseButton1Click:Connect(onClick)
-	tooltip(b, hint)
-	return b
+------------------------------------------------------------------ Ventana y pestañas
+local win = UI:CreateWindow({ Folder = "ElHoyoHub", ToggleKey = false })
+local main = win.frame
+local function syncLang()
+	LANG = UI.Language == 1 and "es" or "en"
+	consoleTitle.Text = T("Consola", "Console")
 end
-
-local function iconRow(parent)
-	local row = new("Frame", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -12, 0.5, 0),
-		Size = UDim2.fromOffset(0, 28),
-		AutomaticSize = Enum.AutomaticSize.X,
-		BackgroundTransparency = 1,
-		Parent = parent,
-	})
-	new("UIListLayout", {
-		FillDirection = Enum.FillDirection.Horizontal,
-		Padding = UDim.new(0, 4),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Parent = row,
-	})
-	return row
-end
-
-local consoleIcons = iconRow(consoleHeader)
-iconButton(consoleIcons, "⌫", L("Borrar la consola", "Clear the console"), "text", function()
-	for _, l in lines do l:Destroy() end
-	table.clear(lines)
-end)
-iconButton(consoleIcons, "×", L("Cerrar la consola", "Close the console"), "err", function() setConsole(false) end)
-
------------------------------------------------------------------- Ventana principal
-local HEADER_H, TABS_H = 56, 34
-
--- Tamaño según la pantalla: cabe en móviles y no se hace enorme en monitores grandes
-local function fitSize()
-	local v = workspace.CurrentCamera.ViewportSize
-	return math.clamp(v.X - 32, 340, 600), math.clamp(v.Y - 96, 300, 430)
-end
-local WIDTH, HEIGHT = fitSize()
-
-local main = new("Frame", {
-	Size = UDim2.fromOffset(WIDTH, HEIGHT),
-	Position = UDim2.new(0.5, -WIDTH / 2, 0.5, -HEIGHT / 2),
-	BackgroundColor3 = C.bg,
-	ClipsDescendants = true,
-	Parent = gui,
-})
-round(main, 12)
-outline(main)
-local userScale = math.clamp(tonumber(config.scale) or 1, 0.5, 2)
-local mainScale = new("UIScale", { Scale = userScale * 0.96, Parent = main })
-
-local header = new("Frame", { Size = UDim2.new(1, 0, 0, HEADER_H), BackgroundTransparency = 1, Parent = main })
-local logo = new("Frame", {
-	Size = UDim2.fromOffset(28, 28),
-	Position = UDim2.new(0, 16, 0.5, -14),
-	BackgroundColor3 = C.accentSoft,
-	Parent = header,
-})
-round(logo, 8)
-local dot = new("Frame", { Size = UDim2.fromOffset(10, 10), Position = UDim2.fromOffset(9, 9), BackgroundColor3 = C.accent, Parent = logo })
-round(dot, 5)
-new("TextLabel", {
-	Text = "El Hoyo Hub",
-	Font = FONT_BOLD,
-	TextSize = 16,
-	TextColor3 = C.text,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(54, 10),
-	Size = UDim2.new(1, -170, 0, 20),
-	Parent = header,
-})
-local function keyHint()
-	return L(config.key .. " para mostrar u ocultar", config.key .. " to show or hide")
-end
-local subtitle = new("TextLabel", {
-	Text = keyHint(),
-	Font = FONT,
-	TextSize = 12,
-	TextColor3 = C.dim,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	BackgroundTransparency = 1,
-	Position = UDim2.fromOffset(54, 30),
-	Size = UDim2.new(1, -170, 0, 16),
-	Parent = header,
-})
-draggable(header, main)
-
-local closeHub -- se define al final; los botones de cerrar la llaman
-local minimized = false
-local headerIcons = iconRow(header)
-iconButton(headerIcons, "≡", L("Mostrar u ocultar la consola", "Show or hide the console"), "accent", function() setConsole(not consoleShown) end)
-iconButton(headerIcons, "–", L("Minimizar", "Minimize"), "text", function()
-	minimized = not minimized
-	tween(main, { Size = UDim2.fromOffset(WIDTH, minimized and HEADER_H or HEIGHT) }, NORMAL)
-end)
-iconButton(headerIcons, "×", L("Cerrar El Hoyo Hub (apaga todo)", "Close El Hoyo Hub (turns everything off)"), "err", function() closeHub() end)
-
--- Barra de secciones: pestañas en fila con un fondo que se desliza a la elegida
-local tabBar = new("Frame", {
-	Position = UDim2.fromOffset(16, HEADER_H),
-	Size = UDim2.new(1, -32, 0, TABS_H),
-	BackgroundColor3 = C.surface,
-	Parent = main,
-})
-round(tabBar, 8)
-local tabIndicator = new("Frame", {
-	Size = UDim2.new(0.2, -4, 1, -4),
-	Position = UDim2.new(0, 2, 0, 2),
-	BackgroundColor3 = C.accentSoft,
-	BorderSizePixel = 0,
-	Parent = tabBar,
-})
-round(tabIndicator, 6)
-local tabRow = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 2, Parent = tabBar })
-new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Parent = tabRow })
-
-local content = new("Frame", {
-	Position = UDim2.fromOffset(0, HEADER_H + TABS_H + 8),
-	Size = UDim2.new(1, 0, 1, -(HEADER_H + TABS_H + 8)),
-	BackgroundTransparency = 1,
-	ClipsDescendants = true,
-	Parent = main,
-})
-
--- Pulso suave del punto del logo
-task.spawn(function()
-	while alive do
-		tween(dot, { BackgroundTransparency = 0.5 }, 1.4, Enum.EasingStyle.Sine).Completed:Wait()
-		tween(dot, { BackgroundTransparency = 0 }, 1.4, Enum.EasingStyle.Sine).Completed:Wait()
-	end
-end)
-
------------------------------------------------------------------- Secciones y controles
-local tabs, currentTab = {}, nil
-local order = 0
-local function nextOrder()
-	order += 1
-	return order
-end
-
-local function selectTab(tab)
-	if currentTab == tab then return end
-	local index = table.find(tabs, tab)
-	tween(tabIndicator, { Position = UDim2.new((index - 1) / #tabs, 2, 0, 2) }, NORMAL)
-	for _, t in tabs do
-		local sel = t == tab
-		tween(t.btn, { TextColor3 = sel and C.text or C.dim }, FAST)
-		if not sel then t.page.Visible = false end
-	end
-	tab.page.Visible = true
-	tab.page.CanvasPosition = Vector2.zero
-	tab.page.Position = UDim2.fromOffset(0, 8)
-	tween(tab.page, { Position = UDim2.fromOffset(0, 0) }, NORMAL)
-	currentTab = tab
-end
--- Al cambiar de paleta, la pestaña elegida vuelve a tener su color de "elegida"
-table.insert(refreshHooks, function()
-	if currentTab then currentTab.btn.TextColor3 = C.text end
-end)
-
--- Cuadrículas de cada página: 2 columnas, o 1 si la ventana es estrecha.
-local GRID_KINDS = {
-	card = { height = 46, wide = 2, narrow = 1 },
-	action = { height = 40, wide = 2, narrow = 1 },
-	tp = { height = 38, wide = 2, narrow = 1 },
-	chip = { height = 30, wide = 4, narrow = 3 },
-}
-local grids, currentGrid = {}, {}
-
-local function layoutGrid(g)
-	local kind = GRID_KINDS[g.kind]
-	local cols = WIDTH < 460 and kind.narrow or kind.wide
-	g.layout.CellSize = UDim2.new(1 / cols, -8 * (cols - 1) / cols, 0, kind.height)
-end
-
-local function makeGrid(page, kind)
-	local f = new("Frame", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	})
-	local g = {
-		kind = kind,
-		frame = f,
-		layout = new("UIGridLayout", { CellPadding = UDim2.fromOffset(8, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = f }),
-	}
-	layoutGrid(g)
-	table.insert(grids, g)
-	return g
-end
-
--- Cuadrícula donde va el siguiente control de este tipo (se abre una nueva tras un título o nota)
-local function gridFor(page, kind)
-	local g = currentGrid[page]
-	if not g or g.kind ~= kind then
-		g = makeGrid(page, kind)
-		currentGrid[page] = g
-	end
-	return g.frame
-end
+win.onLanguage = syncLang
+syncLang()
 
 local pages = {}
-local function addTab(name, desc)
-	local btn = new("TextButton", {
-		Text = name,
-		Font = FONT_SEMI,
-		TextScaled = true, -- se encoge si la ventana es estrecha, sin pasar de 13
-		TextColor3 = C.dim,
-		BackgroundTransparency = 1,
-		AutoButtonColor = false,
-		LayoutOrder = #tabs + 1,
-		Parent = tabRow,
-	})
-	new("UITextSizeConstraint", { MaxTextSize = 13, Parent = btn })
-	pad(btn, 4, 9)
-	local page = new("ScrollingFrame", {
-		Visible = false,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Size = UDim2.fromScale(1, 1),
-		CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		ScrollBarThickness = 3,
-		ScrollBarImageColor3 = C.accent,
-		Parent = content,
-	})
-	new("UIListLayout", { Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = page })
-	new("UIPadding", {
-		PaddingTop = UDim.new(0, 6),
-		PaddingBottom = UDim.new(0, 16),
-		PaddingLeft = UDim.new(0, 16),
-		PaddingRight = UDim.new(0, 16),
-		Parent = page,
-	})
-	-- Descripción de la sección, siempre arriba de la página
-	new("TextLabel", {
-		Text = desc,
-		Font = FONT,
-		TextSize = 13,
-		TextColor3 = C.dim,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	})
-
-	local tab = { btn = btn, page = page }
-	table.insert(tabs, tab)
-	pages[page] = true
-	for _, t in tabs do t.btn.Size = UDim2.new(1 / #tabs, 0, 1, 0) end
-	tabIndicator.Size = UDim2.new(1 / #tabs, -4, 1, -4)
-	btn.MouseButton1Click:Connect(function() selectTab(tab) end)
-	btn.MouseEnter:Connect(function()
-		if currentTab ~= tab then tween(btn, { TextColor3 = C.text }, FAST) end
-	end)
-	btn.MouseLeave:Connect(function()
-		if currentTab ~= tab then tween(btn, { TextColor3 = C.dim }, FAST) end
-	end)
-	tooltip(btn, desc)
+local function addTab(label, icon)
+	local page = { tab = win:Tab({ Name = uiText(label), Icon = icon }), boxes = {}, byName = {}, current = nil }
+	table.insert(pages, page)
 	return page
 end
 
-local function section(page, text)
-	currentGrid[page] = nil
-	new("TextLabel", {
-		Text = text,
-		Font = FONT_BOLD,
-		TextSize = 13,
-		TextColor3 = C.text,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 22),
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	})
-end
-
--- Aviso informativo de ancho completo
-local function note(page, text)
-	currentGrid[page] = nil
-	local box = new("Frame", {
-		BackgroundColor3 = C.accentSoft,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	})
-	round(box, 8)
-	local label = new("TextLabel", {
-		Text = text,
-		Font = FONT,
-		TextSize = 12,
-		TextColor3 = C.text,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		Parent = box,
-	})
-	pad(label, 12, 10)
-	return label
-end
-
--- Campo de texto de ancho completo (p. ej. nombre de un perfil). El borde se ilumina mientras escribes.
-local function input(page, placeholder)
-	currentGrid[page] = nil
-	local box = new("TextBox", {
-		Text = "",
-		PlaceholderText = placeholder,
-		ClearTextOnFocus = false,
-		Font = FONT,
-		TextSize = 13,
-		TextColor3 = C.text,
-		PlaceholderColor3 = C.dim,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundColor3 = C.card,
-		Size = UDim2.new(1, 0, 0, 38),
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	})
-	round(box, 8)
-	pad(box, 12, 0)
-	local stroke = outline(box)
-	box.Focused:Connect(function() tween(stroke, { Color = C.accent }, FAST) end)
-	box.FocusLost:Connect(function() tween(stroke, { Color = C.line }, FAST) end)
+-- Cada sección es una caja; se reparten en dos columnas por orden. Repetir un nombre vuelve a esa caja.
+local function section(page, label)
+	local key = type(label) == "table" and label.en or label
+	local box = page.byName[key]
+	if not box then
+		box = page.tab:Box({ Name = uiText(label), Column = (#page.boxes % 2) + 1, Scrollable = true })
+		table.insert(page.boxes, box)
+		page.byName[key] = box
+	end
+	page.current = box
 	return box
 end
 
--- Todos los interruptores por nombre (en español): para los perfiles y "Apagar todo"
+local function boxFor(target)
+	if target.grid then target = target.page end
+	return target.current or section(target, "General")
+end
+
+-- Listas de botones (teleports, GUIs): van en la caja de la sección actual
+local function grid(page)
+	return { grid = true, page = page }
+end
+
+local function note(page, text)
+	return boxFor(page):Label(uiText(text))
+end
+
+-- Todos los interruptores por nombre (en español): para "Apagar todo"
 local toggles = {}
 
--- Tarjeta con título e interruptor (la explicación va en el tooltip). onChange(estado) se llama al
--- pulsarla; .set(v) la cambia sin llamar a onChange. noSave = es un ajuste, no una función (no entra en
--- los perfiles ni en "Apagar todo").
+-- Interruptor. onChange(estado) al pulsarlo o al cargar un perfil; .set(v) lo cambia sin llamar a onChange.
+-- noSave = es un ajuste, no una función (no entra en perfiles ni en "Apagar todo").
 local function toggle(page, text, onChange, desc, noSave)
-	local card = new("TextButton", {
-		Text = "",
-		AutoButtonColor = false,
-		BackgroundColor3 = C.card,
-		LayoutOrder = nextOrder(),
-		Parent = gridFor(page, "card"),
-	})
-	round(card, 10)
-	hoverFx(card, outline(card), "card", "cardHover")
-	new("TextLabel", {
-		Text = text,
-		Font = FONT_SEMI,
-		TextSize = 14,
-		TextColor3 = C.text,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(14, 0),
-		Size = UDim2.new(1, -76, 1, 0),
-		Parent = card,
-	})
-	local switch = new("Frame", { Size = UDim2.fromOffset(40, 22), Position = UDim2.new(1, -54, 0.5, -11), BackgroundColor3 = C.off, Parent = card })
-	round(switch, 11)
-	local knob = new("Frame", { Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(2, 2), BackgroundColor3 = C.text, Parent = switch })
-	round(knob, 9)
-	tooltip(card, desc) -- la explicación solo aparece al pasar el cursor
-
-	local id = type(text) == "table" and text.es or text
 	local obj = { value = false, onChange = onChange, noSave = noSave }
+	local o = {
+		Name = uiText(text),
+		Tip = desc and uiText(desc) or nil,
+		Callback = function(v)
+			obj.value = v
+			task.spawn(onChange, v)
+		end,
+	}
+	if noSave then o.Flag = false end
+	local control = boxFor(page):Toggle(o)
 	function obj.set(v)
-		obj.value = v
-		tween(switch, { BackgroundColor3 = v and C.on or C.off }, FAST)
-		tween(knob, { Position = UDim2.fromOffset(v and 20 or 2, 2) }, FAST)
+		obj.value = v == true
+		control:Set(obj.value, true)
 	end
-	card.MouseButton1Click:Connect(function()
-		obj.set(not obj.value)
-		task.spawn(onChange, obj.value)
-	end)
-	table.insert(refreshHooks, function() switch.BackgroundColor3 = obj.value and C.on or C.off end)
-	toggles[id] = obj
+	toggles[type(text) == "table" and text.es or text] = obj
 	return obj
 end
 
--- Botón de acción. Si "parent" es una página, va a su cuadrícula de acciones; si es una cuadrícula
--- creada con grid(), va dentro de ella.
 local function button(parent, text, onClick, desc)
-	local inList = not pages[parent] -- botones de una lista (teleports, GUIs): texto a la izquierda y flecha
-	local b = new("TextButton", {
-		Text = text,
-		Font = FONT_SEMI,
-		TextSize = 13,
-		TextColor3 = C.text,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		TextXAlignment = inList and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center,
-		BackgroundColor3 = C.card,
-		AutoButtonColor = false,
-		LayoutOrder = nextOrder(),
-		Parent = inList and parent or gridFor(parent, "action"),
+	return boxFor(parent):Button({ Name = uiText(text), Callback = onClick, Tip = desc and uiText(desc) or nil })
+end
+
+-- Lista desplegable de una opción. onPick(índice). Se guarda en config, no en los perfiles.
+local function combo(page, text, options, default, onPick, desc)
+	local names = {}
+	for i, opt in options do names[i] = uiText(opt) end
+	return boxFor(page):Combo({
+		Name = uiText(text), Options = names, Default = default, Flag = false,
+		Tip = desc and uiText(desc) or nil, Callback = function(_, i) onPick(i) end,
 	})
-	round(b, 8)
-	hoverFx(b, outline(b), "card", "cardHover")
-	if inList then
-		new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 28), Parent = b })
-		local arrow = new("TextLabel", {
-			Text = "›",
-			Font = FONT_BOLD,
-			TextSize = 18,
-			TextColor3 = C.dim,
-			BackgroundTransparency = 1,
-			AnchorPoint = Vector2.new(1, 0.5),
-			Position = UDim2.new(1, 20, 0.5, -1),
-			Size = UDim2.fromOffset(16, 16),
-			Parent = b,
-		})
-		b.MouseEnter:Connect(function() tween(arrow, { TextColor3 = C.accent, Position = UDim2.new(1, 23, 0.5, -1) }, FAST) end)
-		b.MouseLeave:Connect(function() tween(arrow, { TextColor3 = C.dim, Position = UDim2.new(1, 20, 0.5, -1) }, FAST) end)
-	end
-	local s = new("UIScale", { Parent = b })
-	b.MouseButton1Click:Connect(function()
-		tween(s, { Scale = 0.97 }, 0.06).Completed:Wait()
-		tween(s, { Scale = 1 }, FAST)
-		task.spawn(onClick)
-	end)
-	tooltip(b, desc)
-	return b
 end
 
--- Cuadrícula para listas de botones (teleports, GUIs) o de chips (kind = "chip")
-local function grid(page, kind)
-	currentGrid[page] = nil
-	return makeGrid(page, kind or "tp").frame
-end
-
--- Chip seleccionable (p. ej. elegir frutas). Marcado = fondo morado suave y texto morado.
-local function chip(parent, text, onClick, desc)
-	local b = new("TextButton", {
-		Text = text,
-		Font = FONT_SEMI,
-		TextSize = 12,
-		TextColor3 = C.dim,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		BackgroundColor3 = C.card,
-		AutoButtonColor = false,
-		LayoutOrder = nextOrder(),
-		Parent = parent,
+-- Lista desplegable de varias opciones. onChange(tabla índice -> true/false).
+local function multi(page, text, options, defaults, onChange, desc)
+	local names = {}
+	for i, opt in options do names[i] = uiText(opt) end
+	return boxFor(page):Multi({
+		Name = uiText(text), Options = names, Default = defaults, Flag = false,
+		Tip = desc and uiText(desc) or nil, Callback = onChange,
 	})
-	round(b, 15)
-	local stroke = outline(b)
-	local obj = { value = false }
-	function obj.set(v)
-		obj.value = v
-		tween(b, { BackgroundColor3 = v and C.accentSoft or C.card, TextColor3 = v and C.accent or C.dim }, FAST)
-		tween(stroke, { Color = v and C.accent or C.line }, FAST)
-	end
-	b.MouseEnter:Connect(function() if not obj.value then tween(b, { TextColor3 = C.text }, FAST) end end)
-	b.MouseLeave:Connect(function() if not obj.value then tween(b, { TextColor3 = C.dim }, FAST) end end)
-	b.MouseButton1Click:Connect(function() onClick(obj) end)
-	tooltip(b, desc)
-	table.insert(refreshHooks, function() obj.set(obj.value) end)
-	return obj
 end
 
-local pageAuto = addTab(L("Automatización", "Automation"),
-	L("Automatizaciones que funcionan solas mientras están encendidas.", "Automations that run on their own while turned on."))
-local pageTrain = addTab("Train",
-	L("Entrenamiento de haki con Rayleigh, en bucle hasta el límite diario.", "Haki training with Rayleigh, looped until the daily limit."))
-local pageFruits = addTab(L("Frutas", "Fruits"), L("Recoge Devil Fruits del mapa: las que elijas o cualquiera desde una rareza mínima.", "Collects Devil Fruits on the map: the ones you pick or any from a minimum rarity."))
-local pageTp = addTab("Teleports", L("Viaja al instante a NPCs e islas.", "Travel instantly to NPCs and islands."))
-local pageGuis = addTab("GUIs", L("Abre los menús del juego desde donde estés.", "Open the game's menus from anywhere."))
-local pageMisc = addTab("Misc", L("Utilidades sueltas.", "Miscellaneous utilities."))
-local pageSettings = addTab(L("Ajustes", "Settings"), L("Idioma, tamaño y posición del hub.", "Language, size and position of the hub."))
+local function input(page, text, placeholder, default, onDone, desc)
+	return boxFor(page):Input({ Name = uiText(text), Placeholder = uiText(placeholder), Default = default, Callback = onDone, Tip = desc and uiText(desc) or nil })
+end
 
--- Si cambia el tamaño de la pantalla, la ventana y las columnas se adaptan
-table.insert(cleanup, workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-	WIDTH, HEIGHT = fitSize()
-	tween(main, { Size = UDim2.fromOffset(WIDTH, minimized and HEADER_H or HEIGHT) }, NORMAL)
-	for _, g in grids do layoutGrid(g) end
-end))
+win:Group(uiText(L("FARMEO", "FARMING")))
+local pageAuto = addTab(L("Automatización", "Automation"), "BOLT")
+local pageTrain = addTab("Train", "FIRE")
+local pageFruits = addTab(L("Frutas", "Fruits"), "GEM")
+win:Group(uiText(L("MUNDO", "WORLD")))
+local pageTp = addTab("Teleports", "GLOBE")
+local pageGuis = addTab("GUIs", "TH_LARGE")
+win:Group("HUB")
+local pageMisc = addTab("Misc", "SLIDERS_H")
+local pageSettings = addTab(L("Ajustes", "Settings"), "COG")
 
+-- Antes de terminar la ventana: si las cajas de una columna no caben en la página, se reparten el alto
+-- según lo que ocupa cada una (todas tienen scroll, así que no se pierde nada).
+local PAGE_H = 509 -- alto útil de una página de la librería
+local function fitBoxes()
+	for _, page in pages do
+		local columns = { {}, {} }
+		for _, box in page.boxes do table.insert(columns[box.column], box) end
+		for _, list in columns do
+			local available = PAGE_H - 8 * math.max(0, #list - 1)
+			local natural, total = {}, 0
+			for i, box in list do
+				natural[i] = box.flow.y - box.spacing + box.padY + 18
+				total += natural[i]
+			end
+			if total > available then
+				for i, box in list do box.height = math.floor(math.max(80, available * natural[i] / total)) end
+			end
+		end
+	end
+end
 
 ------------------------------------------------------------------ Utilidades del juego
 local function getHRP()
@@ -1060,6 +482,7 @@ local function hakiActive(haki)
 	return char ~= nil and char:GetAttribute(haki.activeAttr) == true
 end
 
+section(pageAuto, "Haki")
 for _, haki in HAKIS do
 	local enabled, noEnergyLogged = false, false
 
@@ -1105,6 +528,7 @@ end
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 local CLICK_DELAY = 0.1
 local autoClick = false
+section(pageAuto, L("Combate", "Combat"))
 toggle(pageAuto, "Auto Click", function(on)
 	autoClick = on
 	log("Auto Click " .. (on and "ON" or "OFF"))
@@ -1124,6 +548,7 @@ end
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 local SAM_EVERY = 60 -- reintento si CompassTokenAt no dice nada
 local claimRemote = getRemote("CompassQuestService", "RF", "Claim")
+local treasureArrive = getRemote("TreasureService", "RE", "Arrive")
 local autoSam = false
 
 local function findCompass()
@@ -1196,6 +621,7 @@ local function goTreasure()
 	teleport(target + Vector3.new(0, 3, 0))
 	log(T("Sam: llevado al tesoro", "Sam: taken to the treasure"))
 	task.wait(0.5)
+	call(treasureArrive, "FireServer") -- lo que manda el juego al llegar al tesoro (grabado)
 	useCompass(compass)
 	local t0 = os.clock()
 	while os.clock() - t0 < 4 do
@@ -1214,6 +640,7 @@ local function goTreasure()
 	samGoBack() -- siempre de vuelta tras usarlo; si hay destino nuevo, el siguiente ciclo vuelve a ir
 end
 
+section(pageAuto, L("Compass y cofres", "Compass & chests"))
 toggle(pageAuto, "Auto Sam (compass)", function(on)
 	autoSam = on
 	if not on then samGoBack() end
@@ -1320,16 +747,14 @@ toggle(pageAuto, "Auto Chest", function(on)
 end, L("Recorre los cofres del mapa del más cercano al más lejano y los abre lo más rápido posible.",
 	"Goes through the chests on the map from nearest to farthest and opens them as fast as possible."))
 
--- Velocidad de Auto Chest (chips: solo uno marcado)
-local speedGrid = grid(pageAuto, "chip")
-local speedChips = {}
-for i, sp in CHEST_SPEEDS do
-	speedChips[i] = chip(speedGrid, sp.name, function()
+-- Velocidad de Auto Chest
+do
+	local speedNames = {}
+	for i, sp in CHEST_SPEEDS do speedNames[i] = sp.name end
+	combo(pageAuto, L("Velocidad de cofres", "Chest speed"), speedNames, config.chestSpeed, function(i)
 		config.chestSpeed = i
 		saveConfig()
-		for j, c in speedChips do c.set(j == i) end
 	end, L("Velocidad de Auto Chest. Si se salta muchos cofres, usa una más lenta.", "Auto Chest speed. If it skips many chests, use a slower one."))
-	speedChips[i].set(i == config.chestSpeed)
 end
 
 local chestStart -- dónde estabas antes de empezar la ronda de cofres
@@ -1387,6 +812,7 @@ local function claimGifts()
 	end
 end
 
+section(pageAuto, L("Farmeo", "Farming"))
 toggle(pageAuto, "Auto Gifts", function(on)
 	autoGifts = on
 	log("Auto Gifts " .. (on and "ON" or "OFF"))
@@ -1403,9 +829,452 @@ end)
 
 end
 
+------------------------------------------------------------------ Auto Pesca
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Grabado con EspiaRemotes (una pesca a mano):
+--   Cast(Vector3 del agua) -> Reel(false) -> el servidor manda MinigameStarted("Easy", "Scatter")
+--   -> el cliente manda Hit(1..10) (en cualquier orden; Miss() si falla uno)
+--   -> el servidor manda MinigameEnded(nota, "Nombre del pez"). La nota es cuántos acertaste (10 = Perfect).
+-- shortcut: no se sabe cuándo pica; se manda Reel(false) cada 2 s hasta que empieza el minijuego (25 s máx.).
+-- Solo se ha visto el minijuego "Scatter" con 10 objetivos; otros tipos se apuntan en la consola.
+local FISH_HIT_DELAY = 0.3 -- tras aparecer cada anillo, antes de acertarlo
+local FISH_REACTION = 0.3 -- tras picar, antes de recoger
+local fishCast = getRemote("FishingService", "RE", "Cast")
+local fishReel = getRemote("FishingService", "RE", "Reel")
+local fishHit = getRemote("FishingService", "RE", "Hit")
+local fishStarted = getRemote("FishingService", "RE", "MinigameStarted")
+local fishEnded = getRemote("FishingService", "RE", "MinigameEnded")
+
+local autoFish = false
+local minigame -- {difficulty, kind} mientras dura el minijuego
+local seenKinds = {}
+local fishToggle
+
+if fishStarted then
+	table.insert(cleanup, fishStarted.OnClientEvent:Connect(function(difficulty, kind)
+		minigame = { difficulty = difficulty, kind = kind }
+		if autoFish and not seenKinds[kind] then
+			seenKinds[kind] = true
+			log(T("Pesca: minijuego ", "Fishing: minigame ") .. tostring(difficulty) .. " / " .. tostring(kind))
+		end
+	end))
+end
+if fishEnded then
+	table.insert(cleanup, fishEnded.OnClientEvent:Connect(function(score, fish)
+		minigame = nil
+		if autoFish then
+			log(T("Pesca: ", "Fishing: ") .. tostring(fish) .. " (" .. tostring(score) .. "/10)", "ok")
+		end
+	end))
+end
+
+-- Equipa la caña (cualquier objeto con "rod" en el nombre)
+local function equipRod()
+	local char, backpack = player.Character, player:FindFirstChild("Backpack")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	local held = char:FindFirstChildOfClass("Tool")
+	if held and held.Name:lower():find("rod") then return true end
+	for _, tool in backpack and backpack:GetChildren() or {} do
+		if tool:IsA("Tool") and tool.Name:lower():find("rod") then
+			hum:EquipTool(tool)
+			task.wait(0.3)
+			return true
+		end
+	end
+	return false
+end
+
+-- Punto de lanzamiento: donde apunta el ratón, como hace el juego al lanzar con clic (en tu grabación el
+-- punto estaba a Y 137, por debajo del suelo de las islas, así que el agua no es agua de Terrain y no se
+-- puede detectar por material). Hay que dejar el ratón apuntando al agua.
+-- El ratón atraviesa el mar (mouse.Hit daba ~10000 studs apuntando al agua), así que se calcula dónde corta
+-- el rayo del ratón con la superficie del mar. Altura: la de una pieza llamada agua/mar/océano si existe; si
+-- no, la del lanzamiento grabado (Y 137,7).
+local FISH_MAX_RANGE = 1000
+local SEA_LEVEL = 137.7
+do
+	local biggest
+	for _, d in workspace:GetDescendants() do
+		if d:IsA("BasePart") then
+			local n = d.Name:lower()
+			if (n:find("water") or n:find("ocean") or n == "sea") and (not biggest or d.Size.Magnitude > biggest.Size.Magnitude) then
+				biggest = d
+			end
+		end
+	end
+	if biggest and biggest.Size.X > 500 then SEA_LEVEL = biggest.Position.Y + biggest.Size.Y / 2 end
+end
+
+local function castPoint()
+	local hrp = getHRP()
+	if not hrp then return nil, "sin personaje" end
+	local ray = mouse.UnitRay
+	if ray.Direction.Y >= -0.01 then return nil, T("el ratón apunta por encima del horizonte", "the mouse points above the horizon") end
+	local t = (SEA_LEVEL - ray.Origin.Y) / ray.Direction.Y
+	if t < 0 then return nil, T("estás por debajo del nivel del mar", "you are below sea level") end
+	local p = ray.Origin + ray.Direction * t
+	local d = (p - hrp.Position).Magnitude
+	if d > FISH_MAX_RANGE then return nil, string.format(T("el punto del mar está a %d studs", "the sea point is %d studs away"), d) end
+	return p
+end
+
+section(pageAuto, L("Farmeo", "Farming"))
+fishToggle = toggle(pageAuto, L("Auto Pesca (beta)", "Auto Fishing (beta)"), function(on)
+	autoFish = on
+	log(on and (T("Auto Pesca ON: deja el ratón apuntando al agua", "Auto Fishing ON: keep the mouse pointing at the water") .. string.format(T(" (mar a Y %.1f)", " (sea at Y %.1f)"), SEA_LEVEL)) or T("Auto Pesca OFF", "Auto Fishing OFF"))
+end, L("Lanza donde apunta tu ratón, espera a que pique y acierta los 10 objetivos del minijuego. Deja el ratón apuntando al agua y ten una caña en el inventario.",
+	"Casts where your mouse points, waits for a bite and hits all 10 minigame targets. Keep the mouse pointing at the water and have a rod in your inventory."))
+
+local warned = false
+local function fishOnce()
+	if not equipRod() then
+		log(T("Pesca: no tienes ninguna caña", "Fishing: you don't have a rod"), "warn")
+		autoFish = false
+		fishToggle.set(false)
+		return
+	end
+	local point, why = castPoint()
+	if not point then
+		-- Aviso destacado solo la primera vez; el motivo concreto siempre en la consola
+		log(T("Pesca: no lanzo: ", "Fishing: not casting: ") .. why, warned and "info" or "warn")
+		warned = true
+		task.wait(3)
+		return
+	end
+	warned = false
+			minigame = nil
+			local ok, err = call(fishCast, "FireServer", point)
+			log(ok and (T("Pesca: lanzando a ", "Fishing: casting at ") .. tostring(point)) or ("Pesca: error " .. tostring(err)), ok and "info" or "error")
+			task.wait(1.5)
+	-- Esperar a que pique: el personaje recibe el atributo FishingBite = true (EscaneoPesca: a los ~27 s de
+	-- caer el flotador). Recoger antes recoge el sedal vacío.
+	local t0 = os.clock()
+	local char = player.Character
+	while autoFish and char and char:GetAttribute("FishingBite") ~= true and os.clock() - t0 < 90 do task.wait(0.1) end
+	if not autoFish then return end
+	if not (char and char:GetAttribute("FishingBite") == true) then
+		return log(T("Pesca: no picó en 90 s, vuelvo a lanzar", "Fishing: no bite in 90 s, casting again"), "warn")
+	end
+	task.wait(FISH_REACTION) -- como una persona: un momento después de que pique
+	call(fishReel, "FireServer", false)
+	local t1 = os.clock()
+	while not minigame and os.clock() - t1 < 5 do task.wait(0.1) end
+	if not minigame then
+		return log(T("Pesca: recogí pero no empezó el minijuego", "Fishing: reeled in but the minigame didn't start"), "warn")
+	end
+
+	-- Minijuego Scatter: van apareciendo anillos ("Ring") en la pantalla de pesca, uno cada ~0,45 s, el primero
+	-- a los ~2 s. Se acierta cada uno un momento después de que aparezca: Hit(número de anillo). Se vigila toda
+	-- PlayerGui (no solo Fishing.Frame.Target) por si el juego vuelve a crear esa pantalla.
+	local rings, hits = 0, 0
+	local conn = player.PlayerGui.DescendantAdded:Connect(function(d)
+		if d.Name ~= "Ring" or not minigame then return end
+		rings += 1
+		local n = rings
+		task.delay(FISH_HIT_DELAY, function()
+			if minigame then
+				call(fishHit, "FireServer", n)
+				hits += 1
+			end
+		end)
+	end)
+	local t2 = os.clock()
+	while minigame and os.clock() - t2 < 20 do task.wait(0.1) end
+	conn:Disconnect()
+	log(string.format(T("Pesca: anillos vistos %d, aciertos enviados %d", "Fishing: rings seen %d, hits sent %d"), rings, hits))
+	if rings == 0 then
+		log(T("Pesca: no vi ningún anillo; pásame la consola", "Fishing: I didn't see any ring; send me the console"), "warn")
+	end
+	minigame = nil
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(0.5)
+		if autoFish then
+			local ok, err = pcall(fishOnce)
+			if not ok then
+				log(T("Pesca: error ", "Fishing: error ") .. tostring(err), "error")
+				task.wait(3)
+			end
+		end
+	end
+end)
+
+end
+
+------------------------------------------------------------------ Auto Quest
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Lee la misión activa del rastreador del juego (PlayerGui.QuestTracker.Frame.Rows: Header y Objective1..)
+-- y actúa según lo que diga. Por ahora entiende "Defeat <enemigo> (Lv N+): a/b": va a por ese enemigo en
+-- Workspace.Alive.NPCs (se llaman "Lv12 Boar") y le ataca con clic real hasta completar el objetivo.
+-- shortcut: aceptar y entregar misiones (QuestLogService) aún no está grabado; hay que hacerlo a mano.
+local QUEST_DIST = 4 -- studs detrás del enemigo
+local autoQuest = false
+
+local function questObjectives()
+	local qt = player.PlayerGui:FindFirstChild("QuestTracker")
+	local frame = qt and qt:FindFirstChild("Frame")
+	local rows = frame and frame:FindFirstChild("Rows")
+	if not rows then return nil, {} end
+	local header = rows:FindFirstChild("Header")
+	local objs = {}
+	for _, r in rows:GetChildren() do
+		if r:IsA("TextLabel") and r.Name:match("^Objective") and r.Visible and r.Text ~= "" then
+			table.insert(objs, { order = tonumber(r.Name:match("%d+")) or 0, text = r.Text })
+		end
+	end
+	table.sort(objs, function(a, b) return a.order < b.order end)
+	return header and header.Text or "", objs
+end
+
+-- "- Defeat Boar (Lv 10+): 0/5" -> "Boar", 10, 0, 5
+local function parseDefeat(text)
+	local name, lv, have, need = text:match("Defeat%s+(.-)%s*%(Lv%s*(%d+)%+?%)%s*:%s*(%d+)%s*/%s*(%d+)")
+	if not name then name, have, need = text:match("Defeat%s+(.-)%s*:%s*(%d+)%s*/%s*(%d+)") end
+	if not name then return nil end
+	return name, tonumber(lv) or 0, tonumber(have), tonumber(need)
+end
+do -- comprobación con el texto real visto en el juego
+	local n, lv, have, need = parseDefeat("- Defeat Boar (Lv 10+): 0/5")
+	assert(n == "Boar" and lv == 10 and have == 0 and need == 5)
+end
+
+local function findEnemy(name, minLv)
+	local aliveFolder = workspace:FindFirstChild("Alive")
+	local npcs = aliveFolder and aliveFolder:FindFirstChild("NPCs")
+	local hrp = getHRP()
+	if not (npcs and hrp) then return end
+	local want = name:lower()
+	local best, bestDist
+	for _, m in npcs:GetChildren() do
+		local hum = m:FindFirstChildOfClass("Humanoid")
+		local root = m:FindFirstChild("HumanoidRootPart")
+		local clean = m.Name:gsub("^Lv%s*%d+%s*", ""):lower()
+		local lv = tonumber(m.Name:match("^Lv%s*(%d+)")) or 0
+		-- "Bandits" en la misión y "Bandit" en el enemigo también vale
+		local same = clean == want or clean == want:gsub("s$", "") or clean .. "s" == want
+		if hum and root and hum.Health > 0 and same and lv >= minLv then
+			local d = (root.Position - hrp.Position).Magnitude
+			if not bestDist or d < bestDist then best, bestDist = m, d end
+		end
+	end
+	return best
+end
+
+-- Arma: la que tengas en la mano si es un arma; si no, la primera del inventario (Melee/Sword/Sniper)
+local function equipWeapon()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	local held = char:FindFirstChildOfClass("Tool")
+	if held and held:GetAttribute("WeaponSlot") and held:GetAttribute("WeaponSlot") ~= "Utility" then return end
+	local backpack = player:FindFirstChild("Backpack")
+	for _, tool in backpack and backpack:GetChildren() or {} do
+		local slot = tool:IsA("Tool") and tool:GetAttribute("WeaponSlot")
+		if slot and slot ~= "Utility" then
+			hum:EquipTool(tool)
+			task.wait(0.2)
+			return
+		end
+	end
+end
+
+-- Se pone detrás del enemigo mirándole, apunta la cámara hacia él y hace clic real sobre él
+-- (el ataque usa el punto del ratón; enviar Attack a mano no funciona)
+local function attack(enemy)
+	local root, hrp = enemy:FindFirstChild("HumanoidRootPart"), getHRP()
+	if not (root and hrp) then return end
+	local away = hrp.Position - root.Position
+	away = away.Magnitude > 0.1 and Vector3.new(away.X, 0, away.Z).Unit or Vector3.new(0, 0, 1)
+	hrp.CFrame = CFrame.lookAt(root.Position + away * QUEST_DIST, root.Position)
+	local cam = workspace.CurrentCamera
+	cam.CFrame = CFrame.lookAt(hrp.Position + away * 10 + Vector3.new(0, 4, 0), root.Position)
+	local p, onScreen = cam:WorldToViewportPoint(root.Position)
+	if onScreen then
+		VIM:SendMouseMoveEvent(p.X, p.Y, game)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+	end
+end
+
+section(pageAuto, L("Combate", "Combat"))
+toggle(pageAuto, "Auto Quest (beta)", function(on)
+	autoQuest = on
+	if not on then releaseMove("Quest") end
+	log("Auto Quest " .. (on and "ON" or "OFF"))
+end, L("Lee la misión activa y la hace. Por ahora entiende las de \"Defeat\": va a por esos enemigos y les ataca hasta completarla. Aceptar y entregar la misión, de momento a mano.",
+	"Reads your active quest and does it. For now it understands \"Defeat\" quests: goes for those enemies and attacks until it's done. Accepting and turning in, by hand for now."))
+
+local lastStatus, questStart
+-- Un paso de Auto Quest. Va en pcall: si algo falla sale en la consola en vez de parar el bucle en silencio
+local function questTick()
+	local header, objs = questObjectives()
+	local target
+	for _, o in objs do
+		local name, lv, have, need = parseDefeat(o.text)
+		if name and have < need then
+			target = { name = name, lv = lv, have = have, need = need }
+			break
+		end
+	end
+
+	local status
+	if #objs == 0 then
+		status = T("Quest: no tienes ninguna misión activa", "Quest: you have no active quest")
+	elseif not target then
+		local texts = {}
+		for _, o in objs do table.insert(texts, o.text) end
+		status = T("Quest: ", "Quest: ") .. tostring(header) .. " — " .. table.concat(texts, " · ")
+			.. T(" (completa o de un tipo que aún no sé hacer)", " (done, or a type I can't do yet)")
+	else
+		status = string.format("Quest: %s %d/%d", target.name, target.have, target.need)
+	end
+	if status ~= lastStatus then
+		log(status, target and "info" or "warn")
+		lastStatus = status
+	end
+
+	if not target then
+		if questStart then
+			returnTo(questStart)
+			questStart = nil
+		end
+		releaseMove("Quest")
+		task.wait(2)
+		return
+	end
+	local enemy = findEnemy(target.name, target.lv)
+	if not enemy then
+		task.wait(1) -- todos muertos o lejos de cargar: esperar a que reaparezcan
+		return
+	end
+	if not claimMove("Quest") then return end
+	local hrp = getHRP()
+	if not questStart and hrp then questStart = hrp.CFrame end
+	equipWeapon()
+	attack(enemy)
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(0.25)
+		if autoQuest then
+			local ok, err = pcall(questTick)
+			if not ok then
+				log("Quest: error " .. tostring(err), "error")
+				task.wait(3)
+			end
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Auto Merlin
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Paquetes de Merlin (grabado): MerlinService.RF.TakePackage() -> true junto a Merlin, y luego
+-- MerlinService.RF.Deliver() -> true en el destino (en la grabación, en Pirate's Land, ~ -1253, 214, -1231).
+-- shortcut: no sabemos qué NPC es Merlin ni cómo marca el juego el destino. Merlin = modelo de Map.Merchants con
+-- "Merlin" en el nombre, o si no "QuestMerchant" (está en la isla de Merlin según la wiki). El destino se busca
+-- como un atributo Vector3 nuevo en el jugador o el personaje tras coger el paquete; si no aparece, se prueba
+-- en el sitio de la grabación. Lo que encuentre sale en la consola para fijarlo.
+local MERLIN_FALLBACK_DEST = Vector3.new(-1253, 214, -1231)
+local takeRemote = getRemote("MerlinService", "RF", "TakePackage")
+local deliverRemote = getRemote("MerlinService", "RF", "Deliver")
+local autoMerlin = false
+local merlinStart
+
+local function findMerlin()
+	local map = workspace:FindFirstChild("Map")
+	local merchants = map and map:FindFirstChild("Merchants")
+	if not merchants then return end
+	for _, m in merchants:GetChildren() do
+		if m.Name:lower():find("merlin") then return m end
+	end
+	return merchants:FindFirstChild("QuestMerchant")
+end
+
+local function vectorAttrs()
+	local out = {}
+	for _, obj in { player, player.Character } do
+		if obj then
+			for k, v in obj:GetAttributes() do
+				if typeof(v) == "Vector3" then out[obj.Name .. "@" .. k] = v end
+			end
+		end
+	end
+	return out
+end
+
+local function merlinRound()
+	local merlin, hrp = findMerlin(), getHRP()
+	if not (merlin and hrp) then
+		log(T("Merlin: no encuentro a Merlin en Map.Merchants", "Merlin: can't find Merlin in Map.Merchants"), "warn")
+		return false
+	end
+	if not merlinStart then merlinStart = hrp.CFrame end
+	teleport(merlin:GetPivot().Position + Vector3.new(0, 3, 4))
+	task.wait(0.6)
+	local before = vectorAttrs()
+	local ok, took = call(takeRemote, "InvokeServer")
+	if not (ok and took) then
+		log(T("Merlin: no me da paquete (", "Merlin: no package (") .. tostring(took) .. ")")
+		return false
+	end
+	task.wait(0.5)
+	-- ¿Dónde hay que entregarlo? Un atributo Vector3 nuevo o que haya cambiado
+	local dest, destName
+	for k, v in vectorAttrs() do
+		if before[k] ~= v then dest, destName = v, k end
+	end
+	if dest then
+		log(T("Merlin: destino en el atributo ", "Merlin: destination in attribute ") .. destName .. " = " .. tostring(dest))
+	else
+		dest = MERLIN_FALLBACK_DEST
+		log(T("Merlin: no veo el destino; pruebo en Pirate's Land", "Merlin: can't see the destination; trying Pirate's Land"), "warn")
+	end
+	teleport(dest + Vector3.new(0, 3, 0))
+	task.wait(0.6)
+	local ok2, delivered = call(deliverRemote, "InvokeServer")
+	log(T("Merlin: entrega -> ", "Merlin: delivery -> ") .. tostring(delivered), (ok2 and delivered) and "ok" or "warn", ok2 and delivered)
+	return ok2 and delivered
+end
+
+section(pageAuto, L("Farmeo", "Farming"))
+toggle(pageAuto, "Auto Merlin (beta)", function(on)
+	autoMerlin = on
+	if not on then
+		if merlinStart then returnTo(merlinStart) end
+		merlinStart = nil
+		releaseMove("Merlin")
+	end
+	log("Auto Merlin " .. (on and "ON" or "OFF"))
+end, L("Coge un paquete de Merlin, lo entrega y repite. Cada entrega cuenta para las misiones de Expertise.",
+	"Takes a package from Merlin, delivers it and repeats. Each delivery counts for Expertise missions."))
+
+task.spawn(function()
+	while alive do
+		task.wait(1)
+		local cooldown = player:GetAttribute("MerlinCooldownEnd") -- hora del servidor en la que Merlin vuelve a dar paquete
+		local waiting = type(cooldown) == "number" and cooldown > workspace:GetServerTimeNow()
+		if autoMerlin and not waiting and claimMove("Merlin") then
+			local ok, delivered = pcall(merlinRound)
+			if not ok then log("Merlin: error " .. tostring(delivered), "error") end
+			-- tras cada vuelta, de regreso a donde estabas (o a la zona segura) hasta el siguiente paquete
+			if merlinStart then returnTo(merlinStart) end
+			merlinStart = nil
+			releaseMove("Merlin")
+			if not (ok and delivered) then task.wait(5) end
+		end
+	end
+end)
+end
+
 ------------------------------------------------------------------ Zona segura
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 local safeBack -- dónde estabas al encenderla
+section(pageAuto, L("Zona segura", "Safe zone"))
 toggle(pageAuto, L("Zona segura", "Safe zone"), function(on)
 	local hrp = getHRP()
 	if on then
@@ -1626,6 +1495,7 @@ note(pageTrain, L("Te llevan a Rayleigh y juegan en bucle hasta el límite diari
 
 end
 
+local groundFruits = function() return {} end -- la rellena Frutas; la usa el ESP
 ------------------------------------------------------------------ Frutas
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 -- Rarezas y nombres de la wiki del juego (datos.json, listas "... Devil Fruits")
@@ -1672,6 +1542,19 @@ local function onGround(tool)
 	local alive = workspace:FindFirstChild("Alive") -- las que lleva alguien están en su personaje
 	return tool.Parent ~= nil and tool:IsDescendantOf(workspace) and not (alive and tool:IsDescendantOf(alive))
 		and not (player.Character and tool:IsDescendantOf(player.Character))
+end
+
+-- Frutas tiradas ahora mismo (para el ESP): { tool, name, part, rank }
+groundFruits = function()
+	local out = {}
+	for tool in loose do
+		if onGround(tool) then
+			local name = fruitOf(tool)
+			local part = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart", true)
+			if name and part then table.insert(out, { tool = tool, name = name, part = part, rank = fruitRank[name] }) end
+		end
+	end
+	return out
 end
 
 local autoFruit = false
@@ -1722,6 +1605,7 @@ local function collectFruit(tool)
 	end
 end
 
+section(pageFruits, L("Recoger", "Collect"))
 toggle(pageFruits, "Collect Devil Fruits", function(on)
 	autoFruit = on
 	if not on then releaseMove("Fruit") end
@@ -1742,44 +1626,182 @@ task.spawn(function()
 	end
 end)
 
--- Rareza mínima: un chip por rareza, solo uno marcado
-section(pageFruits, L("Rareza mínima", "Minimum rarity"))
-local rarityGrid = grid(pageFruits, "chip")
-local rarityChips = {}
-for rank, r in FRUIT_RARITIES do
-	rarityChips[rank] = chip(rarityGrid, r.name, function()
+-- Filtro: rareza mínima y frutas concretas (varias; si no hay ninguna marcada, vale cualquiera)
+section(pageFruits, L("Filtro", "Filter"))
+do
+	local rarityNames = {}
+	for rank, r in FRUIT_RARITIES do rarityNames[rank] = r.name end
+	combo(pageFruits, L("Rareza mínima", "Minimum rarity"), rarityNames, config.fruitMin, function(rank)
 		config.fruitMin = rank
 		saveConfig()
-		for i, c in rarityChips do c.set(i == rank) end
 	end, L("Solo recoge frutas de esta rareza o mejores.", "Only picks up fruits of this rarity or better."))
-	rarityChips[rank].set(rank == config.fruitMin)
 end
-
--- Frutas concretas: varias a la vez; si no hay ninguna marcada, vale cualquiera
-local fruitChips = {}
+local fruitLists = {}
 for _, r in FRUIT_RARITIES do
-	section(pageFruits, r.name)
-	local g = grid(pageFruits, "chip")
-	for _, f in r.fruits do
-		fruitChips[f] = chip(g, f, function(c)
-			config.fruitSel[f] = (not c.value) or nil
-			saveConfig()
-			c.set(not c.value)
-		end, L("Marca o desmarca " .. f .. ".", "Select or unselect " .. f .. "."))
-		fruitChips[f].set(config.fruitSel[f] == true)
-	end
+	local defaults = {}
+	for i, f in r.fruits do defaults[i] = config.fruitSel[f] == true end
+	table.insert(fruitLists, multi(pageFruits, r.name, r.fruits, defaults, function(chosen)
+		for i, f in r.fruits do config.fruitSel[f] = chosen[i] or nil end
+		saveConfig()
+	end, L("Elige qué frutas de esta rareza recoger.", "Choose which fruits of this rarity to pick up.")))
 end
 note(pageFruits, L("Si no marcas ninguna fruta, recoge cualquiera desde la rareza mínima. Si marcas algunas, solo esas (y que cumplan la rareza mínima).",
 	"If you don't select any fruit, it picks up any from the minimum rarity. If you select some, only those (as long as they meet the minimum rarity)."))
 button(pageFruits, L("Quitar selección", "Clear selection"), function()
 	table.clear(config.fruitSel)
 	saveConfig()
-	for _, c in fruitChips do c.set(false) end
+	for _, list in fruitLists do list:Set({}) end
 end, L("Desmarca todas las frutas.", "Unselects every fruit."))
 
-local NPCS -- también lo usa la pestaña GUIs
+
+-- Cajas y venta de frutas (grabado):
+--   abrir: con la caja en la mano ("Common Box"), FruitBoxService.RE.Open()
+--   vender: junto al comprador (al lado de Sam), con la fruta en la mano, FruitTradeService.RF.GetQuote() ->
+--           { Fruit = "Spin", Rarity = "Common", Beri = 25000, Id = 1, Aura, Rainbow } y luego
+--           FruitTradeService.RF.Sell("Beri", Id) -> true
+-- Solo se abren cajas y se venden frutas por DEBAJO de Rare (Common y Uncommon). Nunca se vende una fruta con aura
+-- o arcoíris, ni una que el comprador diga que es Rare o mejor.
+local SELL_BELOW = 3 -- rango de Rare: 1 Common, 2 Uncommon, 3 Rare, 4 Ultra Rare
+local RARITY_RANK = { Common = 1, Uncommon = 2, Rare = 3, ["Ultra Rare"] = 4 }
+local boxOpen = getRemote("FruitBoxService", "RE", "Open")
+local getQuote = getRemote("FruitTradeService", "RF", "GetQuote")
+local sellRemote = getRemote("FruitTradeService", "RF", "Sell")
+local autoBoxes, autoSell = false, false
+
+-- "Ultra Rare Box" -> 4, "Uncommon Box" -> 2 ... (el orden importa: "Uncommon" contiene "common")
+local function boxRank(name)
+	local n = name:lower()
+	if not n:find("box") then return nil end
+	if n:find("ultra") then return 4 end
+	if n:find("uncommon") then return 2 end
+	if n:find("common") then return 1 end
+	if n:find("rare") then return 3 end
+end
+assert(boxRank("Common Box") == 1 and boxRank("Uncommon Box") == 2 and boxRank("Rare Box") == 3 and boxRank("Black Leg") == nil)
+
+local function myTools()
+	local list = {}
+	for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
+		for _, t in holder and holder:GetChildren() or {} do
+			if t:IsA("Tool") then table.insert(list, t) end
+		end
+	end
+	return list
 end
 
+local function hold(tool)
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	if tool.Parent ~= player.Character then
+		hum:EquipTool(tool)
+		task.wait(0.35)
+	end
+	return tool.Parent == player.Character
+end
+
+-- El comprador está al lado de Sam: el NPC de Map.Merchants más cercano a Quest Man (sin contarle a él)
+local function fruitBuyer()
+	local sam = merchant("QuestMerchant2")
+	local merchants = sam and sam.Parent
+	if not merchants then return end
+	local best, bestDist
+	for _, m in merchants:GetChildren() do
+		if m ~= sam and m:IsA("Model") then
+			local d = (m:GetPivot().Position - sam:GetPivot().Position).Magnitude
+			if not bestDist or d < bestDist then best, bestDist = m, d end
+		end
+	end
+	if best and bestDist < 60 then return best end
+	return sam -- si no hay ninguno cerca, al menos al lado de Sam
+end
+
+local function openBoxes()
+	local opened = 0
+	for _, tool in myTools() do
+		local rank = boxRank(tool.Name)
+		if rank and rank < SELL_BELOW and hold(tool) then
+			call(boxOpen, "FireServer")
+			opened += 1
+			log(T("Cajas: abierta ", "Boxes: opened ") .. tool.Name, "ok", true)
+			task.wait(1.5) -- que llegue la fruta
+		end
+	end
+	return opened
+end
+
+local function fruitsToSell()
+	local list = {}
+	for _, tool in myTools() do
+		local name = fruitOf(tool)
+		if name and not boxRank(tool.Name) and fruitRank[name] < SELL_BELOW then table.insert(list, tool) end
+	end
+	return list
+end
+
+local function sellFruits()
+	local list = fruitsToSell()
+	if #list == 0 then return end
+	local hrp, buyer = getHRP(), fruitBuyer()
+	if not (hrp and buyer) then return end
+	if not claimMove("Sell") then return end
+	local back = hrp.CFrame
+	local char = player.Character
+	local prevTool = char and char:FindFirstChildOfClass("Tool")
+	teleport(buyer:GetPivot().Position + Vector3.new(0, 3, 4))
+	task.wait(0.6)
+	for _, tool in list do
+		if hold(tool) then
+			local ok, quote = call(getQuote, "InvokeServer")
+			local rank = ok and type(quote) == "table" and RARITY_RANK[quote.Rarity]
+			if not rank then
+				log(T("Venta: el comprador no me da precio para ", "Sell: the buyer gives no price for ") .. tool.Name, "warn")
+			elseif rank >= SELL_BELOW or quote.Aura or quote.Rainbow then
+				log(T("Venta: no vendo ", "Sell: not selling ") .. tostring(quote.Fruit) .. " (" .. tostring(quote.Rarity) .. ")", "warn")
+			else
+				local sold_ok, sold = call(sellRemote, "InvokeServer", "Beri", quote.Id)
+				if sold_ok and sold then
+					log(string.format(T("Venta: %s (%s) por %s Beri", "Sell: %s (%s) for %s Beri"), tostring(quote.Fruit),
+						tostring(quote.Rarity), tostring(quote.Beri)), "ok", true)
+				else
+					log(T("Venta: no se pudo vender ", "Sell: couldn't sell ") .. tostring(quote.Fruit), "warn")
+				end
+			end
+			task.wait(0.4)
+		end
+	end
+	returnTo(back)
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if hum and prevTool and prevTool.Parent == player:FindFirstChild("Backpack") then hum:EquipTool(prevTool) end
+	releaseMove("Sell")
+	log(T("Venta: comprador = ", "Sell: buyer = ") .. buyer.Name)
+end
+
+section(pageFruits, L("Cajas y venta", "Boxes and selling"))
+toggle(pageFruits, L("Auto abrir cajas (< Rare)", "Auto open boxes (< Rare)"), function(on)
+	autoBoxes = on
+	log(T("Auto abrir cajas ", "Auto open boxes ") .. (on and "ON" or "OFF"))
+end, L("Abre solas las cajas Common y Uncommon que tengas (por ejemplo las que da Sam). Las Rare o mejores no las toca.",
+	"Opens the Common and Uncommon boxes you have (e.g. the ones Sam gives). Rare or better ones are left alone."))
+toggle(pageFruits, L("Auto vender frutas (< Rare)", "Auto sell fruits (< Rare)"), function(on)
+	autoSell = on
+	if not on then releaseMove("Sell") end
+	log(T("Auto vender frutas ", "Auto sell fruits ") .. (on and "ON" or "OFF"))
+end, L("Lleva tus frutas Common y Uncommon al comprador que hay al lado de Sam, las vende por Beri y te devuelve. Nunca vende Rare o mejores, ni con aura o arcoíris.",
+	"Takes your Common and Uncommon fruits to the buyer next to Sam, sells them for Beri and brings you back. Never sells Rare or better, or with aura or rainbow."))
+
+task.spawn(function()
+	while alive do
+		task.wait(3)
+		local ok, err = pcall(function()
+			if autoBoxes then openBoxes() end
+			if autoSell then sellFruits() end
+		end)
+		if not ok then log(T("Cajas/venta: error ", "Boxes/sell: error ") .. tostring(err), "error") end
+	end
+end)
+end
+
+local NPCS -- también lo usa la pestaña GUIs
 ------------------------------------------------------------------ Teleports
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 -- NPCs con interfaz o servicio útil (también los usa la pestaña GUIs)
@@ -2090,204 +2112,144 @@ toggle(pageMisc, L("Auto Hop si hay admin", "Auto Hop if admin"), function(on)
 end, L("Te cambia a otro servidor en cuanto detecta un admin. Si Auto Kick también está encendido, gana Auto Kick.",
 	"Moves you to another server as soon as an admin is detected. If Auto Kick is also on, Auto Kick wins."))
 
-local waitingKey = false -- también lo usa la tecla para ocultar
-local applyProfile -- también se usa al iniciar
+------------------------------------------------------------------ ESP
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Marcas que solo ves tú: nombre y distancia encima de jugadores, cofres y frutas tiradas.
+-- Jugadores además con contorno (Highlight: Roblox solo dibuja ~31 a la vez, por eso cofres y frutas no).
+local ESP_MAX_DIST = 3000
+local espOn = { players = false, chests = false, fruits = false }
+local espFolder = Instance.new("Folder")
+espFolder.Name = "ElHoyoHubESP"
+espFolder.Parent = gui.Parent -- las BillboardGui no se dibujan dentro de una ScreenGui
+table.insert(cleanup, { Disconnect = function() espFolder:Destroy() end })
+
+local RARITY_COLOR = { "dim", "on", "accent", "err" } -- Común, Poco común, Rara, Ultra rara
+local marks = {} -- objetivo -> { bb, label, hl, seen }
+
+local function mark(target, part, text, color, outline)
+	local m = marks[target]
+	if not m then
+		local bb = Instance.new("BillboardGui")
+		bb.AlwaysOnTop = true
+		bb.LightInfluence = 0
+		bb.Size = UDim2.fromOffset(220, 32)
+		bb.StudsOffset = Vector3.new(0, 3, 0)
+		bb.MaxDistance = ESP_MAX_DIST
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = FONT_SEMI
+		label.TextSize = 13
+		label.TextStrokeTransparency = 0.35
+		label.Parent = bb
+		bb.Parent = espFolder
+		m = { bb = bb, label = label }
+		if outline then
+			local hl = Instance.new("Highlight")
+			hl.FillTransparency = 0.85
+			hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			hl.Adornee = target
+			hl.Parent = espFolder
+			m.hl = hl
+		end
+		marks[target] = m
+	end
+	m.bb.Adornee = part
+	m.label.Text = text
+	m.label.TextColor3 = color
+	if m.hl then
+		m.hl.OutlineColor = color
+		m.hl.FillColor = color
+	end
+	m.seen = true
 end
 
+local function firstPart(model)
+	return model:FindFirstChild("Pos1") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(0.3)
+		for _, m in marks do m.seen = false end
+		local hrp = getHRP()
+		if hrp then
+			if espOn.players then
+				for _, p in Players:GetPlayers() do
+					local char = p.Character
+					local root = char and char:FindFirstChild("HumanoidRootPart")
+					if p ~= player and root then
+						local lv = char:GetAttribute("Level")
+						mark(char, root, string.format("%s%s  [%d]", p.Name, lv and (" · Lv " .. lv) or "",
+							(root.Position - hrp.Position).Magnitude), C.accent, true)
+					end
+				end
+			end
+			if espOn.chests then
+				local inst = workspace:FindFirstChild("Instances")
+				local folder = inst and inst:FindFirstChild("Chests")
+				for _, c in folder and folder:GetChildren() or {} do
+					local part = c:IsA("Model") and firstPart(c)
+					if part then
+						mark(c, part, string.format("%s  [%d]", T("Cofre", "Chest"), (part.Position - hrp.Position).Magnitude), C.warn)
+					end
+				end
+			end
+			if espOn.fruits then
+				for _, f in groundFruits() do
+					mark(f.tool, f.part, string.format("%s Fruit  [%d]", f.name, (f.part.Position - hrp.Position).Magnitude),
+						C[RARITY_COLOR[f.rank]] or C.text)
+				end
+			end
+		end
+		for target, m in marks do
+			if not m.seen then
+				m.bb:Destroy()
+				if m.hl then m.hl:Destroy() end
+				marks[target] = nil
+			end
+		end
+	end
+end)
+
+section(pageMisc, "ESP")
+toggle(pageMisc, L("ESP jugadores", "Player ESP"), function(on) espOn.players = on end,
+	L("Muestra el nombre, nivel y distancia de los demás jugadores, con contorno, a través de las paredes.",
+		"Shows other players' name, level and distance, with an outline, through walls."))
+toggle(pageMisc, L("ESP cofres", "Chest ESP"), function(on) espOn.chests = on end,
+	L("Muestra dónde están los cofres del mapa y a qué distancia.", "Shows where the map's chests are and how far."))
+toggle(pageMisc, L("ESP frutas", "Fruit ESP"), function(on) espOn.fruits = on end,
+	L("Muestra las Devil Fruits tiradas en el suelo, con el color de su rareza.", "Shows Devil Fruits lying on the ground, colored by rarity."))
+end
+
+end
+
+local waitingKey = false -- también lo usa la tecla para ocultar
 ------------------------------------------------------------------ Ajustes
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
-section(pageSettings, L("Idioma", "Language"))
-button(pageSettings, "Español", function()
-	setLang("es")
-	log("Idioma: español", "ok", true)
-end, L("Pone el hub en español.", "Switches the hub to Spanish."))
-button(pageSettings, "English", function()
-	setLang("en")
-	log("Language: English", "ok", true)
-end, L("Pone el hub en inglés.", "Switches the hub to English."))
-
-section(pageSettings, L("Paleta de colores", "Color palette"))
-for _, name in PALETTE_ORDER do
-	button(pageSettings, name, function()
-		setPalette(name)
-		log(T("Paleta: ", "Palette: ") .. name, "ok", true)
-	end, L("Cambia los colores del hub a la paleta " .. name .. ".", "Changes the hub colors to the " .. name .. " palette."))
-end
-
 section(pageSettings, L("Interfaz", "Interface"))
+note(pageSettings, L("Idioma, tamaño del menú y estilo (tema y color de acento): pulsa tu perfil, abajo a la izquierda. Perfiles con nombre (guardar, cargar, borrar, papelera): arriba, junto al icono de guardar.",
+	"Language, menu size and style (theme and accent colour): click your profile, bottom left. Named presets (save, load, delete, bin): at the top, next to the save icon."))
+
 local notifyToggle = toggle(pageSettings, L("Notificaciones", "Notifications"), function(on)
 	config.notify = on
 	saveConfig()
-end, L("Muestra avisos abajo a la derecha. Los errores se avisan siempre.", "Shows notices at the bottom right. Errors are always shown."), true)
+end, L("Muestra avisos arriba a la derecha. Los errores se avisan siempre.", "Shows notices at the top right. Errors are always shown."), true)
 notifyToggle.set(config.notify)
 
-waitingKey = false
-local keyButton
-keyButton = button(pageSettings, L("Tecla: " .. config.key, "Key: " .. config.key), function()
+button(pageSettings, L("Cambiar tecla para ocultar", "Change hide key"), function()
 	if waitingKey then return end
 	waitingKey = true
-	bind(keyButton, "Text", L("Pulsa una tecla...", "Press a key..."))
-	local input
+	log(T("Pulsa la tecla que quieras para mostrar u ocultar el hub", "Press the key you want to show or hide the hub"), "warn")
+	local pressed
 	repeat
-		input = UIS.InputBegan:Wait()
-	until input.UserInputType == Enum.UserInputType.Keyboard and not UIS:GetFocusedTextBox()
-	config.key = input.KeyCode.Name
+		pressed = UIS.InputBegan:Wait()
+	until pressed.UserInputType == Enum.UserInputType.Keyboard and not UIS:GetFocusedTextBox()
+	config.key = pressed.KeyCode.Name
 	saveConfig()
-	bind(keyButton, "Text", L("Tecla: " .. config.key, "Key: " .. config.key))
-	bind(subtitle, "Text", keyHint())
 	task.defer(function() waitingKey = false end) -- que esa misma pulsación no oculte el hub
 	log(T("Tecla para ocultar: ", "Hide key: ") .. config.key, "ok", true)
-end, L("Elige la tecla que muestra u oculta el hub.", "Choose the key that shows or hides the hub."))
-
-local function setScale(v)
-	userScale = math.clamp(v, 0.5, 2)
-	config.scale = userScale
-	saveConfig()
-	tween(mainScale, { Scale = userScale }, NORMAL)
-end
-button(pageSettings, L("Tamaño +", "Size +"), function() setScale(userScale + 0.1) end, L("Agranda el hub un 10 %.", "Makes the hub 10% bigger."))
-button(pageSettings, L("Tamaño −", "Size −"), function() setScale(userScale - 0.1) end, L("Reduce el hub un 10 %.", "Makes the hub 10% smaller."))
-button(pageSettings, L("Restablecer posición y tamaño", "Reset position and size"), function()
-	setScale(1)
-	tween(main, { Position = UDim2.new(0.5, -WIDTH / 2, 0.5, -HEIGHT / 2) }, 0.35)
-end, L("Vuelve al tamaño original y centra el hub en la pantalla.", "Goes back to the original size and centers the hub on screen."))
-note(pageSettings, L("También puedes arrastrar la esquina ◢ de abajo a la derecha para cambiar el tamaño. Todo lo que cambies aquí se guarda para la próxima vez.",
-	"You can also drag the ◢ corner at the bottom right to resize. Everything you change here is saved for next time."))
-
------------------------------------------------------------------- Perfiles
--- Un perfil guarda qué funciones están encendidas y los ajustes (idioma, paleta, tecla, avisos, tamaño)
--- con el nombre que elijas. Se guardan en config.profiles (archivo ElHoyoHub.json).
-local DEFAULT_PROFILE = { toggles = {}, lang = "es", palette = "Abismo", key = "RightShift", notify = true, scale = 1 }
-
-local function currentProfile()
-	local on = {}
-	for id, t in toggles do
-		if t.value and not t.noSave then on[id] = true end
-	end
-	return { toggles = on, lang = LANG, palette = config.palette, key = config.key, notify = config.notify, scale = userScale }
-end
-
-applyProfile = function(p)
-	for id, t in toggles do
-		local want = not t.noSave and p.toggles ~= nil and p.toggles[id] == true
-		if not t.noSave and t.value ~= want then
-			t.set(want)
-			task.spawn(t.onChange, want)
-		end
-	end
-	if p.lang then setLang(p.lang) end
-	if p.palette and PALETTES[p.palette] then setPalette(p.palette) end
-	if p.key and Enum.KeyCode[p.key] then
-		config.key = p.key
-		bind(keyButton, "Text", L("Tecla: " .. config.key, "Key: " .. config.key))
-		bind(subtitle, "Text", keyHint())
-	end
-	if p.notify ~= nil then
-		config.notify = p.notify
-		notifyToggle.set(p.notify)
-	end
-	if p.scale then setScale(p.scale) end
-	saveConfig()
-end
-
-section(pageSettings, L("Perfiles", "Profiles"))
-local profileName = input(pageSettings, L("Nombre del perfil", "Profile name"))
-
-local function nameOrWarn()
-	local name = profileName.Text:match("^%s*(.-)%s*$")
-	if name == "" then
-		log(T("Escribe un nombre de perfil", "Type a profile name"), "warn")
-		return nil
-	end
-	return name
-end
-
-local profileList -- cuadrícula con los perfiles guardados (se rellena abajo)
-local function refreshProfiles()
-	for _, child in profileList:GetChildren() do
-		if child:IsA("GuiButton") then child:Destroy() end
-	end
-	local names = {}
-	for name in config.profiles do table.insert(names, name) end
-	table.sort(names)
-	for _, name in names do
-		button(profileList, name, function() profileName.Text = name end,
-			L("Pone este nombre en el campo de arriba.", "Puts this name in the field above."))
-	end
-end
-
--- Borrar y Resetear piden pulsar dos veces (en 3 s) para no perder nada por error
-local armed = {}
-local function confirmed(action)
-	if armed[action] and os.clock() - armed[action] < 3 then
-		armed[action] = nil
-		return true
-	end
-	armed[action] = os.clock()
-	log(T("Pulsa otra vez para confirmar", "Press again to confirm"), "warn")
-	return false
-end
-
-button(pageSettings, L("Guardar", "Save"), function()
-	local name = nameOrWarn()
-	if not name then return end
-	config.profiles[name] = currentProfile()
-	saveConfig()
-	refreshProfiles()
-	log(T("Perfil guardado: ", "Profile saved: ") .. name, "ok", true)
-end, L("Guarda las funciones encendidas y los ajustes con este nombre (si ya existe, lo sobrescribe).",
-	"Saves the active features and settings under this name (overwrites it if it exists)."))
-button(pageSettings, L("Cargar", "Load"), function()
-	local name = nameOrWarn()
-	if not name then return end
-	local p = config.profiles[name]
-	if not p then return log(T("No existe el perfil ", "There's no profile called ") .. name, "warn") end
-	applyProfile(p)
-	log(T("Perfil cargado: ", "Profile loaded: ") .. name, "ok", true)
-end, L("Enciende y apaga las funciones y aplica los ajustes de este perfil.", "Turns features on and off and applies this profile's settings."))
-button(pageSettings, L("Borrar", "Delete"), function()
-	local name = nameOrWarn()
-	if not name then return end
-	if not config.profiles[name] then return log(T("No existe el perfil ", "There's no profile called ") .. name, "warn") end
-	if not confirmed("delete:" .. name) then return end
-	config.profiles[name] = nil
-	saveConfig()
-	refreshProfiles()
-	log(T("Perfil borrado: ", "Profile deleted: ") .. name, "ok", true)
-end, L("Borra este perfil. Pulsa dos veces para confirmar.", "Deletes this profile. Press twice to confirm."))
-button(pageSettings, L("Resetear", "Reset"), function()
-	if not confirmed("reset") then return end
-	applyProfile(DEFAULT_PROFILE)
-	log(T("Todo apagado y ajustes por defecto", "Everything off and default settings"), "ok", true)
-end, L("Apaga todas las funciones y vuelve a los ajustes por defecto. No borra tus perfiles. Pulsa dos veces para confirmar.",
-	"Turns every feature off and goes back to the default settings. Doesn't delete your profiles. Press twice to confirm."))
-
-note(pageSettings, L("Perfiles guardados (pulsa uno para elegirlo):", "Saved profiles (click one to pick it):"))
-profileList = grid(pageSettings)
-refreshProfiles()
-
--- Perfil que se carga solo al abrir el hub (útil al cambiar de servidor)
-local autoProfileNote = note(pageSettings, "")
-local function showAutoProfile()
-	bind(autoProfileNote, "Text", config.autoProfile
-		and L("Al abrir el hub se carga el perfil: " .. config.autoProfile, "When the hub opens it loads the profile: " .. config.autoProfile)
-		or L("Ningún perfil se carga solo al abrir el hub.", "No profile loads automatically when the hub opens."))
-end
-showAutoProfile()
-button(pageSettings, L("Cargar al iniciar", "Load on start"), function()
-	local name = nameOrWarn()
-	if not name then return end
-	if not config.profiles[name] then return log(T("No existe el perfil ", "There's no profile called ") .. name, "warn") end
-	config.autoProfile = name
-	saveConfig()
-	showAutoProfile()
-	log(T("Se cargará al iniciar: ", "Will load on start: ") .. name, "ok", true)
-end, L("Este perfil se cargará solo cada vez que se abra el hub.", "This profile will load by itself every time the hub opens."))
-button(pageSettings, L("No cargar al iniciar", "Don't load on start"), function()
-	config.autoProfile = nil
-	saveConfig()
-	showAutoProfile()
-end, L("Ningún perfil se cargará solo al abrir el hub.", "No profile will load by itself when the hub opens."))
+end, L("Elige la tecla que muestra u oculta el hub (ahora RightShift si no la has cambiado).", "Choose the key that shows or hides the hub (RightShift unless you changed it)."))
 
 ------------------------------------------------------------------ Autoexec
 -- Autoexec = que el hub se abra solo:
@@ -2329,13 +2291,11 @@ local function applyAutoexec()
 end
 
 section(pageSettings, "Autoexec")
-local urlBox = input(pageSettings, L("URL raw del script (la de tu loadstring)", "Script raw URL (the one in your loadstring)"))
-urlBox.Text = config.hubUrl or ""
-urlBox.FocusLost:Connect(function()
-	config.hubUrl = urlBox.Text:match("^%s*(.-)%s*$")
+input(pageSettings, "URL", L("URL raw del script", "Script raw URL"), config.hubUrl or "", function(text)
+	config.hubUrl = text:match("^%s*(.-)%s*$")
 	saveConfig()
 	applyAutoexec()
-end)
+end, L("La URL raw de tu loadstring. ElHoyoUI.lua se descarga del mismo sitio.", "The raw URL of your loadstring. ElHoyoUI.lua is downloaded from the same place."))
 local autoExecToggle
 autoExecToggle = toggle(pageSettings, "Autoexec", function(on)
 	if on and not hasUrl() then
@@ -2354,11 +2314,9 @@ autoExecToggle = toggle(pageSettings, "Autoexec", function(on)
 		log(T("Tu executor no deja escribir en autoexec: solo se abrirá al cambiar de servidor",
 			"Your executor can't write to autoexec: it will only open when you change server"), "warn")
 	end
-end, L("El hub se abre solo al entrar al juego y al cambiar de servidor. Junto con \"Cargar al iniciar\", sigue farmeando donde lo dejaste.",
-	"The hub opens by itself when you join the game and when you change server. Together with \"Load on start\", it keeps farming where you left off."), true)
+end, L("El hub se abre solo al entrar al juego y al cambiar de servidor, y carga el último perfil que usaste.",
+	"The hub opens by itself when you join the game and when you change server, and loads the last preset you used."), true)
 autoExecToggle.set(config.autoExec == true)
-note(pageSettings, L("Se guarda un archivo ElHoyoHub.lua en la carpeta autoexec de tu executor que descarga el hub de esa URL. Solo se ejecuta en este juego.",
-	"A file ElHoyoHub.lua is saved in your executor's autoexec folder that downloads the hub from that URL. It only runs in this game."))
 applyAutoexec() -- cada vez que se abre, deja preparado el siguiente servidor
 
 section(pageSettings, "Hub")
@@ -2373,89 +2331,61 @@ button(pageSettings, L("Apagar todo", "Turn everything off"), function()
 	end
 	log(T("Apagadas ", "Turned off ") .. n .. T(" funciones", " features"), "ok", true)
 end, L("Apaga todas las funciones encendidas sin cerrar el hub.", "Turns off every active feature without closing the hub."))
-button(pageSettings, L("Cerrar El Hoyo Hub", "Close El Hoyo Hub"), function() closeHub() end,
+button(pageSettings, L("Cerrar El Hoyo Hub", "Close El Hoyo Hub"), function() genv.ElHoyoHubClose() end,
 	L("Apaga todas las funciones y cierra el hub.", "Turns off every feature and closes the hub."))
-
 end
 
------------------------------------------------------------------- Tamaño, ocultar, cursor, cerrar
--- Esquina para escalar todo el hub arrastrando
-local grip = new("TextButton", {
-	Text = "◢",
-	TextSize = 12,
-	TextColor3 = C.line,
-	BackgroundTransparency = 1,
-	Size = UDim2.fromOffset(16, 16),
-	Position = UDim2.new(1, -18, 1, -18),
-	ZIndex = 5,
-	Parent = main,
-})
-grip.MouseEnter:Connect(function() tween(grip, { TextColor3 = C.accent }, FAST) end)
-grip.MouseLeave:Connect(function() tween(grip, { TextColor3 = C.line }, FAST) end)
-tooltip(grip, L("Arrastra para cambiar el tamaño", "Drag to resize"))
-local resizing, startX, startScale = false, 0, 1
-grip.MouseButton1Down:Connect(function()
-	resizing, startX, startScale = true, mouse.X, userScale
-end)
-table.insert(cleanup, UIS.InputChanged:Connect(function(input)
-	if resizing and input.UserInputType == Enum.UserInputType.MouseMovement then
-		userScale = math.clamp(startScale + (mouse.X - startX) / 300, 0.5, 2)
-		mainScale.Scale = userScale
-	end
-end))
-table.insert(cleanup, UIS.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 and resizing then
-		resizing = false
-		config.scale = userScale
-		saveConfig()
-	end
-end))
-
-local mainShown = true
-local function setMain(show)
-	mainShown = show
-	hideTip()
-	if show then
-		main.Visible = true
-		mainScale.Scale = userScale * 0.96
-		tween(mainScale, { Scale = userScale }, NORMAL)
-	else
-		tween(mainScale, { Scale = userScale * 0.96 }, FAST)
-		task.delay(FAST, function()
-			if not mainShown then main.Visible = false end
-		end)
-	end
+------------------------------------------------------------------ Ocultar, cursor, cerrar
+local function closeHub()
+	alive = false -- todos los bucles miran esto y se paran
+	for _, c in cleanup do c:Disconnect() end
+	pcall(UI.Unload, UI)
+	gui:Destroy()
 end
+
+-- Mostrar / ocultar con la tecla elegida (la librería no la gestiona: ToggleKey = false)
 table.insert(cleanup, UIS.InputBegan:Connect(function(input)
 	if waitingKey or UIS:GetFocusedTextBox() then return end
-	if input.KeyCode.Name == config.key then setMain(not mainShown) end
+	if input.KeyCode.Name == config.key then main.Visible = not main.Visible end
 end))
 
--- Cursor: el juego a veces lo esconde o lo bloquea en el centro. Un botón Modal visible libera el ratón
--- mientras el hub está abierto, y encima del hub o la consola se fuerza a que se vea.
-new("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 0), Modal = true, Parent = main })
+-- Cursor: el juego a veces lo esconde. Encima del hub o la consola se fuerza a que se vea.
 table.insert(cleanup, game:GetService("RunService").RenderStepped:Connect(function()
 	if overOurGui() then UIS.MouseIconEnabled = true end
 end))
 
-closeHub = function()
-	alive = false
-	for _, c in cleanup do c:Disconnect() end
-	tween(mainScale, { Scale = userScale * 0.94 }, FAST)
-	tween(main, { BackgroundTransparency = 1 }, FAST)
-	task.delay(FAST, function() gui:Destroy() end)
-end
-
 ------------------------------------------------------------------ Inicio
 genv.ElHoyoHubClose = closeHub
-selectTab(tabs[1])
-tween(mainScale, { Scale = userScale }, NORMAL)
+fitBoxes()
+win:Finish() -- coloca todo y carga el último perfil usado (eso enciende sus funciones)
 log(T("El Hoyo Hub cargado", "El Hoyo Hub loaded"), "ok", true)
-for _, name in missingRemotes do
-	log(T("No encuentro la señal ", "Can't find the signal ") .. name .. T(" (¿actualización del juego?)", " (game update?)"), "error")
+for _, missing in missingRemotes do
+	log(T("No encuentro la señal ", "Can't find the signal ") .. missing .. T(" (¿actualización del juego?)", " (game update?)"), "error")
 end
-if config.autoProfile and config.profiles[config.autoProfile] then
-	applyProfile(config.profiles[config.autoProfile])
-	log(T("Perfil cargado al iniciar: ", "Profile loaded on start: ") .. config.autoProfile, "ok", true)
 end
 
+local ok, err = xpcall(ElHoyoHubMain, debug.traceback)
+if not ok then
+	warn("[El Hoyo Hub] " .. tostring(err))
+	if setclipboard then pcall(setclipboard, tostring(err)) end
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "ElHoyoHubError"
+	sg.ResetOnSpawn = false
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.fromOffset(520, 220)
+	box.Position = UDim2.new(0.5, -260, 0.5, -110)
+	box.BackgroundColor3 = Color3.fromHex("15151E")
+	box.TextColor3 = Color3.fromHex("EF4444")
+	box.Font = Enum.Font.Code
+	box.TextSize = 13
+	box.TextWrapped = true
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	box.TextYAlignment = Enum.TextYAlignment.Top
+	box.ClearTextOnFocus = false
+	box.TextEditable = false
+	box.Text = "El Hoyo Hub no ha podido abrirse (error copiado al portapapeles):\n\n" .. tostring(err)
+	box.Parent = sg
+	Instance.new("UICorner", box)
+	sg.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+	task.delay(30, function() sg:Destroy() end)
+end
