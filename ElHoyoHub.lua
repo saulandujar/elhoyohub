@@ -2583,10 +2583,10 @@ end
 --  * Exprimidor: Workspace.Map.Other.Tent2.Model.JuicingBowl (Bowl, Mixer1, Mixer2; ClickDetector 10 studs).
 --    Sale la Tool "<fruta> Juice" ("Banana Juice", "Sour Juice").
 --  * Beber: con el zumo en la mano, PlayerGui.Drink tiene DrinkOne y DrinkAll ("Drink all (n)").
--- Sin confirmar: cómo se usa el exprimidor (se equipa la fruta y se clican sus tres piezas) y si se nota un
--- barril vacío.
+-- Exprimidor (confirmado por el usuario): un clic y a los pocos segundos da los zumos de todas las frutas.
+-- Sin confirmar: si se nota un barril vacío.
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
-local BARREL_COOLDOWN = 300 -- shortcut: no sé cuándo se rellena un barril; se salta 5 min. Mirar si cambia algo al vaciarse
+local BARREL_COOLDOWN = 180 -- shortcut: el usuario calcula 2-3 min hasta que se rellena; mirar si el barril cambia al vaciarse
 local BARRELS_PER_ROUND = 15
 local autoStats = false
 local visited = {} -- pieza del barril -> os.clock() de la última visita
@@ -2650,44 +2650,45 @@ end
 
 local function makeJuice()
 	if juiceFailed then return end
-	local list = {}
+	local count = 0
 	for _, t in tools() do
-		if fruitNames[t.Name] then table.insert(list, t) end
+		if fruitNames[t.Name] then count += 1 end
 	end
-	if #list == 0 then return end
+	if count == 0 then return end
+	-- JuicingBowl es una carpeta (no tiene GetPivot): se usa su pieza con ClickDetector
 	local map = workspace:FindFirstChild("Map")
 	local other = map and map:FindFirstChild("Other")
 	local bowl = other and other:FindFirstChild("JuicingBowl", true)
-	local hum = humanoid()
-	if not (bowl and hum) then
-		return log(T("Auto Stats: no encuentro el exprimidor (Map.Other...JuicingBowl)", "Auto Stats: can't find the juicer (Map.Other...JuicingBowl)"), "warn")
-	end
-	teleport(bowl:GetPivot().Position + Vector3.new(0, 3, 4))
-	task.wait(0.5)
-	for _, fruit in list do
-		if not autoStats then break end
-		if fruit.Parent then
-			hum:EquipTool(fruit)
-			task.wait(0.3)
-			for _, d in bowl:GetDescendants() do
-				if d:IsA("ClickDetector") and fireclickdetector and fruit.Parent then
-					fireclickdetector(d, 0)
-					task.wait(0.4)
-				end
-			end
-			local t0 = os.clock()
-			while fruit.Parent and os.clock() - t0 < 3 do task.wait(0.2) end
-			if fruit.Parent then
-				-- no se gastó: no insistir en cada vuelta
-				juiceFailed = true
-				hum:UnequipTools()
-				return log(T("Auto Stats: la fruta no se gasta en el exprimidor. Dime cómo lo haces a mano (qué clicas y con qué en la mano)",
-					"Auto Stats: the fruit isn't used by the juicer. Tell me how you do it by hand (what you click and holding what)"), "warn")
-			end
-			log(T("Auto Stats: exprimida ", "Auto Stats: juiced ") .. fruit.Name)
+	local detector
+	for _, d in bowl and bowl:GetDescendants() or {} do
+		if d:IsA("ClickDetector") and d.Parent:IsA("BasePart") then
+			detector = d
+			if d.Parent.Name == "Bowl" then break end
 		end
 	end
-	hum:UnequipTools()
+	if not detector then
+		return log(T("Auto Stats: no encuentro el exprimidor (Map.Other...JuicingBowl)", "Auto Stats: can't find the juicer (Map.Other...JuicingBowl)"), "warn")
+	end
+	teleport(detector.Parent.Position + Vector3.new(0, 3, 4))
+	task.wait(0.5)
+	-- Un clic y a los pocos segundos convierte todas las frutas en zumos (confirmado por el usuario)
+	if fireclickdetector then fireclickdetector(detector, 0) end
+	local t0 = os.clock()
+	local left
+	repeat
+		task.wait(0.5)
+		left = 0
+		for _, t in tools() do
+			if fruitNames[t.Name] then left += 1 end
+		end
+	until left < count or os.clock() - t0 > 10
+	if left >= count then
+		juiceFailed = true -- no insistir en cada vuelta
+		return log(T("Auto Stats: el exprimidor no gasta las frutas. Pásame lo que salga en la consola",
+			"Auto Stats: the juicer doesn't use the fruits. Send me what the console shows"), "warn")
+	end
+	task.wait(1) -- por si los zumos llegan uno a uno
+	log(T("Auto Stats: exprimidas ", "Auto Stats: juiced ") .. (count - left) .. T(" frutas", " fruits"))
 end
 
 local function drinkAll()
