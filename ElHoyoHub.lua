@@ -1081,6 +1081,53 @@ end)
 end
 
 -- Quien da misiones en cada isla (cartel "Quests"); lo usan Auto Quest y Teleports
+-- Pulsa un botón de la interfaz del juego como si le hicieras clic, para que el juego haga lo suyo
+local function pressGuiButton(btn)
+	if getconnections then
+		for _, signal in { btn.MouseButton1Click, btn.Activated } do
+			local conns = getconnections(signal)
+			if #conns > 0 then
+				for _, c in conns do pcall(function() c:Fire() end) end
+				return
+			end
+		end
+	end
+	if firesignal then
+		pcall(firesignal, btn.MouseButton1Click)
+		return
+	end
+	-- Último recurso: clic real en el centro del botón (tiene que verse en pantalla)
+	local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+	local inset = game:GetService("GuiService"):GetGuiInset()
+	local x, y = p.X + s.X / 2, p.Y + s.Y / 2 + inset.Y
+	VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+	VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+end
+
+------------------------------------------------------------------ Entregas
+-- Un objeto de misión que hay que llevar es una Tool con el atributo DeliveryTarget (Vector3 del destino); visto
+-- con el paquete de Merlin. Lo usan Auto Merlin y Auto Quest (las misiones de Merlin salen en los dos).
+local deliverRemote = getRemote("MerlinService", "RF", "Deliver")
+local function heldPackage()
+	for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
+		for _, t in holder and holder:GetChildren() or {} do
+			if t:IsA("Tool") and typeof(t:GetAttribute("DeliveryTarget")) == "Vector3" then return t end
+		end
+	end
+end
+local function deliverPackage(package)
+	teleport(package:GetAttribute("DeliveryTarget") + Vector3.new(0, 3, 4))
+	task.wait(0.6)
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if hum and package.Parent ~= player.Character then
+		hum:EquipTool(package) -- en la mano, por si el juego lo pide
+		task.wait(0.3)
+	end
+	local ok, delivered = call(deliverRemote, "InvokeServer")
+	log(T("Entrega de ", "Delivery of ") .. package.Name .. " -> " .. tostring(delivered), (ok and delivered) and "ok" or "warn", ok and delivered)
+	return ok and delivered
+end
+
 local QUEST_GIVERS = {
 	{ name = "Dockmaster Rolf", model = "QuestWindmill" },
 	{ name = "Guard Captain Bram", model = "QuestTown" },
@@ -1095,6 +1142,7 @@ local QUEST_GIVERS = {
 	{ name = "Elder Moray", model = "QuestDeepwake" },
 	{ name = "Climber Edda", model = "QuestCliffs" },
 	{ name = "Hermit Oswin", model = "QuestPursuer" },
+	{ name = "Merlin", model = "QuestFishMerchant" }, -- al final: config.questGiver guarda el número
 }
 ------------------------------------------------------------------ Auto Quest
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
@@ -1343,6 +1391,21 @@ local function questTick()
 	local giver = QUEST_GIVERS[config.questGiver]
 	local header, objs = questObjectives()
 
+	-- Llevas algo que entregar (paquete de Merlin u otro con DeliveryTarget): primero eso
+	local package = heldPackage()
+	if package then
+		if claimMove("Quest") then
+			local hrp = getHRP()
+			if not questStart and hrp then questStart = hrp.CFrame end
+			deliverPackage(package)
+			returnTo(questStart)
+			questStart = nil
+			releaseMove("Quest")
+		end
+		task.wait(1)
+		return
+	end
+
 	-- Sin misión: ir a pedir una (como mucho cada 15 s)
 	if #objs == 0 then
 		if os.clock() - lastAcceptTry > 15 and claimMove("Quest") then
@@ -1461,7 +1524,6 @@ do -- bloque propio: sus variables no cuentan para el límite de 200 locales del
 -- como un atributo Vector3 nuevo en el jugador o el personaje tras coger el paquete; si no aparece, se prueba
 -- en el sitio de la grabación. Lo que encuentre sale en la consola para fijarlo.
 local takeRemote = getRemote("MerlinService", "RF", "TakePackage")
-local deliverRemote = getRemote("MerlinService", "RF", "Deliver")
 local autoMerlin = false
 local merlinStart
 
@@ -1501,14 +1563,6 @@ local function placeNamed(text)
 	if island then
 		local target = island:FindFirstChild("QuestBoard") or island:FindFirstChildWhichIsA("BasePart", true)
 		if target then return target:GetPivot().Position end
-	end
-end
-
--- El paquete es una Tool "Package" con el atributo DeliveryTarget (Vector3 del destino)
-local function heldPackage()
-	for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
-		local p = holder and holder:FindFirstChild("Package")
-		if p and typeof(p:GetAttribute("DeliveryTarget")) == "Vector3" then return p end
 	end
 end
 
@@ -1581,6 +1635,7 @@ local function merlinRound()
 		return false
 	end
 	log(T("Merlin: destino ", "Merlin: destination ") .. how .. " -> " .. tostring(dest))
+	if package then return deliverPackage(package) end
 	teleport(dest + Vector3.new(0, 3, 4))
 	task.wait(0.6)
 	-- con el paquete en la mano, por si el juego lo pide
@@ -2215,8 +2270,6 @@ section(pageTp, "NPCs", 2)
 npcButtons(pageTp, NPCS)
 section(pageQuest, L("Ir a un NPC de misiones", "Go to a quest giver"))
 npcButtons(pageQuest, QUEST_GIVERS)
-section(pageQuest, "Merlin")
-npcButtons(pageQuest, { { name = "Merlin", model = "QuestFishMerchant" } })
 
 -- Nombres de las islas según la wiki del juego (datos.json) y los NPCs que hay en cada una.
 -- Las que no aparecen aquí usan su nombre interno limpio.
@@ -2316,7 +2369,8 @@ do
 	local offY = (MAP_H - (maxZ - minZ) * scale) / 2
 	local zoom, panX, panY = 1, 0, 0
 	local function toMap(p)
-		local bx, by = (p.X - minX) * scale + offX, (p.Z - minZ) * scale + offY
+		-- girado 180°: así el norte del juego queda arriba (confirmado por el usuario)
+		local bx, by = (maxX - p.X) * scale + offX, (maxZ - p.Z) * scale + offY
 		return (bx - W / 2) * zoom + W / 2 + panX, (by - MAP_H / 2) * zoom + MAP_H / 2 + panY
 	end
 
@@ -2457,29 +2511,6 @@ end
 
 ------------------------------------------------------------------ GUIs
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
--- Pulsa un botón de la interfaz del juego como si le hicieras clic, para que el juego haga lo suyo
-local function pressGuiButton(btn)
-	if getconnections then
-		for _, signal in { btn.MouseButton1Click, btn.Activated } do
-			local conns = getconnections(signal)
-			if #conns > 0 then
-				for _, c in conns do pcall(function() c:Fire() end) end
-				return
-			end
-		end
-	end
-	if firesignal then
-		pcall(firesignal, btn.MouseButton1Click)
-		return
-	end
-	-- Último recurso: clic real en el centro del botón (tiene que verse en pantalla)
-	local p, s = btn.AbsolutePosition, btn.AbsoluteSize
-	local inset = game:GetService("GuiService"):GetGuiInset()
-	local x, y = p.X + s.X / 2, p.Y + s.Y / 2 + inset.Y
-	VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-	VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
-end
-
 -- Botones del menú del juego (Crews, Challenges, Quests, Shop, Stats...), leídos en vivo de su interfaz
 section(pageGuis, L("Menú del juego", "Game menu"))
 local menuGrid = grid(pageGuis)
@@ -2543,6 +2574,180 @@ for _, entry in NPCS do
 			"Briefly goes to " .. entry.name .. ", opens their menu and brings you back."))
 end
 
+end
+
+------------------------------------------------------------------ Auto Stats
+-- Frutas normales (no Devil Fruits) → zumos que suben stats. Datos de EscaneoBatidos:
+--  * Barriles y cajas: Workspace.Map.Barrels.Barrels.Barrel / .Crates.Crate, ClickDetector en la pieza (8 studs).
+--    Dan una fruta como Tool ("Banana", "Prickly Pear").
+--  * Exprimidor: Workspace.Map.Other.Tent2.Model.JuicingBowl (Bowl, Mixer1, Mixer2; ClickDetector 10 studs).
+--    Sale la Tool "<fruta> Juice" ("Banana Juice", "Sour Juice").
+--  * Beber: con el zumo en la mano, PlayerGui.Drink tiene DrinkOne y DrinkAll ("Drink all (n)").
+-- Sin confirmar: cómo se usa el exprimidor (se equipa la fruta y se clican sus tres piezas) y si se nota un
+-- barril vacío.
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+local BARREL_COOLDOWN = 300 -- shortcut: no sé cuándo se rellena un barril; se salta 5 min. Mirar si cambia algo al vaciarse
+local BARRELS_PER_ROUND = 15
+local autoStats = false
+local visited = {} -- pieza del barril -> os.clock() de la última visita
+local juiceFailed = false
+config.juiceFruits = config.juiceFruits or {}
+local fruitNames = { Banana = true, ["Prickly Pear"] = true } -- y las que salgan de los barriles
+for name in config.juiceFruits do fruitNames[name] = true end
+
+local function tools()
+	local out = {}
+	for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
+		for _, t in holder and holder:GetChildren() or {} do
+			if t:IsA("Tool") then table.insert(out, t) end
+		end
+	end
+	return out
+end
+local function isDrink(t) return t.Name:find("Juice") ~= nil or t.Name:find("Smoothie") ~= nil end
+local function humanoid() return player.Character and player.Character:FindFirstChildOfClass("Humanoid") end
+
+local function collect()
+	local hrp = getHRP()
+	local map = workspace:FindFirstChild("Map")
+	local root = map and map:FindFirstChild("Barrels")
+	if not (hrp and root) then return end
+	local list = {}
+	for _, cd in root:GetDescendants() do
+		if cd:IsA("ClickDetector") and cd.Parent:IsA("BasePart")
+			and os.clock() - (visited[cd.Parent] or -math.huge) > BARREL_COOLDOWN then
+			table.insert(list, cd)
+		end
+	end
+	table.sort(list, function(a, b)
+		return (a.Parent.Position - hrp.Position).Magnitude < (b.Parent.Position - hrp.Position).Magnitude
+	end)
+	local got = 0
+	for i = 1, math.min(BARRELS_PER_ROUND, #list) do
+		if not autoStats then break end
+		local cd = list[i]
+		visited[cd.Parent] = os.clock()
+		local before = {}
+		for _, t in tools() do before[t] = true end
+		teleport(cd.Parent.Position + Vector3.new(0, 4, 0))
+		task.wait(0.3)
+		if fireclickdetector then fireclickdetector(cd, 0) end
+		task.wait(0.6)
+		for _, t in tools() do
+			if not before[t] and not isDrink(t) then
+				got += 1
+				if not fruitNames[t.Name] then
+					fruitNames[t.Name] = true
+					config.juiceFruits[t.Name] = true
+					saveConfig()
+					log(T("Auto Stats: fruta nueva ", "Auto Stats: new fruit ") .. t.Name)
+				end
+			end
+		end
+	end
+	log(T("Auto Stats: barriles ", "Auto Stats: barrels ") .. math.min(BARRELS_PER_ROUND, #list) .. T(", frutas nuevas ", ", new fruits ") .. got)
+end
+
+local function makeJuice()
+	if juiceFailed then return end
+	local list = {}
+	for _, t in tools() do
+		if fruitNames[t.Name] then table.insert(list, t) end
+	end
+	if #list == 0 then return end
+	local map = workspace:FindFirstChild("Map")
+	local other = map and map:FindFirstChild("Other")
+	local bowl = other and other:FindFirstChild("JuicingBowl", true)
+	local hum = humanoid()
+	if not (bowl and hum) then
+		return log(T("Auto Stats: no encuentro el exprimidor (Map.Other...JuicingBowl)", "Auto Stats: can't find the juicer (Map.Other...JuicingBowl)"), "warn")
+	end
+	teleport(bowl:GetPivot().Position + Vector3.new(0, 3, 4))
+	task.wait(0.5)
+	for _, fruit in list do
+		if not autoStats then break end
+		if fruit.Parent then
+			hum:EquipTool(fruit)
+			task.wait(0.3)
+			for _, d in bowl:GetDescendants() do
+				if d:IsA("ClickDetector") and fireclickdetector and fruit.Parent then
+					fireclickdetector(d, 0)
+					task.wait(0.4)
+				end
+			end
+			local t0 = os.clock()
+			while fruit.Parent and os.clock() - t0 < 3 do task.wait(0.2) end
+			if fruit.Parent then
+				-- no se gastó: no insistir en cada vuelta
+				juiceFailed = true
+				hum:UnequipTools()
+				return log(T("Auto Stats: la fruta no se gasta en el exprimidor. Dime cómo lo haces a mano (qué clicas y con qué en la mano)",
+					"Auto Stats: the fruit isn't used by the juicer. Tell me how you do it by hand (what you click and holding what)"), "warn")
+			end
+			log(T("Auto Stats: exprimida ", "Auto Stats: juiced ") .. fruit.Name)
+		end
+	end
+	hum:UnequipTools()
+end
+
+local function drinkAll()
+	local hum = humanoid()
+	if not hum then return end
+	local done = {}
+	for _, d in tools() do
+		if isDrink(d) and not done[d.Name] and d.Parent then
+			done[d.Name] = true
+			hum:EquipTool(d)
+			-- con el zumo en la mano aparece PlayerGui.Drink con "Drink all"
+			local btn
+			local t0 = os.clock()
+			repeat
+				local gui = player.PlayerGui:FindFirstChild("Drink")
+				local frame = gui and gui:FindFirstChild("Drink")
+				local actions = frame and frame.Visible and frame:FindFirstChild("Actions")
+				btn = actions and actions:FindFirstChild("DrinkAll")
+				if not btn then task.wait(0.1) end
+			until btn or os.clock() - t0 > 2
+			if btn then
+				task.wait(0.2)
+				pressGuiButton(btn)
+				task.wait(0.8)
+				log(T("Auto Stats: bebidos todos los ", "Auto Stats: drank every ") .. d.Name, "ok", true)
+			else
+				log(T("Auto Stats: no sale el botón Drink all con ", "Auto Stats: no Drink all button with ") .. d.Name, "warn")
+			end
+		end
+	end
+	hum:UnequipTools()
+end
+
+section(pageAuto, L("Farmeo", "Farming"))
+toggle(pageAuto, "Auto Stats (beta)", function(on)
+	autoStats = on
+	juiceFailed = false
+	if not on then releaseMove("Stats") end
+	log("Auto Stats " .. (on and "ON" or "OFF"))
+end, L("Clica barriles y cajas para sacar frutas normales, las exprime en el puesto de zumos y se bebe todos los zumos de golpe (Drink all).",
+	"Clicks barrels and crates for normal fruits, juices them at the juice stand and drinks every juice at once (Drink all)."))
+
+task.spawn(function()
+	while alive do
+		task.wait(2)
+		if autoStats and claimMove("Stats") then
+			local hrp = getHRP()
+			local start = hrp and hrp.CFrame
+			local ok, err = pcall(function()
+				collect()
+				makeJuice()
+				drinkAll()
+			end)
+			if not ok then log("Auto Stats: error " .. tostring(err), "error") end
+			if start then returnTo(start) end
+			releaseMove("Stats")
+			task.wait(20)
+		end
+	end
+end)
 end
 
 ------------------------------------------------------------------ Misc
