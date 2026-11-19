@@ -269,12 +269,13 @@ local function addTab(label, icon)
 	return page
 end
 
--- Cada sección es una caja; se reparten en dos columnas por orden. Repetir un nombre vuelve a esa caja.
-local function section(page, label)
+-- Cada sección es una caja; se reparten en dos columnas por orden (o en la columna que se diga). Repetir un
+-- nombre vuelve a esa caja.
+local function section(page, label, column)
 	local key = type(label) == "table" and label.en or label
 	local box = page.byName[key]
 	if not box then
-		box = page.tab:Box({ Name = uiText(label), Column = (#page.boxes % 2) + 1, Scrollable = true })
+		box = page.tab:Box({ Name = uiText(label), Column = column or ((#page.boxes % 2) + 1), Scrollable = true })
 		table.insert(page.boxes, box)
 		page.byName[key] = box
 	end
@@ -1531,8 +1532,22 @@ local function merlinRound()
 	task.wait(1.5)
 	for _, c in watch do c:Disconnect() end
 
-	-- 1) Un dato nuevo o cambiado: una posición, o el nombre de un NPC o de una isla
+	-- 0) Lo confirmado (EscaneoPersonaje con el paquete encima): el paquete es una Tool "Package" con el atributo
+	--    DeliveryTarget = Vector3 del destino (en esa prueba, el comprador de frutas al lado de Sam). Puede tardar
+	--    un poco en llegar al inventario.
 	local dest, how
+	local package
+	local t0 = os.clock()
+	repeat
+		for _, holder in { player:FindFirstChild("Backpack"), player.Character } do
+			local p = holder and holder:FindFirstChild("Package")
+			if p and typeof(p:GetAttribute("DeliveryTarget")) == "Vector3" then package = p end
+		end
+		if not package then task.wait(0.2) end
+	until package or os.clock() - t0 > 3
+	if package then dest, how = package:GetAttribute("DeliveryTarget"), "Package@DeliveryTarget" end
+
+	-- 1) Si no: un dato nuevo o cambiado (una posición, o el nombre de un NPC o de una isla)
 	for k, v in allAttrs() do
 		if before[k] ~= v then
 			log("Merlin: " .. T("dato nuevo ", "new data ") .. k .. " = " .. tostring(v))
@@ -1558,6 +1573,12 @@ local function merlinRound()
 	log(T("Merlin: destino ", "Merlin: destination ") .. how .. " -> " .. tostring(dest))
 	teleport(dest + Vector3.new(0, 3, 4))
 	task.wait(0.6)
+	-- con el paquete en la mano, por si el juego lo pide
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if package and hum and package.Parent ~= player.Character then
+		hum:EquipTool(package)
+		task.wait(0.3)
+	end
 	local ok2, delivered = call(deliverRemote, "InvokeServer")
 	log(T("Merlin: entrega -> ", "Merlin: delivery -> ") .. tostring(delivered), (ok2 and delivered) and "ok" or "warn", ok2 and delivered)
 	return ok2 and delivered
@@ -2178,7 +2199,9 @@ local function npcButtons(page, list)
 		end, L("Te lleva junto a " .. entry.name, "Takes you to " .. entry.name))
 	end
 end
-section(pageTp, "NPCs")
+pageTp.tab:Columns({ 1.45, 1 }) -- columna 1 más ancha: solo lleva el mapa
+local mapBox = section(pageTp, L("Mapa", "Map"), 1)
+section(pageTp, "NPCs", 2)
 npcButtons(pageTp, NPCS)
 section(pageQuest, L("Ir a un NPC de misiones", "Go to a quest giver"))
 npcButtons(pageQuest, QUEST_GIVERS)
@@ -2204,7 +2227,7 @@ local ISLAND_NAMES = {
 	Island14 = "Pursuer Island", -- tiene QuestPursuer al lado
 }
 
-section(pageTp, L("Islas", "Islands"))
+section(pageTp, L("Islas", "Islands"), 2)
 local islandGrid = grid(pageTp)
 local map = workspace:FindFirstChild("Map")
 local islandsFolder = map and map:FindFirstChild("Islands")
@@ -2215,18 +2238,109 @@ local function islandName(island)
 	return ISLAND_NAMES[island.Name] or clean
 end
 table.sort(islands, function(a, b) return islandName(a) < islandName(b) end)
+-- El tablón está en tierra firme. Sin tablón: la isla si es un modelo, o cualquier pieza suya
+-- (una carpeta no tiene posición y GetPivot daría error)
+local function islandTarget(island)
+	return island:FindFirstChild("QuestBoard")
+		or (island:IsA("PVInstance") and island)
+		or island:FindFirstChildWhichIsA("BasePart", true)
+end
+local function goIsland(island)
+	local name = islandName(island)
+	local target = islandTarget(island)
+	if not target then return log(T("No sé dónde está ", "Don't know where this is: ") .. name, "warn") end
+	teleport(target:GetPivot().Position + Vector3.new(0, 5, 0))
+	log(T("Llevado a ", "Taken to ") .. name)
+end
 for _, island in islands do
 	local name = islandName(island)
-	button(islandGrid, name, function()
-		-- El tablón está en tierra firme. Sin tablón: la isla si es un modelo, o cualquier pieza suya
-		-- (una carpeta no tiene posición y GetPivot daría error)
-		local target = island:FindFirstChild("QuestBoard")
-			or (island:IsA("PVInstance") and island)
-			or island:FindFirstChildWhichIsA("BasePart", true)
-		if not target then return log(T("No sé dónde está ", "Don't know where this is: ") .. name, "warn") end
-		teleport(target:GetPivot().Position + Vector3.new(0, 5, 0))
-		log(T("Llevado a ", "Taken to ") .. name)
-	end, L("Te lleva a " .. name, "Takes you to " .. name))
+	button(islandGrid, name, function() goIsland(island) end, L("Te lleva a " .. name, "Takes you to " .. name))
+end
+
+-- Mapa visto desde arriba: cada isla es un círculo en su X/Z (tamaño según la isla); clic = teletransporte.
+-- El punto rojo eres tú.
+do
+	local MAP_H, PAD = 440, 34
+	local W = mapBox.flow.rw
+	local frame = Instance.new("Frame")
+	frame.Position = UDim2.fromOffset(mapBox.flow.x, mapBox.flow.y)
+	frame.Size = UDim2.fromOffset(W, MAP_H)
+	frame.BackgroundColor3 = C.bg
+	frame.BorderSizePixel = 0
+	frame.ClipsDescendants = true
+	frame.Parent = mapBox.flow.parent
+	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 4)
+	Instance.new("UIStroke", frame).Color = C.line
+	mapBox:advance(MAP_H)
+
+	local points = {}
+	local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+	for _, island in islands do
+		local target = islandTarget(island)
+		if target then
+			local p = target:GetPivot().Position
+			local ok, size = pcall(function() return island:IsA("Model") and island:GetExtentsSize() or target.Size end)
+			table.insert(points, { island = island, pos = p, size = ok and size or Vector3.zero })
+			minX, maxX = math.min(minX, p.X), math.max(maxX, p.X)
+			minZ, maxZ = math.min(minZ, p.Z), math.max(maxZ, p.Z)
+		end
+	end
+	local scale = math.min((W - 2 * PAD) / math.max(maxX - minX, 1), (MAP_H - 2 * PAD) / math.max(maxZ - minZ, 1))
+	local offX = (W - (maxX - minX) * scale) / 2
+	local offY = (MAP_H - (maxZ - minZ) * scale) / 2
+	local function toMap(p) return (p.X - minX) * scale + offX, (p.Z - minZ) * scale + offY end
+
+	for _, pt in points do
+		local x, y = toMap(pt.pos)
+		local d = math.clamp(math.max(pt.size.X, pt.size.Z) * scale, 12, 46)
+		local dot = Instance.new("TextButton")
+		dot.AnchorPoint = Vector2.new(0.5, 0.5)
+		dot.Position = UDim2.fromOffset(x, y)
+		dot.Size = UDim2.fromOffset(d, d)
+		dot.BackgroundColor3 = C.surface
+		dot.Text = ""
+		dot.AutoButtonColor = false
+		dot.Parent = frame
+		Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+		local ring = Instance.new("UIStroke", dot)
+		ring.Color = C.line
+		ring.Thickness = 1.5
+		local label = Instance.new("TextLabel")
+		label.AnchorPoint = Vector2.new(0.5, 0)
+		label.Position = UDim2.fromOffset(x, y + d / 2 + 2)
+		label.Size = UDim2.fromOffset(110, 12)
+		label.BackgroundTransparency = 1
+		label.Font = FONT_SEMI
+		label.TextSize = 10
+		label.TextColor3 = C.dim
+		label.Text = islandName(pt.island) -- shortcut: los nombres pueden solaparse si dos islas están muy juntas
+		label.Parent = frame
+		dot.MouseEnter:Connect(function() ring.Color, label.TextColor3 = C.accent, C.text end)
+		dot.MouseLeave:Connect(function() ring.Color, label.TextColor3 = C.line, C.dim end)
+		dot.MouseButton1Click:Connect(function() goIsland(pt.island) end)
+	end
+
+	local me = Instance.new("Frame")
+	me.AnchorPoint = Vector2.new(0.5, 0.5)
+	me.Size = UDim2.fromOffset(8, 8)
+	me.BackgroundColor3 = C.accent
+	me.BorderSizePixel = 0
+	me.ZIndex = 5
+	me.Parent = frame
+	Instance.new("UICorner", me).CornerRadius = UDim.new(1, 0)
+	Instance.new("UIStroke", me).Color = C.text
+	task.spawn(function()
+		while alive and frame.Parent do
+			local hrp = getHRP()
+			me.Visible = hrp ~= nil and #points > 0
+			if hrp then
+				local x, y = toMap(hrp.Position)
+				me.Position = UDim2.fromOffset(math.clamp(x, 4, W - 4), math.clamp(y, 4, MAP_H - 4))
+			end
+			task.wait(0.3)
+		end
+	end)
+	if #points == 0 then note(pageTp, L("No hay islas para dibujar el mapa.", "No islands to draw the map.")) end
 end
 if #islands == 0 then note(pageTp, L("No encuentro Workspace.Map.Islands.", "Can't find Workspace.Map.Islands.")) end
 
