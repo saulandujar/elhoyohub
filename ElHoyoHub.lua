@@ -1,6 +1,6 @@
 -- El Hoyo Hub
 -- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
-local HUB_VERSION = "1.0.1"
+local HUB_VERSION = "1.1.0"
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
 local function ElHoyoHubMain()
@@ -390,15 +390,48 @@ local function getHRP()
 	return player.Character and player.Character:FindFirstChild("HumanoidRootPart")
 end
 
--- shortcut: teletransporte directo; si el juego te expulsa por distancia, cambiar a ir por tramos
-local function teleport(pos)
-	local hrp = getHRP()
-	if hrp then hrp.CFrame = CFrame.new(pos) end
-end
-
 -- Solo una función puede moverte a la vez (Sam, Chest, Train). Sin esto, Auto Sam te sacaba del dojo
 -- en mitad de una partida y Auto Chest te movía cada medio segundo.
 local busy -- nombre de la función que te está moviendo, o nil
+
+-- Evitar jugadores (Zona segura): una función automática no te lleva a un sitio con otro jugador a menos de
+-- avoid.radius studs. Espera hasta AVOID_WAIT s a que se vaya; con skip = true no espera (para saltar a otro
+-- barril o cofre). Los teletransportes a mano (botones) no se frenan.
+local avoid = { on = false, radius = 60 }
+local AVOID_WAIT = 20
+local avoidLogged = 0
+local function playerNear(pos)
+	for _, p in Players:GetPlayers() do
+		local hrp = p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		if hrp and (hrp.Position - pos).Magnitude < avoid.radius then return p.Name end
+	end
+end
+
+-- Devuelve false si no te movió. shortcut: teletransporte directo; si el juego te expulsa por distancia, ir por tramos
+local function teleport(pos, skip)
+	local hrp = getHRP()
+	if not hrp then return false end
+	if avoid.on and busy then
+		local t0 = os.clock()
+		local who = playerNear(pos)
+		while who and not skip and os.clock() - t0 < AVOID_WAIT do
+			task.wait(0.5)
+			who = playerNear(pos)
+		end
+		if who then
+			if os.clock() - avoidLogged > 5 then -- que no llene la consola
+				avoidLogged = os.clock()
+				log(T("Evitar jugadores: ", "Avoid players: ") .. who .. T(" está en el sitio, no voy (", " is there, not going (") .. busy .. ")")
+			end
+			return false
+		end
+		hrp = getHRP()
+		if not hrp then return false end
+	end
+	hrp.CFrame = CFrame.new(pos)
+	return true
+end
+
 local function claimMove(name)
 	if busy and busy ~= name then return false end
 	busy = name
@@ -735,7 +768,8 @@ end
 local function openChest(chest)
 	tried[chest] = true
 	local speed = CHEST_SPEEDS[config.chestSpeed]
-	teleport(chest:GetPivot().Position + Vector3.new(0, 3, 0)) -- dentro de los 10 studs del clic
+	-- dentro de los 10 studs del clic; si hay alguien (Evitar jugadores) se salta este cofre
+	if not teleport(chest:GetPivot().Position + Vector3.new(0, 3, 0), true) then return end
 	task.wait(speed.wait) -- que el servidor vea que estás al lado antes de clicar
 	local t0 = os.clock()
 	repeat
@@ -1712,6 +1746,24 @@ end, L("Crea una plataforma muy alta que solo ves tú y te deja ahí para farmea
 	"Creates a very high platform only you can see and keeps you there to farm. Sam, Chest and Fruits come back to it when done. Turning it off brings you back."))
 table.insert(cleanup, { Disconnect = function() if safePart then safePart:Destroy() end end }) -- se quita al cerrar el hub
 
+toggle(pageAuto, L("Evitar jugadores", "Avoid players"), function(on)
+	avoid.on = on
+	log(T("Evitar jugadores ", "Avoid players ") .. (on and "ON" or "OFF"))
+end, L("Las funciones automáticas no te llevan a un sitio con otro jugador cerca: esperan a que se vaya o (barriles) pasan al siguiente.",
+	"Automatic features don't take you somewhere with another player nearby: they wait until they leave or (barrels) skip to the next."))
+do
+	local RADII = { 30, 60, 100, 200 }
+	local names = {}
+	for i, r in RADII do names[i] = r .. " studs" end
+	local pick = table.find(RADII, tonumber(config.avoidRadius)) or 2
+	avoid.radius = RADII[pick]
+	combo(pageAuto, L("Radio para evitar", "Avoid radius"), names, pick, function(i)
+		avoid.radius = RADII[i]
+		config.avoidRadius = RADII[i]
+		saveConfig()
+	end, L("A qué distancia de otro jugador no te teletransporta.", "How close to another player it won't teleport you."))
+end
+
 -- Si caes o te mueven y nadie más te está moviendo, vuelves a la plataforma
 task.spawn(function()
 	while alive do
@@ -2589,7 +2641,6 @@ end
 -- Sin confirmar: si se nota un barril vacío.
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 local BARREL_COOLDOWN = 180 -- shortcut: el usuario calcula 2-3 min hasta que se rellena; mirar si el barril cambia al vaciarse
-local BARRELS_PER_ROUND = 15
 local autoStats = false
 local visited = {} -- pieza del barril -> os.clock() de la última visita
 local juiceFailed = false
@@ -2609,48 +2660,63 @@ end
 local function isDrink(t) return t.Name:find("Juice") ~= nil or t.Name:find("Smoothie") ~= nil end
 local function humanoid() return player.Character and player.Character:FindFirstChildOfClass("Humanoid") end
 
+-- Todos los barriles y cajas del mapa, en ruta (siempre al más cercano desde donde estás), sin pausas largas
 local function collect()
 	local hrp = getHRP()
 	local map = workspace:FindFirstChild("Map")
 	local root = map and map:FindFirstChild("Barrels")
 	if not (hrp and root) then return end
-	local list = {}
+	local pending = {}
 	for _, cd in root:GetDescendants() do
 		if cd:IsA("ClickDetector") and cd.Parent:IsA("BasePart")
 			and os.clock() - (visited[cd.Parent] or -math.huge) > BARREL_COOLDOWN then
-			table.insert(list, cd)
+			table.insert(pending, cd)
 		end
 	end
-	table.sort(list, function(a, b)
-		return (a.Parent.Position - hrp.Position).Magnitude < (b.Parent.Position - hrp.Position).Magnitude
-	end)
-	local got = 0
-	for i = 1, math.min(BARRELS_PER_ROUND, #list) do
-		if not autoStats then break end
-		local cd = list[i]
-		visited[cd.Parent] = os.clock()
-		local before = {}
-		for _, t in tools() do before[t] = true end
-		teleport(cd.Parent.Position + Vector3.new(0, 4, 0))
-		task.wait(0.3)
-		if fireclickdetector then fireclickdetector(cd, 0) end
-		task.wait(0.6)
-		for _, t in tools() do
-			if not before[t] and not isDrink(t) then
-				got += 1
-				if not fruitNames[t.Name] then
-					fruitNames[t.Name] = true
-					config.juiceFruits[t.Name] = true
-					saveConfig()
-					log(T("Auto Stats: fruta nueva ", "Auto Stats: new fruit ") .. t.Name)
-				end
+	local before = {}
+	for _, t in tools() do before[t] = true end
+	local here, clicked, skipped = hrp.Position, 0, 0
+	while #pending > 0 and autoStats do
+		local best, bestD = 1, math.huge
+		for i, cd in pending do
+			local d = (cd.Parent.Position - here).Magnitude
+			if d < bestD then best, bestD = i, d end
+		end
+		local cd = table.remove(pending, best)
+		local part = cd.Parent
+		if part.Parent then
+			here = part.Position
+			if teleport(part.Position + Vector3.new(0, 4, 0), true) then
+				visited[part] = os.clock()
+				task.wait(0.2) -- que el servidor vea que estás al lado (ClickDetector de 8 studs)
+				if fireclickdetector then fireclickdetector(cd, 0) end
+				clicked += 1
+				task.wait(0.1)
+			else
+				skipped += 1 -- hay alguien: se prueba en la siguiente vuelta
 			end
 		end
 	end
-	log(T("Auto Stats: barriles ", "Auto Stats: barrels ") .. math.min(BARRELS_PER_ROUND, #list) .. T(", frutas nuevas ", ", new fruits ") .. got)
+	task.wait(0.5) -- las últimas frutas pueden tardar en llegar
+	-- lo nuevo que no es zumo ha salido de los barriles: es fruta (así se aprenden las que no conocíamos)
+	local got = 0
+	for _, t in tools() do
+		if not before[t] and not isDrink(t) then
+			got += 1
+			if not fruitNames[t.Name] then
+				fruitNames[t.Name] = true
+				config.juiceFruits[t.Name] = true
+				saveConfig()
+				log(T("Auto Stats: fruta nueva ", "Auto Stats: new fruit ") .. t.Name)
+			end
+		end
+	end
+	log(T("Auto Stats: ", "Auto Stats: ") .. clicked .. T(" barriles", " barrels")
+		.. (skipped > 0 and (", " .. skipped .. T(" con gente", " with people")) or "") .. T(", frutas nuevas ", ", new fruits ") .. got)
 end
 
-local function makeJuice()
+-- start: adónde volver nada más clicar (o la zona segura); los zumos llegan aunque no estés al lado
+local function makeJuice(start)
 	if juiceFailed then return end
 	local count = 0
 	for _, t in tools() do
@@ -2671,10 +2737,12 @@ local function makeJuice()
 	if not detector then
 		return log(T("Auto Stats: no encuentro el exprimidor (Map.Other...JuicingBowl)", "Auto Stats: can't find the juicer (Map.Other...JuicingBowl)"), "warn")
 	end
-	teleport(detector.Parent.Position + Vector3.new(0, 3, 4))
-	task.wait(0.5)
+	if not teleport(detector.Parent.Position + Vector3.new(0, 3, 4)) then return end -- alguien en el exprimidor
+	task.wait(0.25)
 	-- Un clic y a los pocos segundos convierte todas las frutas en zumos (confirmado por el usuario)
 	if fireclickdetector then fireclickdetector(detector, 0) end
+	task.wait(0.2)
+	returnTo(start) -- shortcut: si resulta que hay que quedarse al lado mientras exprime, esperar aquí antes de volver
 	local t0 = os.clock()
 	local left
 	repeat
@@ -2740,7 +2808,7 @@ task.spawn(function()
 			local start = hrp and hrp.CFrame
 			local ok, err = pcall(function()
 				collect()
-				makeJuice()
+				makeJuice(start)
 				drinkAll()
 			end)
 			if not ok then log("Auto Stats: error " .. tostring(err), "error") end
