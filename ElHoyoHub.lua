@@ -1,4 +1,6 @@
 -- El Hoyo Hub
+-- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
+local HUB_VERSION = "1.0.1"
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
 local function ElHoyoHubMain()
@@ -253,7 +255,7 @@ local function log(msg, level, notify)
 end
 
 ------------------------------------------------------------------ Ventana y pestañas
-local win = UI:CreateWindow({ Folder = "ElHoyoHub", ToggleKey = false })
+local win = UI:CreateWindow({ Folder = "ElHoyoHub", ToggleKey = false, SubBrand = "HUB v" .. HUB_VERSION }) -- versión bajo el logo
 local main = win.frame
 local function syncLang()
 	LANG = UI.Language == 1 and "es" or "en"
@@ -3121,6 +3123,7 @@ autoExecToggle.set(config.autoExec == true)
 applyAutoexec() -- cada vez que se abre, deja preparado el siguiente servidor
 
 section(pageSettings, "Hub")
+note(pageSettings, L("Versión " .. HUB_VERSION, "Version " .. HUB_VERSION))
 button(pageSettings, L("Apagar todo", "Turn everything off"), function()
 	local n = 0
 	for _, t in toggles do
@@ -3159,7 +3162,7 @@ end))
 genv.ElHoyoHubClose = closeHub
 fitBoxes()
 win:Finish() -- coloca todo y carga el último perfil usado (eso enciende sus funciones)
-log(T("El Hoyo Hub cargado", "El Hoyo Hub loaded"), "ok", true)
+log(T("El Hoyo Hub cargado (v", "El Hoyo Hub loaded (v") .. HUB_VERSION .. ")", "ok", true)
 for _, missing in missingRemotes do
 	log(T("No encuentro la señal ", "Can't find the signal ") .. missing .. T(" (¿actualización del juego?)", " (game update?)"), "error")
 end
