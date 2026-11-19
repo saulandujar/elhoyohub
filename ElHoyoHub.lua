@@ -837,7 +837,7 @@ do -- bloque propio: sus variables no cuentan para el límite de 200 locales del
 --   -> el servidor manda MinigameEnded(nota, "Nombre del pez"). La nota es cuántos acertaste (10 = Perfect).
 -- shortcut: no se sabe cuándo pica; se manda Reel(false) cada 2 s hasta que empieza el minijuego (25 s máx.).
 -- Solo se ha visto el minijuego "Scatter" con 10 objetivos; otros tipos se apuntan en la consola.
-local FISH_HIT_DELAY = 0.3 -- tras aparecer cada anillo, antes de acertarlo
+local FISH_RING_CLOSE = 1.1 -- se pulsa cuando el anillo mide como mucho 1,1 veces el objetivo
 local FISH_REACTION = 0.3 -- tras picar, antes de recoger
 local fishCast = getRemote("FishingService", "RE", "Cast")
 local fishReel = getRemote("FishingService", "RE", "Reel")
@@ -920,11 +920,40 @@ local function castPoint()
 end
 
 section(pageAuto, L("Farmeo", "Farming"))
+-- Sitio de pesca guardado (config.fishSpot = { stand = {x,y,z,rotación}, cast = {x,y,z} }). Si existe, Auto Pesca
+-- te lleva ahí y lanza a ese punto, sin depender del ratón: así puede pescar solo (p. ej. para Auto Quest).
+local function savedSpot()
+	local spot = config.fishSpot
+	if type(spot) ~= "table" or type(spot.stand) ~= "table" or type(spot.cast) ~= "table" then return nil end
+	local st, ca = spot.stand, spot.cast
+	return CFrame.new(st[1], st[2], st[3]) * CFrame.Angles(0, st[4] or 0, 0), Vector3.new(ca[1], ca[2], ca[3])
+end
+
 fishToggle = toggle(pageAuto, L("Auto Pesca (beta)", "Auto Fishing (beta)"), function(on)
 	autoFish = on
+	if not on then releaseMove("Fish") end
 	log(on and (T("Auto Pesca ON: deja el ratón apuntando al agua", "Auto Fishing ON: keep the mouse pointing at the water") .. string.format(T(" (mar a Y %.1f)", " (sea at Y %.1f)"), SEA_LEVEL)) or T("Auto Pesca OFF", "Auto Fishing OFF"))
 end, L("Lanza donde apunta tu ratón, espera a que pique y acierta los 10 objetivos del minijuego. Deja el ratón apuntando al agua y ten una caña en el inventario.",
 	"Casts where your mouse points, waits for a bite and hits all 10 minigame targets. Keep the mouse pointing at the water and have a rod in your inventory."))
+
+button(pageAuto, L("Guardar sitio de pesca aquí", "Save fishing spot here"), function()
+	local hrp = getHRP()
+	local p, why = castPoint()
+	if not (hrp and p) then
+		return log(T("Pesca: para guardar el sitio, apunta con el ratón al agua (", "Fishing: to save the spot, point the mouse at the water (") .. tostring(why) .. ")", "warn")
+	end
+	local _, yaw = hrp.CFrame:ToOrientation()
+	config.fishSpot = { stand = { hrp.Position.X, hrp.Position.Y, hrp.Position.Z, yaw }, cast = { p.X, p.Y, p.Z } }
+	saveConfig()
+	log(T("Pesca: sitio guardado. Auto Pesca y Auto Quest pescarán aquí", "Fishing: spot saved. Auto Fishing and Auto Quest will fish here"), "ok", true)
+end, L("Ponte en la orilla, apunta con el ratón al agua y púlsalo: Auto Pesca irá siempre aquí y lanzará a ese punto, sin necesitar el ratón.",
+	"Stand on the shore, point the mouse at the water and press it: Auto Fishing will always come here and cast at that point, without needing the mouse."))
+button(pageAuto, L("Borrar sitio de pesca", "Clear fishing spot"), function()
+	config.fishSpot = nil
+	saveConfig()
+	releaseMove("Fish")
+	log(T("Pesca: sitio borrado; vuelve a lanzar donde apunte el ratón", "Fishing: spot cleared; it casts where the mouse points again"), "ok", true)
+end, L("Olvida el sitio guardado: Auto Pesca vuelve a lanzar donde apunte el ratón.", "Forgets the saved spot: Auto Fishing casts where the mouse points again."))
 
 local warned = false
 local function fishOnce()
@@ -934,7 +963,24 @@ local function fishOnce()
 		fishToggle.set(false)
 		return
 	end
-	local point, why = castPoint()
+	local standAt, spotCast = savedSpot()
+	local point, why
+	if standAt then
+		-- Con sitio guardado: ir allí (si otra función no te está moviendo) y lanzar al punto guardado
+		if not claimMove("Fish") then
+			task.wait(1)
+			return
+		end
+		local hrp = getHRP()
+		if hrp and (hrp.Position - standAt.Position).Magnitude > 8 then
+			hrp.CFrame = standAt
+			task.wait(0.5)
+		end
+		releaseMove("Fish") -- se suelta ya: si Sam u otra función te mueve, luego te devuelve aquí
+		point = spotCast
+	else
+		point, why = castPoint()
+	end
 	if not point then
 		-- Aviso destacado solo la primera vez; el motivo concreto siempre en la consola
 		log(T("Pesca: no lanzo: ", "Fishing: not casting: ") .. why, warned and "info" or "warn")
@@ -964,17 +1010,45 @@ local function fishOnce()
 		return log(T("Pesca: recogí pero no empezó el minijuego", "Fishing: reeled in but the minigame didn't start"), "warn")
 	end
 
-	-- Minijuego Scatter: van apareciendo anillos ("Ring") en la pantalla de pesca, uno cada ~0,45 s, el primero
-	-- a los ~2 s. Se acierta cada uno un momento después de que aparezca: Hit(número de anillo). Se vigila toda
-	-- PlayerGui (no solo Fishing.Frame.Target) por si el juego vuelve a crear esa pantalla.
+	-- Minijuego Scatter: el objetivo (Fishing.Frame.Target) cambia de sitio y aparece un anillo ("Ring") que se
+	-- cierra sobre él; hay que pulsar el objetivo cuando el anillo llega. Mandar Hit(n) a mano a destiempo no
+	-- contaba, así que ahora se pulsa el propio botón del juego cuando el anillo ya ha cerrado: el juego mide el
+	-- momento y manda Hit él solo. Si no se puede pulsar el botón, se manda Hit(n) como antes.
 	local rings, hits = 0, 0
-	local conn = player.PlayerGui.DescendantAdded:Connect(function(d)
-		if d.Name ~= "Ring" or not minigame then return end
+	local logged = false
+	local function pressTarget(target, n)
+		if target:IsA("GuiButton") and getconnections then
+			for _, signal in { target.MouseButton1Down, target.MouseButton1Click, target.Activated } do
+				local conns = getconnections(signal)
+				if #conns > 0 then
+					for _, c in conns do pcall(function() c:Fire() end) end
+					return true
+				end
+			end
+		end
+		call(fishHit, "FireServer", n)
+		return false
+	end
+	local conn = player.PlayerGui.DescendantAdded:Connect(function(ring)
+		if ring.Name ~= "Ring" or not minigame then return end
 		rings += 1
 		local n = rings
-		task.delay(FISH_HIT_DELAY, function()
+		local target = ring.Parent
+		task.spawn(function()
+			local t0 = os.clock()
+			local startSize = ring.AbsoluteSize.X
+			-- esperar a que el anillo se cierre hasta el tamaño del objetivo (o como mucho 1,5 s)
+			while ring.Parent and minigame and os.clock() - t0 < 1.5 do
+				if target:IsA("GuiObject") and ring.AbsoluteSize.X <= target.AbsoluteSize.X * FISH_RING_CLOSE then break end
+				task.wait()
+			end
+			if not logged then
+				logged = true
+				log(string.format(T("Pesca: anillo de %d px a %d px en %.2f s (objetivo %s de %d px)", "Fishing: ring %d px to %d px in %.2f s (target %s, %d px)"),
+					startSize, ring.AbsoluteSize.X, os.clock() - t0, target.ClassName, target:IsA("GuiObject") and target.AbsoluteSize.X or 0))
+			end
 			if minigame then
-				call(fishHit, "FireServer", n)
+				pressTarget(target, n)
 				hits += 1
 			end
 		end)
@@ -1004,6 +1078,22 @@ end)
 
 end
 
+-- Quien da misiones en cada isla (cartel "Quests"); lo usan Auto Quest y Teleports
+local QUEST_GIVERS = {
+	{ name = "Dockmaster Rolf", model = "QuestWindmill" },
+	{ name = "Guard Captain Bram", model = "QuestTown" },
+	{ name = "Old Pirate Gil", model = "QuestPirate" },
+	{ name = "Farmer Otto", model = "QuestFarm" },
+	{ name = "Beachcomber Lou", model = "QuestCrabIsle" },
+	{ name = "Old Miner Gus", model = "QuestMountain" },
+	{ name = "Sheriff Dale", model = "QuestCaver" },
+	{ name = "Calm Bob", model = "QuestTreea" },
+	{ name = "Mama Fredda", model = "QuestSandCastle" },
+	{ name = "Hal the Deserter", model = "QuestMarine" },
+	{ name = "Elder Moray", model = "QuestDeepwake" },
+	{ name = "Climber Edda", model = "QuestCliffs" },
+	{ name = "Hermit Oswin", model = "QuestPursuer" },
+}
 ------------------------------------------------------------------ Auto Quest
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 -- Lee la misión activa del rastreador del juego (PlayerGui.QuestTracker.Frame.Rows: Header y Objective1..)
@@ -1099,42 +1189,232 @@ local function attack(enemy)
 	end
 end
 
+-- Ventana del NPC de misiones (EscaneoGUI con Farmer Otto): PlayerGui.QuestGiver.Frame.Window.Body
+--   List: botones "Quest<N>" (texto en su hijo "Text", p. ej. "! Out of the Pen"; "!" = disponible)
+--   Next: botón con "Accept" (o lo que toque para entregar)
+-- Se usa la propia ventana del juego: hablar con el NPC (ClickDetector de su parte Clickable), pulsar la misión y
+-- pulsar el botón. Así no hace falta saber el id interno de cada misión (entregar grabado: Claim("FarmBoars")).
+local function pressButton(btn)
+	if getconnections then
+		for _, signal in { btn.MouseButton1Click, btn.Activated, btn.MouseButton1Down } do
+			local conns = getconnections(signal)
+			if #conns > 0 then
+				for _, c in conns do pcall(function() c:Fire() end) end
+				return true
+			end
+		end
+	end
+	if firesignal then return pcall(firesignal, btn.MouseButton1Click) end
+	return false
+end
+
+local function buttonText(btn)
+	local t = btn:FindFirstChild("Text")
+	if t and t:IsA("TextLabel") then return t.Text end
+	return btn:IsA("TextButton") and btn.Text or ""
+end
+
+local function giverWindow()
+	local qg = player.PlayerGui:FindFirstChild("QuestGiver")
+	local frame = qg and qg:FindFirstChild("Frame")
+	if not (frame and frame.Visible and (not qg:IsA("ScreenGui") or qg.Enabled)) then return nil end
+	local window = frame:FindFirstChild("Window")
+	return window and window:FindFirstChild("Body")
+end
+
+-- Va al NPC, le habla y espera a que se abra su ventana (3 s). Devuelve el cuerpo de la ventana.
+local function openGiver(entry)
+	local npc = merchant(entry.model)
+	if not npc then
+		log(T("Quest: no encuentro a ", "Quest: can't find ") .. entry.name, "warn")
+		return nil
+	end
+	teleport(npc:GetPivot().Position + Vector3.new(0, 3, 4))
+	task.wait(0.4)
+	for _, d in npc:GetDescendants() do
+		if d:IsA("ClickDetector") and fireclickdetector then fireclickdetector(d) end
+	end
+	local t0 = os.clock()
+	while os.clock() - t0 < 3 do
+		local body = giverWindow()
+		if body then return body end
+		task.wait(0.1)
+	end
+	log(T("Quest: no se abre la ventana de ", "Quest: the window of ") .. entry.name .. T("", " doesn't open"), "warn")
+	return nil
+end
+
+local function questButtons(body)
+	local list = body:FindFirstChild("List")
+	local out = {}
+	for _, b in list and list:GetChildren() or {} do
+		if b:IsA("GuiButton") and b.Name:match("^Quest") and b.Visible then table.insert(out, b) end
+	end
+	table.sort(out, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+	return out
+end
+
+local function acceptQuest(entry)
+	local body = openGiver(entry)
+	if not body then return false end
+	for _, b in questButtons(body) do
+		if buttonText(b):match("^%s*!") then -- "!" = misión disponible
+			pressButton(b)
+			task.wait(0.5)
+			local nextBtn = body:FindFirstChild("Next")
+			if nextBtn and buttonText(nextBtn):lower():find("accept") then
+				pressButton(nextBtn)
+				task.wait(1)
+				log(T("Quest: aceptada ", "Quest: accepted ") .. buttonText(b):gsub("^%s*!%s*", ""), "ok", true)
+				return true
+			end
+		end
+	end
+	log(T("Quest: ", "Quest: ") .. entry.name .. T(" no tiene misiones disponibles ahora", " has no quests available right now"), "warn")
+	return false
+end
+
+-- Entregar: abrir la ventana y pulsar lo que no sea "Accept" (y si hace falta, antes la misión)
+local function claimQuest(entry)
+	local body = openGiver(entry)
+	if not body then return false end
+	local function tryNext()
+		local nextBtn = body:FindFirstChild("Next")
+		local text = nextBtn and buttonText(nextBtn):lower() or ""
+		if nextBtn and nextBtn.Visible and text ~= "" and not text:find("accept") then
+			pressButton(nextBtn)
+			task.wait(1)
+			return true
+		end
+		return false
+	end
+	if tryNext() then return true end
+	for _, b in questButtons(body) do
+		if not buttonText(b):match("^%s*!") then
+			pressButton(b)
+			task.wait(0.5)
+			if tryNext() then return true end
+		end
+	end
+	log(T("Quest: no veo cómo entregar la misión en la ventana de ", "Quest: can't see how to turn the quest in at ") .. entry.name, "warn")
+	return false
+end
+
+-- Objetivos "...: a/b" del rastreador
+local function progressOf(text)
+	local have, need = text:match("(%d+)%s*/%s*(%d+)%s*$")
+	return tonumber(have), tonumber(need)
+end
+
 section(pageAuto, L("Combate", "Combat"))
 toggle(pageAuto, "Auto Quest (beta)", function(on)
 	autoQuest = on
 	if not on then releaseMove("Quest") end
 	log("Auto Quest " .. (on and "ON" or "OFF"))
-end, L("Lee la misión activa y la hace. Por ahora entiende las de \"Defeat\": va a por esos enemigos y les ataca hasta completarla. Aceptar y entregar la misión, de momento a mano.",
-	"Reads your active quest and does it. For now it understands \"Defeat\" quests: goes for those enemies and attacks until it's done. Accepting and turning in, by hand for now."))
+end, L("Va al NPC elegido, acepta una misión, la hace (matar enemigos; pescar con Auto Pesca, quedándote en el agua) y vuelve a entregarla.",
+	"Goes to the chosen NPC, accepts a quest, does it (defeating enemies; fishing with Auto Fishing, staying at the water) and comes back to turn it in."))
+do
+	local names = {}
+	for i, g in QUEST_GIVERS do names[i] = g.name end
+	config.questGiver = math.clamp(tonumber(config.questGiver) or 4, 1, #QUEST_GIVERS) -- 4 = Farmer Otto
+	combo(pageAuto, L("NPC de misiones", "Quest giver"), names, config.questGiver, function(i)
+		config.questGiver = i
+		saveConfig()
+	end, L("A quién pide y entrega las misiones Auto Quest.", "Who Auto Quest takes and turns in quests from."))
+end
 
 local lastStatus, questStart
+local lastAcceptTry, lastClaimTry = -math.huge, -math.huge
+local questFishing = false -- Auto Quest encendió Auto Pesca y la apagará al acabar ese objetivo
+
+local function stopQuestFishing()
+	if not questFishing then return end
+	questFishing = false
+	local fish = toggles["Auto Pesca (beta)"]
+	if fish and fish.value then
+		fish.set(false)
+		task.spawn(fish.onChange, false)
+	end
+end
 -- Un paso de Auto Quest. Va en pcall: si algo falla sale en la consola en vez de parar el bucle en silencio
 local function questTick()
+	local giver = QUEST_GIVERS[config.questGiver]
 	local header, objs = questObjectives()
-	local target
+
+	-- Sin misión: ir a pedir una (como mucho cada 15 s)
+	if #objs == 0 then
+		if os.clock() - lastAcceptTry > 15 and claimMove("Quest") then
+			lastAcceptTry = os.clock()
+			local hrp = getHRP()
+			if not questStart and hrp then questStart = hrp.CFrame end
+			acceptQuest(giver)
+			returnTo(questStart)
+			questStart = nil
+			releaseMove("Quest")
+		end
+		task.wait(1)
+		return
+	end
+
+	-- ¿Qué objetivo falta? Derrotar enemigos o pescar. Si todos están a/b completos, entregar.
+	local target, fishing, allDone = nil, false, true
 	for _, o in objs do
-		local name, lv, have, need = parseDefeat(o.text)
-		if name and have < need then
-			target = { name = name, lv = lv, have = have, need = need }
-			break
+		local have, need = progressOf(o.text)
+		if have and need and have < need then
+			allDone = false
+			local name, lv = parseDefeat(o.text)
+			if name and not target then target = { name = name, lv = lv, have = have, need = need } end
+			if o.text:lower():find("catch") or o.text:lower():find("fish") then fishing = true end
 		end
 	end
 
 	local status
-	if #objs == 0 then
-		status = T("Quest: no tienes ninguna misión activa", "Quest: you have no active quest")
-	elseif not target then
+	if allDone then
+		status = T("Quest: completa, voy a entregarla a ", "Quest: done, turning it in to ") .. giver.name
+	elseif target then
+		status = string.format("Quest: %s %d/%d", target.name, target.have, target.need)
+	elseif fishing then
+		status = T("Quest: hay que pescar; uso Auto Pesca (quédate en el agua con el ratón sobre ella)",
+			"Quest: fishing needed; using Auto Fishing (stay at the water with the mouse on it)")
+	else
 		local texts = {}
 		for _, o in objs do table.insert(texts, o.text) end
-		status = T("Quest: ", "Quest: ") .. tostring(header) .. " — " .. table.concat(texts, " · ")
-			.. T(" (completa o de un tipo que aún no sé hacer)", " (done, or a type I can't do yet)")
-	else
-		status = string.format("Quest: %s %d/%d", target.name, target.have, target.need)
+		status = T("Quest: ", "Quest: ") .. tostring(header) .. " — " .. table.concat(texts, " · ") .. T(" (aún no sé hacer este tipo)", " (I can't do this type yet)")
 	end
 	if status ~= lastStatus then
-		log(status, target and "info" or "warn")
+		log(status, (target or fishing or allDone) and "info" or "warn")
 		lastStatus = status
 	end
+
+	if allDone then
+		stopQuestFishing()
+		if os.clock() - lastClaimTry > 10 and claimMove("Quest") then
+			lastClaimTry = os.clock()
+			local hrp = getHRP()
+			if not questStart and hrp then questStart = hrp.CFrame end
+			if claimQuest(giver) then log(T("Quest: entregada", "Quest: turned in"), "ok", true) end
+			returnTo(questStart)
+			questStart = nil
+			releaseMove("Quest")
+		end
+		task.wait(1)
+		return
+	end
+
+	if fishing and not target then
+		local fish = toggles["Auto Pesca (beta)"]
+		if fish and not fish.value then
+			fish.set(true)
+			task.spawn(fish.onChange, true)
+			questFishing = true
+			if not config.fishSpot then
+				log(T("Quest: no hay sitio de pesca guardado; pescará donde apunte el ratón", "Quest: no saved fishing spot; it will fish where the mouse points"), "warn")
+			end
+		end
+		task.wait(2)
+		return
+	end
+	stopQuestFishing()
 
 	if not target then
 		if questStart then
@@ -1175,8 +1455,7 @@ end
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 -- Paquetes de Merlin (grabado): MerlinService.RF.TakePackage() -> true junto a Merlin, y luego
 -- MerlinService.RF.Deliver() -> true en el destino (en la grabación, en Pirate's Land, ~ -1253, 214, -1231).
--- shortcut: no sabemos qué NPC es Merlin ni cómo marca el juego el destino. Merlin = modelo de Map.Merchants con
--- "Merlin" en el nombre, o si no "QuestMerchant" (está en la isla de Merlin según la wiki). El destino se busca
+-- Merlin es QuestFishMerchant (junto a Farmer Otto). shortcut: no sabemos cómo marca el juego el destino; se busca
 -- como un atributo Vector3 nuevo en el jugador o el personaje tras coger el paquete; si no aparece, se prueba
 -- en el sitio de la grabación. Lo que encuentre sale en la consola para fijarlo.
 local MERLIN_FALLBACK_DEST = Vector3.new(-1253, 214, -1231)
@@ -1189,10 +1468,7 @@ local function findMerlin()
 	local map = workspace:FindFirstChild("Map")
 	local merchants = map and map:FindFirstChild("Merchants")
 	if not merchants then return end
-	for _, m in merchants:GetChildren() do
-		if m.Name:lower():find("merlin") then return m end
-	end
-	return merchants:FindFirstChild("QuestMerchant")
+	return merchants:FindFirstChild("QuestFishMerchant") -- Merlin: junto a Farmer Otto (QuestFarm)
 end
 
 local function vectorAttrs()
@@ -1514,9 +1790,11 @@ end
 config.fruitSel = config.fruitSel or {} -- frutas elegidas (vacío = cualquiera)
 config.fruitMin = math.clamp(tonumber(config.fruitMin) or 1, 1, #FRUIT_RARITIES)
 
--- shortcut: se supone que una fruta suelta es una Tool en el workspace con el nombre de la fruta
--- (p. ej. "Chop Fruit"); los objetos sueltos que no encajan se apuntan en la consola para ajustarlo.
+-- Confirmado (EscaneoPendientes): una fruta tirada es una Tool en Workspace.Instances.Drops, llamada
+-- "Spring Fruit", con el atributo FruitItem = "Spring". Se mira primero el atributo y, si no, el nombre.
 local function fruitOf(obj)
+	local attr = typeof(obj) == "Instance" and obj:GetAttribute("FruitItem")
+	if type(attr) == "string" and fruitRank[attr] then return attr end
 	local n = obj.Name:lower()
 	for name in fruitRank do
 		if n:find("%f[%a]" .. name:lower() .. "%f[%A]") then return name end
@@ -1589,13 +1867,24 @@ local function collectFruit(tool)
 	local back = hrp.CFrame
 	teleport(handle.Position + Vector3.new(0, 2, 0))
 	task.wait(0.2)
-	hrp = getHRP()
-	if hrp and firetouchinterest then
-		firetouchinterest(hrp, handle, 0)
-		firetouchinterest(hrp, handle, 1)
-	end
+	-- Coger: tocar el Handle (recogida normal de Roblox) y, por si la fruta usa otro sistema, clicar o pulsar
+	-- lo que tenga. Se insiste hasta 1,5 s.
 	local t0 = os.clock()
-	while onGround(tool) and os.clock() - t0 < 1.5 do task.wait(0.1) end
+	repeat
+		hrp = getHRP()
+		if hrp and firetouchinterest then
+			firetouchinterest(hrp, handle, 0)
+			firetouchinterest(hrp, handle, 1)
+		end
+		for _, d in tool:GetDescendants() do
+			if d:IsA("ClickDetector") and fireclickdetector then
+				fireclickdetector(d)
+			elseif d:IsA("ProximityPrompt") and fireproximityprompt then
+				fireproximityprompt(d)
+			end
+		end
+		task.wait(0.25)
+	until not onGround(tool) or os.clock() - t0 >= 1.5
 	returnTo(back)
 	if onGround(tool) then
 		fruitTried[tool] = os.clock()
@@ -1699,20 +1988,10 @@ local function hold(tool)
 	return tool.Parent == player.Character
 end
 
--- El comprador está al lado de Sam: el NPC de Map.Merchants más cercano a Quest Man (sin contarle a él)
+-- El comprador de frutas es SellerMerchant, a 27 studs de Sam (EscaneoPendientes). Antes se cogía el NPC más
+-- cercano a Sam, que era DeepFisherman, y por eso te llevaba junto a Sam.
 local function fruitBuyer()
-	local sam = merchant("QuestMerchant2")
-	local merchants = sam and sam.Parent
-	if not merchants then return end
-	local best, bestDist
-	for _, m in merchants:GetChildren() do
-		if m ~= sam and m:IsA("Model") then
-			local d = (m:GetPivot().Position - sam:GetPivot().Position).Magnitude
-			if not bestDist or d < bestDist then best, bestDist = m, d end
-		end
-	end
-	if best and bestDist < 60 then return best end
-	return sam -- si no hay ninguno cerca, al menos al lado de Sam
+	return merchant("SellerMerchant") or merchant("QuestMerchant2")
 end
 
 local function openBoxes()
@@ -1804,24 +2083,43 @@ end
 local NPCS -- también lo usa la pestaña GUIs
 ------------------------------------------------------------------ Teleports
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
--- NPCs con interfaz o servicio útil (también los usa la pestaña GUIs)
+-- NPCs con interfaz o servicio útil (también los usa la pestaña GUIs). Nombres de su cartel o de la wiki;
+-- modelos de Map.Merchants (EscaneoPendientes). Todos se hablan con un ClickDetector (32 studs) en "Clickable".
 NPCS = {
-	{ name = "Quest Man (Sam's Bar)", model = "QuestMerchant2" },
+	{ name = "Sam (Quest Man)", model = "QuestMerchant2" },
+	{ name = "Fruit Seller", model = "SellerMerchant" },
+	{ name = "Drink Merchant", model = "DrinkMerchant" },
+	{ name = "Deep Fisherman", model = "DeepFisherman" },
+	{ name = "Merlin", model = "QuestFishMerchant" },
+	{ name = "Trait Sage", model = "TraitSage" },
 	{ name = "Silvers Rayleigh", model = "QuestHakiMerchant" },
+	{ name = "Red-Haired Shanks", model = "HakiRankMerchant" },
+	{ name = "The Expert", model = "ExpertiseMerchant" },
+	{ name = "Fish Merchant", model = "FishMerchant" },
 	{ name = "Strange Compass Shop", model = "FriendMerchant" },
-	{ name = "Fish Merchant", model = "QuestFishMerchant" },
+	{ name = "Affinity Diviner", model = "AffinityMerchant" },
+	{ name = "Advanced Bartender", model = "BetterDrinkMerchant" },
+	{ name = "Craftsman", model = "Craftsman" },
+	{ name = "Sword Dealer", model = "SwordMerchant" },
+	{ name = "Sniper Dealer", model = "SniperMerchant" },
+	{ name = "Emote Merchant", model = "EmoteMerchant" },
 }
 
-section(pageTp, "NPCs")
-local npcGrid = grid(pageTp)
-for _, entry in NPCS do
-	button(npcGrid, entry.name, function()
-		local npc = merchant(entry.model)
-		if not npc then return log(T("No encuentro a ", "Can't find ") .. entry.name, "warn") end
-		teleport(npc:GetPivot().Position + Vector3.new(0, 3, 4))
-		log(T("Llevado a ", "Taken to ") .. entry.name)
-	end, L("Te lleva junto a " .. entry.name, "Takes you to " .. entry.name))
+local function npcButtons(list)
+	local g = grid(pageTp)
+	for _, entry in list do
+		button(g, entry.name, function()
+			local npc = merchant(entry.model)
+			if not npc then return log(T("No encuentro a ", "Can't find ") .. entry.name, "warn") end
+			teleport(npc:GetPivot().Position + Vector3.new(0, 3, 4))
+			log(T("Llevado a ", "Taken to ") .. entry.name)
+		end, L("Te lleva junto a " .. entry.name, "Takes you to " .. entry.name))
+	end
 end
+section(pageTp, "NPCs")
+npcButtons(NPCS)
+section(pageTp, L("Misiones", "Quest givers"))
+npcButtons(QUEST_GIVERS)
 
 -- Nombres de las islas según la wiki del juego (datos.json) y los NPCs que hay en cada una.
 -- Las que no aparecen aquí usan su nombre interno limpio.
