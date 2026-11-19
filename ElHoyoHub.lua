@@ -1,6 +1,6 @@
 -- El Hoyo Hub
 -- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
-local HUB_VERSION = "1.1.0"
+local HUB_VERSION = "1.1.1"
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
 local function ElHoyoHubMain()
@@ -2646,7 +2646,11 @@ local visited = {} -- pieza del barril -> os.clock() de la última visita
 local juiceFailed = false
 config.juiceFruits = config.juiceFruits or {}
 local fruitNames = { Banana = true, ["Prickly Pear"] = true } -- y las que salgan de los barriles
-for name in config.juiceFruits do fruitNames[name] = true end
+-- Las "...Grapple" salen de los barriles pero no dan zumo (confirmado por el usuario): se tiran
+local function isGrapple(name) return name:find("Grapple%s*$") ~= nil end
+for name in config.juiceFruits do
+	if isGrapple(name) then config.juiceFruits[name] = nil else fruitNames[name] = true end
+end
 
 local function tools()
 	local out = {}
@@ -2657,8 +2661,33 @@ local function tools()
 	end
 	return out
 end
-local function isDrink(t) return t.Name:find("Juice") ~= nil or t.Name:find("Smoothie") ~= nil end
 local function humanoid() return player.Character and player.Character:FindFirstChildOfClass("Humanoid") end
+local function isDrink(t) -- "Banana Juice", "Coconut Milk"...
+	return t.Name:find("Juice") ~= nil or t.Name:find("Smoothie") ~= nil or t.Name:find("Milk") ~= nil
+end
+
+-- Tirar las Grapple: en la mano y fuera del personaje (como la tecla Retroceso); si no se suelta, la tecla
+local function dropGrapples()
+	local hum = humanoid()
+	if not hum then return end
+	local n = 0
+	for _, t in tools() do
+		if isGrapple(t.Name) and t.Parent then
+			hum:EquipTool(t)
+			task.wait(0.2)
+			if t.CanBeDropped then pcall(function() t.Parent = workspace end) end
+			task.wait(0.2)
+			if t.Parent == player.Character then
+				VIM:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
+				VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+				task.wait(0.3)
+			end
+			if t.Parent ~= player.Character and t.Parent ~= player:FindFirstChild("Backpack") then n += 1 end
+		end
+	end
+	hum:UnequipTools()
+	if n > 0 then log(T("Auto Stats: tiradas ", "Auto Stats: dropped ") .. n .. " Grapple") end
+end
 
 -- Todos los barriles y cajas del mapa, en ruta (siempre al más cercano desde donde estás), sin pausas largas
 local function collect()
@@ -2701,7 +2730,7 @@ local function collect()
 	-- lo nuevo que no es zumo ha salido de los barriles: es fruta (así se aprenden las que no conocíamos)
 	local got = 0
 	for _, t in tools() do
-		if not before[t] and not isDrink(t) then
+		if not before[t] and not isDrink(t) and not isGrapple(t.Name) then
 			got += 1
 			if not fruitNames[t.Name] then
 				fruitNames[t.Name] = true
@@ -2809,6 +2838,7 @@ task.spawn(function()
 			local ok, err = pcall(function()
 				collect()
 				makeJuice(start)
+				dropGrapples()
 				drinkAll()
 			end)
 			if not ok then log("Auto Stats: error " .. tostring(err), "error") end
