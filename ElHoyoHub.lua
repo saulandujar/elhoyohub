@@ -2374,37 +2374,59 @@ do
 			ring.Color, label.TextColor3, label.ZIndex = C.line, C.dim, 2
 			layout()
 		end)
-		dot.MouseButton1Click:Connect(function() goIsland(pt.island) end)
 	end
 
-	-- Zoom con la rueda, manteniendo fijo el punto bajo el ratón
-	frame.InputChanged:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
-		local newZoom = math.clamp(zoom * (input.Position.Z > 0 and 1.25 or 0.8), 1, MAX_ZOOM)
-		local mx = input.Position.X - frame.AbsolutePosition.X
-		local my = input.Position.Y - frame.AbsolutePosition.Y
-		panX = mx - W / 2 - (mx - W / 2 - panX) * newZoom / zoom
-		panY = my - MAP_H / 2 - (my - MAP_H / 2 - panY) * newZoom / zoom
-		zoom = newZoom
-		layout()
-	end)
-	-- Arrastrar para moverse (empezando en el fondo, no en una isla)
-	local dragFrom
-	frame.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragFrom = { x = input.Position.X, y = input.Position.Y, px = panX, py = panY }
-		end
-	end)
-	table.insert(cleanup, UIS.InputChanged:Connect(function(input)
-		if dragFrom and input.UserInputType == Enum.UserInputType.MouseMovement then
-			panX = dragFrom.px + input.Position.X - dragFrom.x
-			panY = dragFrom.py + input.Position.Y - dragFrom.y
+	-- Ratón: la librería reparte los clics y la rueda con su propio sistema; si el mapa no está registrado en él,
+	-- pulsar encima arrastra la ventana y la rueda hace scroll de la caja. Se registra como un control más en una
+	-- sub-zona de la caja (se mira antes que la caja).
+	local scope = mapBox.scope
+	local mapScope = setmetatable({ parent = scope, own = 1, alpha = scope.alpha, painters = {}, items = {}, wheels = {},
+		kids = {}, inert = false }, getmetatable(scope))
+	table.insert(scope.kids, mapScope)
+	local function localPoint(p) -- de píxeles de pantalla a píxeles del mapa (la ventana puede estar escalada)
+		local k = frame.AbsoluteSize.X / W
+		return (p.X - frame.AbsolutePosition.X) / k, (p.Y - frame.AbsolutePosition.Y) / k
+	end
+	local dragFrom, moved
+	table.insert(mapScope.items, {
+		gui = frame,
+		down = function(p)
+			local x, y = localPoint(p)
+			dragFrom, moved = { x = x, y = y, px = panX, py = panY }, false
+		end,
+		drag = function(p)
+			if not dragFrom then return end
+			local x, y = localPoint(p)
+			if math.abs(x - dragFrom.x) + math.abs(y - dragFrom.y) > 4 then moved = true end
+			panX, panY = dragFrom.px + x - dragFrom.x, dragFrom.py + y - dragFrom.y
 			layout()
-		end
-	end))
-	table.insert(cleanup, UIS.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragFrom = nil end
-	end))
+		end,
+		up = function(p)
+			dragFrom = nil
+			if moved then return end
+			-- clic sin arrastrar: la isla bajo el ratón
+			for _, pt in points do
+				local a, s = pt.dot.AbsolutePosition, pt.dot.AbsoluteSize
+				if p.X >= a.X and p.Y >= a.Y and p.X < a.X + s.X and p.Y < a.Y + s.Y then return goIsland(pt.island) end
+			end
+		end,
+	})
+	-- Zoom con la rueda, manteniendo fijo el punto bajo el ratón
+	table.insert(mapScope.wheels, {
+		gui = frame,
+		fn = function(z)
+			-- GetMouseLocation cuenta desde arriba de la pantalla; las GUI sin IgnoreGuiInset, desde debajo de la barra
+			local sg = frame:FindFirstAncestorWhichIsA("ScreenGui")
+			local m = UIS:GetMouseLocation()
+			if not (sg and sg.IgnoreGuiInset) then m -= game:GetService("GuiService"):GetGuiInset() end
+			local mx, my = localPoint(m)
+			local newZoom = math.clamp(zoom * (z > 0 and 1.25 or 0.8), 1, MAX_ZOOM)
+			panX = mx - W / 2 - (mx - W / 2 - panX) * newZoom / zoom
+			panY = my - MAP_H / 2 - (my - MAP_H / 2 - panY) * newZoom / zoom
+			zoom = newZoom
+			layout()
+		end,
+	})
 	task.defer(layout) -- TextBounds ya calculado
 
 	local me = Instance.new("Frame")
