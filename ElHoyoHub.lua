@@ -1,5 +1,6 @@
--- El Hoyo Hub v1.4.0-rc1 (build f8338114). ARCHIVO GENERADO por tools/build.js: no editar aquí,
--- el código está en src/ (ver ARCHITECTURE.md). Módulos: Lifecycle, Components, Config, Webhook, ElHoyoUI, Console, Ownership, Knowledge, CatalogIndex, Diagnostics.
+-- El Hoyo Hub v1.5.2-rc1 (build a038d77e). ARCHIVO GENERADO por tools/build.js: no editar aquí,
+-- el código está en src/ (ver ARCHITECTURE.md). Módulos: Lifecycle, Components, Config, Webhook, Tokens, Layout, Search, Notifications, ElHoyoUI, Console, Ownership, Protection, Knowledge, KnowledgeView, CatalogIndex, Profiles, Diagnostics, NpcFarm, Favorites.
+local import -- se asigna después de los módulos: así los módulos la ven (upvalue) y pueden importar otros
 local __modules = {}
 __modules["Lifecycle"] = function(...)
 -- Lifecycle: ciclo de vida del hub. Sin dependencias de Roblox más allá de `task` (inyectable para pruebas).
@@ -9,6 +10,9 @@ __modules["Lifecycle"] = function(...)
 --    aún no se ha soltado se encuentra la ventana destruida) · life.startedAt / life.readyAt: tiempos de carga
 --  * life.spawn / life.delay / life.defer: como task.*, pero el error va a life.errors en vez de perderse
 --  * life.errors: registro de errores con contador (los repetidos no se esconden: suman y se vuelven a avisar)
+--  * 1.4.1: cada hilo es una TAREA con id y origen (componente). Un hilo lanzado desde otro HEREDA su origen: los
+--    bucles internos de una función también la identifican. Tipos de error: recoverable | config | critical.
+--    life.tasks(), life.cancel(origen), life.try(origen, fn, ...), life.leaks() (lo que sobrevive al cierre).
 -- Sustituye al `task` global envuelto de 1.3.1: así el código dice lo que hace y el `task` de Roblox no cambia.
 local Lifecycle = {}
 
@@ -16,15 +20,20 @@ local ErrorLog = {}
 ErrorLog.__index = ErrorLog
 -- max: errores distintos que se guardan; remind: cada cuántos s se vuelve a avisar uno que se repite
 function ErrorLog.new(max, remind, clock)
-	return setmetatable({ list = {}, byKey = {}, max = max or 30, remind = remind or 60, clock = clock or os.clock, total = 0 }, ErrorLog)
+	return setmetatable({ list = {}, byKey = {}, max = max or 30, remind = remind or 60, clock = clock or os.clock, total = 0,
+		byKind = {}, bySource = {} }, ErrorLog)
 end
 -- Apunta un error. Devuelve el texto a mostrar o nil si no toca avisar todavía (repetido hace poco).
-function ErrorLog:add(err, source)
+-- kind = "recoverable" (por defecto) | "config" | "critical"
+function ErrorLog:add(err, source, kind)
 	local text = tostring(err)
 	local first = text:match("^[^\n]*") or text
 	local key = (source or "") .. "|" .. first
 	local now = self.clock()
+	kind = kind or "recoverable"
 	self.total += 1
+	self.byKind[kind] = (self.byKind[kind] or 0) + 1
+	if source then self.bySource[source] = (self.bySource[source] or 0) + 1 end
 	local e = self.byKey[key]
 	if e then
 		e.count += 1
@@ -36,7 +45,7 @@ function ErrorLog:add(err, source)
 		end
 		return nil
 	end
-	e = { key = key, message = first, trace = text, source = source, count = 1, first = now, last = now, shown = now, shownCount = 1 }
+	e = { key = key, message = first, trace = text, source = source, kind = kind, count = 1, first = now, last = now, shown = now, shownCount = 1 }
 	self.byKey[key] = e
 	table.insert(self.list, e)
 	if #self.list > self.max then
@@ -61,26 +70,76 @@ function Lifecycle.new(opts)
 	local life = { alive = true, stage = "loading", onError = false, cleanup = {}, final = {}, closeErrors = 0,
 		errors = ErrorLog.new(opts.maxErrors, opts.remind, opts.clock), threads = 0, startedAt = clock(), readyAt = nil }
 
-	function life.report(err, source)
-		local shown = life.errors:add(err, source)
-		if shown and life.alive and life.onError then pcall(life.onError, shown, source) end
+	-- Si mostrar un error falla (o vuelve a llamar a report), no se entra en bucle: se cuenta y ya está
+	life.reportFailures = 0
+	local reporting = false
+	function life.report(err, source, kind)
+		local shown = life.errors:add(err, source, kind)
+		if shown and life.alive and life.onError and not reporting then
+			reporting = true
+			local ok = pcall(life.onError, shown, source, kind)
+			reporting = false
+			if not ok then life.reportFailures += 1 end
+		end
 	end
+
+	-- Tareas: id, origen, cuándo empezó. sourceOf[hilo] = origen, para que los hilos hijos lo hereden.
+	local sourceOf = setmetatable({}, { __mode = "k" })
+	local running = {} -- [entry] = true mientras corre
+	local nextId = 0
+	local function current() return sourceOf[coroutine.running()] end
+	life.current = current
 
 	local function guarded(fn, source)
 		if type(fn) ~= "function" then return fn end -- un hilo se deja igual
 		return function(...)
+			local co = coroutine.running()
+			sourceOf[co] = source
+			nextId += 1
+			local entry = { id = nextId, source = source, at = clock(), thread = co }
+			running[entry] = true
 			life.threads += 1
 			local ok, err = xpcall(fn, debug.traceback, ...)
 			life.threads -= 1
+			running[entry] = nil
 			if not ok and life.alive then life.report(err, source) end
 		end
 	end
 	life.guarded = guarded
-	function life.spawn(fn, ...) return realTask.spawn(guarded(fn), ...) end
-	-- Como spawn, pero el error lleva el nombre de quien lo lanzó (el hub lo usa para marcar ese componente en Error)
+	-- spawn/defer/delay heredan el origen del hilo que los llama; spawnAs lo pone explícitamente
+	function life.spawn(fn, ...) return realTask.spawn(guarded(fn, current()), ...) end
 	function life.spawnAs(source, fn, ...) return realTask.spawn(guarded(fn, source), ...) end
-	function life.defer(fn, ...) return realTask.defer(guarded(fn), ...) end
-	function life.delay(t, fn, ...) return realTask.delay(t, guarded(fn), ...) end
+	function life.defer(fn, ...) return realTask.defer(guarded(fn, current()), ...) end
+	function life.delay(t, fn, ...) return realTask.delay(t, guarded(fn, current()), ...) end
+
+	-- Tareas en curso: { id, source, age }
+	function life.tasks()
+		local out = {}
+		for entry in running do
+			if coroutine.status(entry.thread) == "dead" then running[entry] = nil
+			else table.insert(out, { id = entry.id, source = entry.source, age = clock() - entry.at }) end
+		end
+		table.sort(out, function(a, b) return a.id < b.id end)
+		return out
+	end
+	-- Cancela las tareas de un origen (que no sea la que llama). Devuelve cuántas.
+	function life.cancel(source)
+		local n, me = 0, coroutine.running()
+		for entry in running do
+			if entry.source == source and entry.thread ~= me and coroutine.status(entry.thread) ~= "dead" then
+				if pcall(realTask.cancel, entry.thread) then n += 1 end
+				running[entry] = nil
+				life.threads -= 1
+			end
+		end
+		return n
+	end
+	-- pcall que NO esconde el fallo: lo apunta con su origen y tipo. Devuelve ok, resultado (o mensaje).
+	function life.try(source, fn, ...)
+		local ok, res = pcall(fn, ...)
+		if not ok then life.report(res, source, "recoverable") end
+		return ok, res
+	end
 
 	-- Registra algo que hay que deshacer al cerrar: una conexión, o una función. Devuelve lo mismo.
 	function life.add(item, first)
@@ -95,6 +154,8 @@ function Lifecycle.new(opts)
 		return item
 	end
 
+	-- Lo que se soltó al cerrar, para comprobar después que de verdad se soltó (life.leaks)
+	local released = setmetatable({}, { __mode = "k" })
 	-- Cerrar varias veces no hace nada más. Cada paso va en pcall: uno que falle no deja el resto sin deshacer.
 	function life.close()
 		if not life.alive then return false end
@@ -103,15 +164,31 @@ function Lifecycle.new(opts)
 		for _, group in { life.cleanup, life.final } do
 			for _, c in group do
 				local ok, err = pcall(c.Disconnect, c)
+				released[c] = true
 				if not ok then
 					life.closeErrors += 1
-					life.errors:add(err, "close")
+					life.errors:add(err, "close", "critical")
 				end
 			end
 			table.clear(group)
 		end
 		life.stage = "closed"
 		return true
+	end
+
+	-- Tras cerrar: conexiones que siguen conectadas y tareas que siguen vivas (no debería haber ninguna; las tareas
+	-- que esperan con task.wait salen solas al ver life.alive = false: `grace` = segundos que se les dan)
+	function life.leaks(grace)
+		local out = { connections = 0, tasks = {} }
+		for c in released do
+			if type(c) == "table" and c.Connected == true or typeof and typeof(c) == "RBXScriptConnection" and c.Connected then
+				out.connections += 1
+			end
+		end
+		for _, t in life.tasks() do
+			if t.age > (grace or 0) then table.insert(out.tasks, t) end
+		end
+		return out
 	end
 
 	-- Para diagnósticos: cuántas cosas hay registradas y cuántas conexiones siguen vivas
@@ -124,7 +201,8 @@ function Lifecycle.new(opts)
 			end
 		end
 		return { cleanups = #life.cleanup, finals = #life.final, connections = connections, connected = connected, threads = life.threads,
-			errors = #life.errors.list, errorTotal = life.errors.total, closeErrors = life.closeErrors,
+			errors = #life.errors.list, errorTotal = life.errors.total, closeErrors = life.closeErrors, tasks = #life.tasks(),
+			errorKinds = table.clone(life.errors.byKind), reportFailures = life.reportFailures,
 			initTime = life.readyAt and (life.readyAt - life.startedAt) or nil }
 	end
 	return life
@@ -147,16 +225,20 @@ return Lifecycle
 end
 __modules["Components"] = function(...)
 -- Components: estado central de los componentes del hub (infraestructura, informativos y funciones).
--- Un componente tiene UN estado a la vez, con motivo, último error, tiempo activo, dependencias, disponibilidad y
--- recursos propios. Las transiciones no permitidas se rechazan (devuelven false) para que no haya estados
--- contradictorios. Sin Roblox: el reloj se inyecta. El estado de las funciones sale de su interruptor (una sola
--- fuente de verdad): el hub solo lo refleja aquí, no lo duplica.
+-- v2 (1.4.1): separa la INTENCIÓN (desiredState: lo que se pidió) del ESTADO REAL (runtimeState, alias `state`: lo que
+-- está pasando), la disponibilidad (dependencias) y el motivo. Contrato reutilizable para componentes internos:
+--   impl = { init(c), start(c, token), stop(c), pause(c), resume(c), destroy(c) }   (todas opcionales)
+--   c:init() c:start() c:stop() c:pause() c:resume() c:destroy() c:getStatus()
+-- start/stop son idempotentes; cada start/stop cambia la GENERACIÓN: un token o una tarea de una generación vieja ya
+-- no puede tocar el componente (c:token().alive() == false). Sin Roblox: reloj, spawn y cancel se inyectan.
 local Components = {}
 
 Components.STATES = { "Disabled", "Initializing", "Ready", "Running", "Waiting", "Paused", "Stopping", "Error", "Unavailable" }
 local VALID = {}
 for _, s in Components.STATES do VALID[s] = true end
 Components.VALID = VALID
+-- Intenciones posibles
+Components.DESIRED = { Disabled = true, Running = true, Paused = true }
 
 -- Activo = cuenta como tiempo de actividad y satisface a quien dependa de él
 local ACTIVE = { Running = true, Waiting = true, Paused = true }
@@ -176,6 +258,7 @@ local ALLOWED = {
 	Unavailable = { Initializing = true, Ready = true, Disabled = true },
 }
 Components.ALLOWED = ALLOWED
+local HISTORY = 12 -- transiciones guardadas por componente
 
 function Components.canMove(from, to)
 	if from == to then return VALID[to] == true end
@@ -184,9 +267,12 @@ function Components.canMove(from, to)
 end
 
 local Component = {}
-Component.__index = Component
+Component.__index = function(t, k)
+	if k == "runtimeState" then return rawget(t, "state") end
+	return Component[k]
+end
 
--- Cambia de estado. Devuelve true si cambió (o ya estaba), false si la transición no está permitida.
+-- Cambia el estado REAL. Devuelve true si cambió (o ya estaba), false + motivo si no está permitido.
 function Component:set(state, reason)
 	if not VALID[state] then return false, "estado desconocido: " .. tostring(state) end
 	if not Components.canMove(self.state, state) then
@@ -194,21 +280,41 @@ function Component:set(state, reason)
 		return false, self.state .. " -> " .. state .. " no permitido"
 	end
 	local now = self.registry.clock()
-	if ACTIVE[state] and not ACTIVE[self.state] then self.activeSince = now end
-	if not ACTIVE[state] and ACTIVE[self.state] and self.activeSince then
-		self.activeTotal += now - self.activeSince
-		self.activeSince = nil
+	if ACTIVE[state] and not ACTIVE[self.state] then
+		self.activeSince = now
+		self.startedAt = now
 	end
-	local changed = self.state ~= state
+	if not ACTIVE[state] and ACTIVE[self.state] then
+		if self.activeSince then self.activeTotal += now - self.activeSince end
+		self.activeSince = nil
+		self.stoppedAt = now
+	end
+	local from = self.state
+	local changed = from ~= state
 	self.state, self.reason, self.since = state, reason, changed and now or self.since
-	if changed then self.registry:_changed(self) end
+	if changed then
+		self.lastTransition = { from = from, to = state, at = now, reason = reason }
+		table.insert(self.history, self.lastTransition)
+		if #self.history > HISTORY then table.remove(self.history, 1) end
+		self.registry:_changed(self)
+	end
 	return true
 end
 
--- Error: guarda el mensaje (primera línea) y cuántos lleva
-function Component:fail(err)
+-- Intención: lo que se pidió (el interruptor, un start/stop). No cambia el estado real.
+function Component:setDesired(desired)
+	if not Components.DESIRED[desired] then return false end
+	self.desiredState = desired
+	return true
+end
+
+-- Error: guarda el mensaje (primera línea), cuántos lleva y de qué tipo (recoverable | config | critical)
+function Component:fail(err, kind)
+	kind = kind or "recoverable"
 	self.errors += 1
+	self.errorKinds[kind] = (self.errorKinds[kind] or 0) + 1
 	self.lastError = (tostring(err):match("^[^\n]*"))
+	self.lastErrorKind = kind
 	return self:set("Error", self.lastError)
 end
 
@@ -226,7 +332,11 @@ function Component:track(item)
 end
 function Component:release()
 	local n = #self.resources
-	for i = n, 1, -1 do pcall(self.resources[i].Disconnect, self.resources[i]) end
+	for i = n, 1, -1 do
+		local item = self.resources[i]
+		local ok, err = pcall(item.Disconnect, item)
+		if not ok then self.registry:_report(self, err, "recoverable") end -- no se esconde: se apunta
+	end
 	table.clear(self.resources)
 	return n
 end
@@ -236,33 +346,197 @@ function Component:available()
 	for _, dep in self.deps do
 		local d = self.registry.byName[dep]
 		if not d then return false, dep .. " no existe" end
-		if not SATISFIES[d.state] then return false, dep .. " " .. d.state end
+		if not SATISFIES[d.state] then
+			return false, dep .. " está en " .. d.state .. (d.reason and (" (" .. tostring(d.reason) .. ")") or "")
+		end
 	end
 	return true
+end
+
+-- Token de la generación actual: alive() es false en cuanto hay otro start/stop o destroy
+function Component:token()
+	local gen = self.generation
+	return { generation = gen, alive = function() return self.generation == gen and not self.destroyed end }
+end
+
+-- Lanza una tarea del componente: lleva su nombre (sus errores lo marcan en Error), se cancela al parar y no hace
+-- nada si al empezar su generación ya no es la actual.
+function Component:spawn(fn, ...)
+	local token = self:token()
+	local reg = self.registry
+	local entry = { name = self.name, generation = token.generation }
+	local thread = reg.spawn(function(...)
+		if not token.alive() then return end
+		local ok, err = xpcall(fn, debug.traceback, token, ...)
+		self.tasks[entry] = nil
+		if not ok and token.alive() then reg:_report(self, err, "recoverable") end
+	end, ...)
+	entry.thread = thread
+	if thread ~= nil and (type(thread) ~= "thread" or coroutine.status(thread) ~= "dead") then self.tasks[entry] = true end
+	return thread
+end
+function Component:taskCount()
+	local n = 0
+	for entry in self.tasks do
+		if type(entry.thread) == "thread" and coroutine.status(entry.thread) == "dead" then self.tasks[entry] = nil else n += 1 end
+	end
+	return n
+end
+local function cancelTasks(self)
+	local n = 0
+	for entry in self.tasks do
+		if type(entry.thread) == "thread" and coroutine.status(entry.thread) ~= "dead" then
+			local ok = pcall(self.registry.cancel, entry.thread)
+			if ok then n += 1 end
+		end
+		self.tasks[entry] = nil
+	end
+	return n
+end
+
+-- Llama a un paso del contrato en pcall. Un fallo marca Error (con su tipo) y devuelve false + mensaje.
+local function hook(self, name, ...)
+	local fn = self.impl and self.impl[name]
+	if not fn then return true end
+	local ok, err = pcall(fn, self, ...)
+	if not ok then
+		self:fail(err, name == "init" and "config" or "recoverable")
+		return false, self.lastError
+	end
+	return true
+end
+
+function Component:init()
+	if self.destroyed then return false, "destruido" end
+	if self.initialized then return true end
+	local okDeps, why = self:available()
+	if not okDeps then
+		self:set("Unavailable", why)
+		return false, why
+	end
+	self:set("Initializing", nil)
+	local ok, err = hook(self, "init")
+	if not ok then return false, err end
+	self.initialized = true
+	self:set("Ready", nil)
+	return true
+end
+
+function Component:start()
+	self:setDesired("Running")
+	if self.destroyed then return false, "destruido" end
+	if self.state == "Running" or self.state == "Waiting" then return true end -- idempotente
+	if self.state == "Paused" then return self:resume() end
+	if not self.initialized or self.state == "Unavailable" then
+		self.initialized = self.initialized and self.state ~= "Unavailable"
+		local ok, why = self:init()
+		if not ok then return false, why end
+	end
+	local okDeps, why = self:available()
+	if not okDeps then
+		self:set("Unavailable", why)
+		return false, why
+	end
+	self.generation += 1
+	if self.state == "Error" then self:set("Ready", "reintento") end
+	local ok, err = hook(self, "start", self:token())
+	if not ok then return false, err end
+	if self.state ~= "Error" then self:set("Running", nil) end
+	return true
+end
+
+function Component:stop(reason)
+	self:setDesired("Disabled")
+	if not (ACTIVE[self.state] or self.state == "Stopping") then return true end -- idempotente: ya parado
+	self.generation += 1 -- lo que lanzó el start anterior ya no puede tocar nada
+	self:set("Stopping", reason)
+	cancelTasks(self)
+	hook(self, "stop")
+	if self.state == "Stopping" then self:set(self.initialized and "Ready" or "Disabled", reason) end
+	return true
+end
+
+function Component:pause()
+	if self.state == "Paused" then return true end
+	if not (self.state == "Running" or self.state == "Waiting") then return false, "no está en marcha (" .. self.state .. ")" end
+	self:setDesired("Paused")
+	local ok, err = hook(self, "pause")
+	if not ok then return false, err end
+	self:set("Paused", nil)
+	return true
+end
+
+function Component:resume()
+	if self.state == "Running" then return true end
+	if self.state ~= "Paused" then return false, "no está en pausa (" .. self.state .. ")" end
+	self:setDesired("Running")
+	local ok, err = hook(self, "resume")
+	if not ok then return false, err end
+	self:set("Running", nil)
+	return true
+end
+
+function Component:destroy(reason)
+	if self.destroyed then return true end
+	self:stop(reason)
+	hook(self, "destroy")
+	self.destroyed = true
+	self.generation += 1
+	cancelTasks(self)
+	self:release()
+	if self.state ~= "Disabled" then
+		if not self:set("Disabled", reason) then self.state = "Disabled" end
+	end
+	return true
+end
+
+function Component:getStatus()
+	local ok, why = self:available()
+	return {
+		name = self.name, kind = self.kind, state = self.state, runtimeState = self.state, desiredState = self.desiredState,
+		matches = (self.desiredState == "Running" and (self.state == "Running" or self.state == "Waiting"))
+			or (self.desiredState == "Paused" and self.state == "Paused")
+			or (self.desiredState == "Disabled" and not ACTIVE[self.state]),
+		reason = self.reason, available = ok, unavailableWhy = why, availability = ok and "available" or "unavailable",
+		deps = table.clone(self.deps), lastError = self.lastError, lastErrorKind = self.lastErrorKind, errors = self.errors,
+		errorKinds = table.clone(self.errorKinds), resources = #self.resources, tasks = self:taskCount(),
+		uptime = self:uptime(), startedAt = self.startedAt, stoppedAt = self.stoppedAt, lastTransition = self.lastTransition,
+		generation = self.generation, destroyed = self.destroyed == true, rejected = self.rejected,
+	}
 end
 
 local Registry = {}
 Registry.__index = Registry
 
--- opts.clock (por defecto os.clock)
+-- opts.clock (os.clock), opts.spawn(fn, ...) -> hilo (task.spawn), opts.cancel(hilo) (task.cancel),
+-- opts.onError(componente, mensaje, tipo): para llevar el error al registro del hub
 function Components.new(opts)
 	opts = opts or {}
-	return setmetatable({ list = {}, byName = {}, clock = opts.clock or os.clock, listeners = {} }, Registry)
+	local hasTask = type(task) == "table"
+	return setmetatable({
+		list = {}, byName = {}, clock = opts.clock or os.clock, listeners = {}, onError = opts.onError,
+		spawn = opts.spawn or (hasTask and task.spawn) or function(fn, ...) local co = coroutine.create(fn); coroutine.resume(co, ...); return co end,
+		cancel = opts.cancel or (hasTask and task.cancel) or function(co) coroutine.close(co) end,
+	}, Registry)
 end
 
--- info = { kind = "core" | "info" | "feature", deps = { nombres }, state = inicial (Disabled) , reason }
+-- info = { kind = "core" | "info" | "feature", deps = { nombres }, state = inicial (Disabled), reason, impl = contrato }
 function Registry:register(name, info)
 	info = info or {}
 	local existing = self.byName[name]
 	if existing then return existing end
 	local c = setmetatable({
 		name = name, kind = info.kind or "core", deps = info.deps or {}, state = "Disabled", reason = nil,
-		since = self.clock(), activeSince = nil, activeTotal = 0, errors = 0, lastError = nil, resources = {}, rejected = 0,
-		registry = self,
+		desiredState = "Disabled", since = self.clock(), activeSince = nil, activeTotal = 0, errors = 0, errorKinds = {},
+		lastError = nil, resources = {}, rejected = 0, registry = self, impl = info.impl, generation = 0, tasks = {},
+		history = {}, initialized = info.state == "Ready", startedAt = nil, stoppedAt = nil,
 	}, Component)
 	self.byName[name] = c
 	table.insert(self.list, c)
-	if info.state and info.state ~= "Disabled" then c:set(info.state, info.reason) end
+	if info.state and info.state ~= "Disabled" then
+		c:set(info.state, info.reason)
+		if ACTIVE[info.state] then c.desiredState = "Running" end
+	end
 	return c
 end
 
@@ -270,7 +544,19 @@ function Registry:get(name) return self.byName[name] end
 
 function Registry:onChange(fn) table.insert(self.listeners, fn) end
 function Registry:_changed(c)
-	for _, fn in self.listeners do pcall(fn, c) end
+	for _, fn in self.listeners do
+		local ok, err = pcall(fn, c)
+		if not ok then self.listenerErrors = (self.listenerErrors or 0) + 1; self.lastListenerError = tostring(err) end
+	end
+end
+-- Error de una tarea o de un recurso: marca el componente y avisa al hub (una sola vez: sin bucles de aviso)
+function Registry:_report(c, err, kind)
+	c:fail(err, kind)
+	if self.onError and not self.reporting then
+		self.reporting = true
+		pcall(self.onError, c, c.lastError, kind)
+		self.reporting = false
+	end
 end
 
 -- Dependencias: lo que no puede funcionar pasa a Unavailable (con el motivo); lo que vuelve a poder, a Ready.
@@ -282,12 +568,14 @@ function Registry:refresh()
 		for _, c in self.list do
 			local ok, why = c:available()
 			if not ok and c.state ~= "Disabled" and c.state ~= "Error" and c.state ~= "Unavailable" then
+				if ACTIVE[c.state] then c.generation += 1; cancelTasks(c) end
 				c:set("Stopping", why)
 				c:set("Disabled", why)
 				c:set("Unavailable", why)
 				changed, n = true, n + 1
 			elseif ok and c.state == "Unavailable" and #c.deps > 0 then
 				c:set("Ready", nil)
+				c.initialized = c.impl == nil or c.initialized
 				changed, n = true, n + 1
 			end
 		end
@@ -315,15 +603,10 @@ function Registry:cycles()
 	return out
 end
 
--- Para el Diagnóstico: una fila por componente, en orden de registro
+-- Para el Diagnóstico: una fila por componente (getStatus), en orden de registro
 function Registry:snapshot()
 	local out = {}
-	for _, c in self.list do
-		local ok, why = c:available()
-		table.insert(out, { name = c.name, kind = c.kind, state = c.state, reason = c.reason, lastError = c.lastError,
-			errors = c.errors, uptime = c:uptime(), deps = table.clone(c.deps), available = ok, unavailableWhy = why,
-			resources = #c.resources })
-	end
+	for _, c in self.list do table.insert(out, c:getStatus()) end
 	return out
 end
 
@@ -334,19 +617,30 @@ function Registry:counts()
 	return out
 end
 
--- Al cerrar el hub: suelta los recursos de todos (los últimos registrados primero) y los deja Disabled
+-- Componentes cuya intención no coincide con su estado real (p. ej. pedido Running y está en Error)
+function Registry:mismatches()
+	local out = {}
+	for _, c in self.list do
+		local s = c:getStatus()
+		if not s.matches then table.insert(out, s) end
+	end
+	return out
+end
+
+-- Al cerrar el hub: para y destruye todos (los últimos registrados primero), suelta recursos y cancela tareas.
+-- Devuelve recursos soltados y la lista de lo que sobrevive (tareas vivas o recursos sin soltar: no debería haber).
 function Registry:shutdown(reason)
 	local released = 0
 	for i = #self.list, 1, -1 do
 		local c = self.list[i]
-		if c.state ~= "Disabled" then
-			c:set("Stopping", reason)
-			if c.state ~= "Stopping" then c:set("Disabled", reason) end -- Unavailable/Initializing no pasan por Stopping
-		end
-		released += c:release()
-		if c.state == "Stopping" then c:set("Disabled", reason) end
+		released += #c.resources
+		c:destroy(reason)
 	end
-	return released
+	local survivors = {}
+	for _, c in self.list do
+		if c:taskCount() > 0 or #c.resources > 0 then table.insert(survivors, c.name) end
+	end
+	return released, survivors
 end
 
 return Components
@@ -360,12 +654,114 @@ local Config = {}
 
 Config.VERSION = 3 -- configVersion actual. Historial en Config.MIGRATIONS.
 
--- Tipo de cada clave conocida. Un valor de otro tipo se ignora (queda el de serie) y se avisa.
-Config.TYPES = {
-	profiles = "table", lang = "string", palette = "string", key = "string", notify = "boolean", scale = "number",
-	hubUrl = "string", webhook = "string", autoExec = "boolean", fishSpot = "table", juiceFruits = "table",
-	fruitSel = "table", sellRarities = "table", boxRarities = "table", bossKeys = "string", configVersion = "number",
+-- Esquema central (1.4.1): una entrada por ajuste de ElHoyoHub.json. De aquí salen los tipos, los valores de serie,
+-- los rangos y qué es secreto. Los valores de serie son los MISMOS que antes usaba src/main.lua (`config.x or N`).
+--   id: clave estable · type · default · range {min, max} (los números fuera se RECORTAN, como hacía main) ·
+--   integer · options (valores válidos) · category · persist ("config" = ElHoyoHub.json; nunca van en perfiles de la
+--   librería) · sensitive (no sale en exportaciones ni diagnósticos) · since (versión en que apareció) ·
+--   migration (número de Config.MIGRATIONS que la toca, si alguna)
+-- Las claves que no están aquí (de versiones futuras o pasadas) se conservan tal cual: no se borra nada.
+local HUB_URL = "https://raw.githubusercontent.com/saulandujar/elhoyohub/refs/heads/main/ElHoyoHub.lua"
+Config.SCHEMA = {
+	{ id = "configVersion", type = "number", default = nil, category = "hub", since = "1.3.1" },
+	{ id = "profiles", type = "table", default = {}, category = "hub", since = "1.1.0" },
+	{ id = "lang", type = "string", default = "es", options = { "es", "en" }, category = "interface", since = "1.0.0" },
+	{ id = "palette", type = "string", default = "Abismo", category = "interface", since = "1.1.0" },
+	{ id = "key", type = "string", default = "RightShift", category = "interface", since = "1.0.0" },
+	{ id = "notify", type = "boolean", default = true, category = "interface", since = "1.1.0" },
+	{ id = "scale", type = "number", default = 1, range = { 0.5, 2 }, category = "interface", since = "1.1.0" },
+	{ id = "hubUrl", type = "string", default = HUB_URL, category = "hub", since = "1.2.0" },
+	{ id = "autoExec", type = "boolean", default = false, category = "hub", since = "1.2.0" },
+	{ id = "webhook", type = "string", default = nil, category = "discord", sensitive = true, since = "1.3.0", migration = 2 },
+	{ id = "chestSpeed", type = "number", default = 2, range = { 1, 3 }, integer = true, category = "automation", since = "1.2.0" },
+	{ id = "fishSpot", type = "table", default = nil, category = "automation", since = "1.2.0" },
+	{ id = "juiceFruits", type = "table", default = {}, category = "automation", since = "1.3.0" },
+	{ id = "questGiver", type = "number", default = 4, range = { 1, 14 }, integer = true, category = "quests", since = "1.2.0" },
+	{ id = "fruitMin", type = "number", default = 1, range = { 1, 4 }, integer = true, category = "fruits", since = "1.2.0" },
+	{ id = "fruitSel", type = "table", default = {}, category = "fruits", since = "1.2.0" },
+	{ id = "sellRarities", type = "table", default = nil, category = "fruits", since = "1.3.0" },
+	{ id = "boxRarities", type = "table", default = nil, category = "fruits", since = "1.3.0" },
+	{ id = "avoidRadius", type = "number", default = 60, options = { 30, 60, 100, 200 }, category = "protection", since = "1.3.0" },
+	{ id = "escapeAt", type = "number", default = 2, range = { 1, 10 }, integer = true, category = "protection", since = "1.3.0" },
+	{ id = "flySpeed", type = "number", default = 2, range = { 1, 10 }, integer = true, category = "movement", since = "1.2.0" },
+	{ id = "walkSpeed", type = "number", default = 2, range = { 1, 10 }, integer = true, category = "movement", since = "1.2.0" },
+	{ id = "jumpMult", type = "number", default = 2, range = { 1, 10 }, integer = true, category = "movement", since = "1.2.0" },
+	{ id = "bossMode", type = "number", default = 1, range = { 1, 10 }, integer = true, category = "bosses", since = "1.3.0" },
+	{ id = "bossPick", type = "number", default = 1, range = { 1, 50 }, integer = true, category = "bosses", since = "1.3.0" },
+	{ id = "bossWeapon", type = "number", default = 1, range = { 1, 10 }, integer = true, category = "bosses", since = "1.3.0" },
+	{ id = "bossKeys", type = "string", default = "Z X C V", category = "bosses", since = "1.3.0" },
+	-- 1.5.0: favoritos (ids estables de controles) y tecla del buscador global (con Ctrl)
+	{ id = "favorites", type = "table", default = {}, category = "interface", since = "1.5.0" },
+	{ id = "searchKey", type = "string", default = "K", category = "interface", since = "1.5.0" },
+	-- 1.5.1: Bounty (NPCs). Índices de las listas de src/modules/NpcFarm.lua; el punto, { x, y, z }
+	{ id = "bountyPoint", type = "table", default = nil, category = "bounty", since = "1.5.1" },
+	{ id = "bountySkills", type = "table", default = { true, true, true, true }, category = "bounty", since = "1.5.1" },
+	{ id = "bountyInterval", type = "number", default = 2, range = { 1, 4 }, integer = true, category = "bounty", since = "1.5.1" },
+	{ id = "bountyRadius", type = "number", default = 2, range = { 1, 4 }, integer = true, category = "bounty", since = "1.5.1" },
+	{ id = "bountyLow", type = "number", default = 2, range = { 1, 3 }, integer = true, category = "bounty", since = "1.5.1" },
+	{ id = "bountyRecover", type = "number", default = 2, range = { 1, 3 }, integer = true, category = "bounty", since = "1.5.1" },
 }
+Config.BY_ID = {}
+Config.TYPES = {} -- compatibilidad con 1.3.2: tipo de cada clave
+for _, s in Config.SCHEMA do
+	Config.BY_ID[s.id] = s
+	Config.TYPES[s.id] = s.type
+end
+
+local function copy(v)
+	if type(v) ~= "table" then return v end
+	local out = {}
+	for k, x in v do out[k] = copy(x) end
+	return out
+end
+
+-- Valores de serie del esquema (copias: nadie comparte tablas) con `overrides` encima
+function Config.defaults(overrides)
+	local out = {}
+	for _, s in Config.SCHEMA do
+		if s.default ~= nil then out[s.id] = copy(s.default) end
+	end
+	for k, v in overrides or {} do out[k] = v end
+	return out
+end
+
+-- Comprueba un valor contra su entrada del esquema. Devuelve ok, valor (quizá recortado), motivo.
+-- Clave desconocida = válida tal cual (compatibilidad).
+function Config.check(id, value)
+	local s = Config.BY_ID[id]
+	if not s then return true, value end
+	if type(value) ~= s.type then return false, nil, "tipo " .. type(value) .. " (se esperaba " .. s.type .. ")" end
+	if s.type == "number" then
+		if value ~= value then return false, nil, "no es un número" end
+		if s.integer then value = math.floor(value + 0.5) end
+		if s.range then value = math.clamp(value, s.range[1], s.range[2]) end
+	end
+	if s.options and table.find(s.options, value) == nil then return false, nil, "valor no permitido: " .. tostring(value) end
+	return true, value
+end
+
+-- Copia de la config sin lo sensible (para exportar o diagnosticar)
+function Config.public(config)
+	local out = {}
+	for k, v in config do
+		local s = Config.BY_ID[k]
+		if not (s and s.sensitive) and k ~= "profiles" then out[k] = copy(v) end
+	end
+	return out
+end
+
+-- Resumen del esquema por categoría (Diagnóstico)
+function Config.summary(config)
+	local out = { total = #Config.SCHEMA, custom = 0, unknown = 0, byCategory = {} }
+	for _, s in Config.SCHEMA do
+		out.byCategory[s.category] = (out.byCategory[s.category] or 0) + 1
+		if config and config[s.id] ~= nil and s.default ~= nil and type(s.default) ~= "table" and config[s.id] ~= s.default then
+			out.custom += 1
+		end
+	end
+	for k in config or {} do if not Config.BY_ID[k] then out.unknown += 1 end end
+	return out
+end
 
 -- Patrón de URL de webhook de Discord (cualquier subdominio de discord(app).com). Sirve para tapar secretos.
 local WEBHOOK_ANY = "https://[%w%.%-]*discord[%w%.%-]*%.com/api/webhooks/[%w/_%-]+"
@@ -392,13 +788,16 @@ function Config.load(fs, json, path, defaults)
 		return config, notes, state
 	end
 	state.file = "ok"
+	state.clamped = {}
 	for k, v in data do
-		local want = Config.TYPES[k]
-		if type(k) == "string" and (not want or type(v) == want) then
-			config[k] = v
+		local ok, value, why = false, nil, "clave no válida"
+		if type(k) == "string" then ok, value, why = Config.check(k, v) end
+		if ok then
+			if value ~= v then table.insert(state.clamped, k) end -- recortado al rango (lo mismo que hacía main)
+			config[k] = value
 		else
 			table.insert(state.ignored, tostring(k))
-			table.insert(notes, { "Ajuste ignorado (valor no válido): " .. tostring(k), "Setting ignored (invalid value): " .. tostring(k) })
+			table.insert(notes, { "Ajuste ignorado (" .. tostring(why) .. "): " .. tostring(k), "Setting ignored (invalid value): " .. tostring(k) })
 		end
 	end
 	return config, notes, state
@@ -542,6 +941,388 @@ end
 
 return Webhook
 end
+__modules["Tokens"] = function(...)
+-- Tokens: el sistema de diseño de El Hoyo UI en un solo sitio (1.5.0). Solo datos (sin Roblox): colores en
+-- hexadecimal (la librería los convierte con Color3.fromHex), tipografía, espaciado, radios, opacidades, duraciones
+-- y colores de estado. Un componente nuevo debe sacar de aquí sus valores en vez de escribir números sueltos.
+-- Reglas de la identidad (ver ARCHITECTURE.md > Sistema de diseño): fondos muy oscuros por capas (Top/Body < Side <
+-- Group < Frame), un único acento carmesí #E11D48, bordes de 1 px discretos, radios pequeños (4–8; 14 solo la
+-- ventana), texto 12 px (11 títulos de grupo, 13 títulos de sección), animaciones cortas que no bloquean.
+local Tokens = {}
+
+Tokens.ACCENT = "#E11D48" -- carmesí del logo
+
+-- Paletas: { [nombre] = "#RRGGBB" | { "#RRGGBB", opacidad } }. Abismo es la de serie y el respaldo de las demás.
+Tokens.palettes = {
+	Abismo = {
+		Text = "#ECECF4", Disabled = "#808096", Soft = "#BEBECE", Border = "#24202D", PopupBorder = "#342E40",
+		FrameInactive = "#1A1822", FrameActive = "#3A1222", TabActive = "#2A1520", Button = "#1C1A24",
+		ButtonHovered = "#121118", ButtonActive = "#16141D", Side = "#0F0E15", Top = "#0B0A10", Body = "#0B0A10",
+		Group = "#131219", Popup = "#13121A", FieldBg = "#1C1A24", SwitchOff = "#1E1B26", SwitchRim = { "#FFFFFF", 0.07 },
+		KnobOff = "#8C889C", Divider = { "#FFFFFF", 0.118 }, LabelOff = "#9694A2", LabelOn = "#FFFFFF",
+		Separator = "#1E1C27", Ink = "#FFFFFF", SwatchLine = { "#FFFFFF", 0.08 },
+		-- estados (1.5.0)
+		Success = "#22C55E", Warning = "#F59E0B", Danger = "#EF4444", Info = "#60A5FA", Muted = "#5B5A6E",
+	},
+	Light = {
+		Text = "#1C1E25", Disabled = "#767B87", Soft = "#4F535E", Border = "#DADDE4", PopupBorder = "#CCD0DA",
+		FrameInactive = "#E3E6ED", FrameActive = "#D1DBF4", TabActive = "#D9DEEA", Button = "#E7E9EF",
+		ButtonHovered = "#DDE0E7", ButtonActive = "#D4D7DF", Side = "#EAECF1", Top = "#F4F5F8", Body = "#F1F2F6",
+		Group = "#FCFCFD", Popup = "#F6F7FA", FieldBg = "#E5E7EE", SwitchOff = "#CACED8", SwitchRim = { "#000000", 0.06 },
+		KnobOff = "#FFFFFF", Divider = { "#000000", 0.1 }, LabelOff = "#767B87", LabelOn = "#1C1E25",
+		Separator = "#DADDE4", Ink = "#1C1E25", SwatchLine = { "#000000", 0.12 },
+		Success = "#16A34A", Warning = "#D97706", Danger = "#DC2626", Info = "#2563EB", Muted = "#9CA3AF",
+	},
+}
+
+-- Tipografía (px)
+Tokens.text = { caption = 11, body = 12, title = 13, heading = 14 }
+-- Espaciado (px) y alturas de fila
+Tokens.space = { xs = 2, sm = 4, md = 8, lg = 12, xl = 16, gutter = 10 }
+Tokens.size = { row = 25, tab = 34, tabPill = 30, sideWidth = 150, header = 61, icon = 14 }
+-- Radios (px): pequeños, sin esquinas exageradas
+Tokens.radius = { control = 6, card = 8, popup = 10, window = 14 }
+-- Opacidades de los estados interactivos (sobre el color de su capa)
+Tokens.opacity = { idle = 0.5, hover = 0.8, pressed = 0.95, disabled = 0.35, activeFill = 1 }
+-- Velocidades de animación (la librería usa Anim(valor, velocidad): más alto = más rápido)
+Tokens.motion = { fast = 16, normal = 12, slow = 5, page = 2.8 }
+-- Estado de un componente (Components) → token de color del punto de estado
+Tokens.status = {
+	Running = "Success", Waiting = "Warning", Paused = "Warning", Initializing = "Info", Ready = "Muted",
+	Disabled = "Muted", Stopping = "Warning", Error = "Danger", Unavailable = "Muted",
+}
+-- Niveles de notificación → token de color
+Tokens.notify = { info = "Info", success = "Success", warning = "Warning", error = "Danger" }
+
+-- Resuelve un token de color de una paleta (con respaldo en Abismo). Devuelve hex y opacidad.
+function Tokens.color(theme, name)
+	local p = Tokens.palettes[theme] or Tokens.palettes.Abismo
+	local v = p[name] or Tokens.palettes.Abismo[name]
+	if type(v) == "table" then return v[1], v[2] end
+	return v, 1
+end
+
+-- Comprueba que todas las paletas tienen los mismos nombres que Abismo y hex válidos. Devuelve problemas.
+function Tokens.validate()
+	local problems = {}
+	local function hex(v) return type(v) == "string" and v:match("^#%x%x%x%x%x%x$") ~= nil end
+	for theme, p in Tokens.palettes do
+		for name in Tokens.palettes.Abismo do
+			if p[name] == nil then table.insert(problems, theme .. ": falta " .. name) end
+		end
+		for name, v in p do
+			local h, a = v, 1
+			if type(v) == "table" then h, a = v[1], v[2] end
+			if not hex(h) then table.insert(problems, theme .. "." .. name .. ": hex no válido") end
+			if type(a) ~= "number" or a < 0 or a > 1 then table.insert(problems, theme .. "." .. name .. ": opacidad") end
+		end
+	end
+	for state, token in Tokens.status do
+		if Tokens.palettes.Abismo[token] == nil then table.insert(problems, "estado " .. state .. ": token " .. token) end
+	end
+	if not hex(Tokens.ACCENT) then table.insert(problems, "acento") end
+	return problems
+end
+
+return Tokens
+end
+__modules["Layout"] = function(...)
+-- Layout: matemáticas de colocación de El Hoyo UI (1.5.0), sin Roblox, para poder probarlas con Lune.
+-- Coordenadas "lógicas" = las del Stage de la librería (píxeles de pantalla divididos por la escala).
+-- * fitScale: la escala que pidió el usuario, salvo que la ventana no quepa: entonces la mayor que sí cabe.
+-- * breakpoint / compact: tramo de resolución y si la barra lateral debe compactarse (grupos plegados).
+-- * clampWindow: posición restaurada o arrastrada siempre visible (entera si cabe; si no, la cabecera).
+-- * placePopup: listas desplegables debajo del control o, si no caben, encima; nunca fuera de la pantalla.
+-- * sidebar / scrollTo: posiciones de la barra lateral con grupos plegados y desplazamiento.
+local Layout = {}
+
+Layout.BASE = { w = 800, h = 600 } -- tamaño de la ventana a escala 1
+Layout.SCALE = { min = 0.5, max = 2, step = 0.05 }
+Layout.MARGIN = 16
+Layout.HEADER = 61 -- alto de la cabecera (lo mínimo que debe verse para poder arrastrar)
+Layout.SIDE = { group = 12, groupLabel = 16.5, tab = 34, height = 470 }
+
+local function size(v) return v.X or v.x or v[1], v.Y or v.y or v[2] end
+
+-- Escala efectiva para un viewport (en píxeles reales). Devuelve escala, motivo ("user" | "fit").
+function Layout.fitScale(view, userScale, margin)
+	local vw, vh = size(view)
+	margin = margin or Layout.MARGIN
+	local want = math.clamp(tonumber(userScale) or 1, Layout.SCALE.min, Layout.SCALE.max)
+	local fits = math.min((vw - 2 * margin) / Layout.BASE.w, (vh - 2 * margin) / Layout.BASE.h)
+	if want <= fits then return want, "user" end
+	local s = math.floor(fits / Layout.SCALE.step + 1e-9) * Layout.SCALE.step
+	s = math.floor(s * 100 + 0.5) / 100 -- sin restos de coma flotante (1.7, no 1.7000000000000002)
+	return math.clamp(s, Layout.SCALE.min, want), "fit"
+end
+
+-- Tramo de resolución (píxeles reales): "small" < 720 de alto o < 1100 de ancho; "hd" < 1080; "fhd" < 1440; "qhd"
+function Layout.breakpoint(view)
+	local vw, vh = size(view)
+	if vh < 720 or vw < 1100 then return "small" end
+	if vh < 1080 then return "hd" end
+	if vh < 1440 then return "fhd" end
+	return "qhd"
+end
+
+-- ¿Barra lateral compacta? Con poco alto lógico (la ventana ya va reducida) los grupos se pliegan salvo el activo.
+function Layout.compact(view, scale)
+	local _, vh = size(view)
+	return vh / (scale or 1) < Layout.BASE.h + 2 * Layout.MARGIN or Layout.breakpoint(view) == "small"
+end
+
+-- Posición válida de la ventana (lógica). Si cabe entera, dentro con margen; si no, al menos la cabecera.
+function Layout.clampWindow(pos, win, view, margin)
+	local px, py = size(pos)
+	local ww, wh = size(win)
+	local vw, vh = size(view)
+	margin = margin or 0
+	local function axis(p, w, v, keep)
+		if w + 2 * margin <= v then return math.clamp(p, margin, v - w - margin) end
+		return math.clamp(p, keep - w, 0) -- más grande que la pantalla: que se vea su principio
+	end
+	local x = axis(px, ww, vw, math.min(ww, vw))
+	local y = axis(py, wh, vh, math.min(wh, vh))
+	-- nunca por encima del borde superior: la cabecera (para arrastrar) siempre a la vista
+	y = math.max(y, math.min(0, vh - Layout.HEADER))
+	return x, y
+end
+
+-- Lista desplegable de w×h para un control en (ax, ay) de alto ah. Debajo si cabe; si no encima; si tampoco, la
+-- que más sitio tenga y recortada al alto disponible. Devuelve x, y, alto final, "below" | "above".
+function Layout.placePopup(ax, ay, ah, w, h, view, margin)
+	local vw, vh = size(view)
+	margin = margin or 8
+	local below = vh - margin - (ay + ah + 4)
+	local above = ay - 4 - margin
+	local x = math.clamp(ax, margin, math.max(margin, vw - w - margin))
+	if h <= below then return x, ay + ah + 4, h, "below" end
+	if h <= above then return x, ay - 4 - h, h, "above" end
+	if below >= above then return x, ay + ah + 4, math.max(0, below), "below" end
+	local hh = math.max(0, above)
+	return x, ay - 4 - hh, hh, "above"
+end
+
+-- Barra lateral. items = { { kind = "group", key, collapsed } | { kind = "tab", group = key } } en orden.
+-- Devuelve { y = { [i] = posición o nil si oculto }, total, maxScroll }. Mismos pasos que relayoutSide.
+function Layout.sidebar(items, height)
+	local S = Layout.SIDE
+	local ys, y, collapsed, first = {}, 0, {}, true
+	for i, it in items do
+		if it.kind == "group" then
+			collapsed[it.key] = it.collapsed == true
+			if not first then y += S.group end
+			first = false
+			ys[i] = y + 1
+			y = math.floor(y + S.groupLabel)
+		elseif not (it.group and collapsed[it.group]) then
+			ys[i] = y
+			y += S.tab
+		end
+	end
+	return { y = ys, total = y, maxScroll = math.max(0, y - (height or S.height)) }
+end
+
+-- Desplazamiento para que una fila (y, alto) se vea entera en una ventana de `height`
+function Layout.scrollTo(rowY, rowH, scroll, height, maxScroll)
+	local s = scroll
+	if rowY < s then s = rowY end
+	if rowY + rowH > s + height then s = rowY + rowH - height end
+	return math.clamp(s, 0, math.max(0, maxScroll or s))
+end
+
+return Layout
+end
+__modules["Search"] = function(...)
+-- Search: búsqueda global de El Hoyo UI (1.5.0), sin Roblox. Normaliza texto (mayúsculas, acentos, ñ), puntúa,
+-- agrupa resultados por fuente y guarda un historial corto. La librería pinta; aquí no se ejecuta nada: un resultado
+-- solo dice ADÓNDE ir (el que llama decide; la búsqueda nunca pulsa un control).
+-- entrada = { label, group, path?, aliases?, tip?, key? }
+local Search = {}
+
+-- Grupos en el orden en que se muestran
+Search.GROUPS = { "controls", "settings", "profiles", "catalog", "history" }
+Search.PER_GROUP = 5
+Search.LIMIT = 10
+Search.HISTORY = 8
+
+local FOLD = {
+	[0xE1] = "a", [0xE0] = "a", [0xE4] = "a", [0xE2] = "a", [0xC1] = "a", [0xC0] = "a", [0xC4] = "a", [0xC2] = "a",
+	[0xE9] = "e", [0xE8] = "e", [0xEB] = "e", [0xEA] = "e", [0xC9] = "e", [0xC8] = "e", [0xCB] = "e", [0xCA] = "e",
+	[0xED] = "i", [0xEC] = "i", [0xEF] = "i", [0xEE] = "i", [0xCD] = "i", [0xCC] = "i", [0xCF] = "i", [0xCE] = "i",
+	[0x130] = "i", [0x131] = "i",
+	[0xF3] = "o", [0xF2] = "o", [0xF6] = "o", [0xF4] = "o", [0xD3] = "o", [0xD2] = "o", [0xD6] = "o", [0xD4] = "o",
+	[0xFA] = "u", [0xF9] = "u", [0xFC] = "u", [0xFB] = "u", [0xDA] = "u", [0xD9] = "u", [0xDC] = "u", [0xDB] = "u",
+	[0xF1] = "n", [0xD1] = "n", [0xE7] = "c", [0xC7] = "c", [0x11E] = "g", [0x11F] = "g", [0x15E] = "s", [0x15F] = "s",
+}
+
+-- Caché del texto normalizado: los nombres de controles y entidades se repiten en cada pulsación (medido con
+-- tools/bench.js). Tope de tamaño para que no crezca sin límite.
+local foldCache, foldCount = {}, 0
+Search.CACHE_MAX = 4000
+
+-- Minúsculas y sin acentos, carácter a carácter (la posición en caracteres se conserva: sirve para resaltar)
+function Search.fold(text)
+	text = tostring(text or "")
+	local hit = foldCache[text]
+	if hit then return hit end
+	local out = {}
+	for _, code in utf8.codes(text) do
+		if code >= 65 and code <= 90 then
+			table.insert(out, string.char(code + 32))
+		elseif FOLD[code] then
+			table.insert(out, FOLD[code])
+		elseif code >= 0x410 and code <= 0x42F then
+			table.insert(out, utf8.char(code + 0x20))
+		else
+			table.insert(out, utf8.char(code))
+		end
+	end
+	local folded = table.concat(out)
+	foldCount += 1
+	if foldCount > Search.CACHE_MAX then table.clear(foldCache); foldCount = 1 end
+	foldCache[text] = folded
+	return folded
+end
+
+-- Posición (en caracteres, desde 1) de q en text, sin mayúsculas ni acentos; nil si no está
+function Search.find(text, q)
+	local f, fq = Search.fold(text), Search.fold(q)
+	if fq == "" then return nil end
+	local at = string.find(f, fq, 1, true)
+	return at and utf8.len(f, 1, at) or nil
+end
+
+local GROUP_ORDER = {}
+for i, g in Search.GROUPS do GROUP_ORDER[g] = i end
+
+-- Puntúa entradas para q. Devuelve hits { entry, at (posición en label o nil), field, score } agrupados en el orden
+-- de GROUPS, como mucho PER_GROUP por grupo y LIMIT en total.
+function Search.rank(entries, q, opts)
+	opts = opts or {}
+	local fq = Search.fold(q):match("^%s*(.-)%s*$")
+	local hits = {}
+	if fq == "" then return hits end
+	for _, e in entries do
+		local best, at, field = 0, nil, nil
+		local label = Search.fold(e.label)
+		local p = string.find(label, fq, 1, true)
+		if p then
+			best = (label == fq and 100) or (p == 1 and 80) or 60
+			at, field = utf8.len(label, 1, p), "label"
+		end
+		if best < 50 then
+			for _, a in e.aliases or {} do
+				if string.find(Search.fold(a), fq, 1, true) then best, field = 50, "alias"; break end
+			end
+		end
+		if best < 40 and e.path and string.find(Search.fold(e.path), fq, 1, true) then best, field = 40, "path" end
+		if best < 30 and e.tip and string.find(Search.fold(e.tip), fq, 1, true) then best, field = 30, "tip" end
+		if best > 0 then table.insert(hits, { entry = e, at = at, field = field, score = best }) end
+	end
+	table.sort(hits, function(a, b)
+		local ga, gb = GROUP_ORDER[a.entry.group] or 99, GROUP_ORDER[b.entry.group] or 99
+		if ga ~= gb then return ga < gb end
+		if a.score ~= b.score then return a.score > b.score end
+		return Search.fold(a.entry.label) < Search.fold(b.entry.label)
+	end)
+	local out, perGroup = {}, {}
+	for _, h in hits do
+		local g = h.entry.group or "?"
+		perGroup[g] = (perGroup[g] or 0) + 1
+		if perGroup[g] <= (opts.perGroup or Search.PER_GROUP) then table.insert(out, h) end
+		if #out >= (opts.limit or Search.LIMIT) then break end
+	end
+	return out
+end
+
+-- Historial: lo último primero, sin repetidos (sin distinguir mayúsculas/acentos), como mucho HISTORY
+function Search.remember(history, q)
+	q = tostring(q or ""):match("^%s*(.-)%s*$")
+	if #q < 2 then return history end
+	local out, key = { q }, Search.fold(q)
+	for _, h in history or {} do
+		if type(h) == "string" and Search.fold(h) ~= key and #out < Search.HISTORY then table.insert(out, h) end
+	end
+	return out
+end
+
+-- Trozos de un texto para pintarlo resaltado: antes, coincidencia, después (posición y largo en caracteres)
+function Search.split(text, at, len)
+	text = tostring(text)
+	if not at then return text, "", "" end
+	local a = utf8.offset(text, at) or (#text + 1)
+	local b = utf8.offset(text, at + len) or (#text + 1)
+	return text:sub(1, a - 1), text:sub(a, b - 1), text:sub(b)
+end
+
+return Search
+end
+__modules["Notifications"] = function(...)
+-- Notifications: niveles, duplicados e historial de las notificaciones de El Hoyo UI (1.5.0). Sin Roblox: la
+-- librería pinta; aquí se decide si una notificación es nueva o repetida y se guarda el historial.
+local Notifications = {}
+Notifications.__index = Notifications
+
+Notifications.LEVELS = { info = true, success = true, warning = true, error = true }
+-- nombres que usa el hub en log() → nivel
+local ALIAS = { ok = "success", warn = "warning", err = "error", ["error"] = "error", info = "info", success = "success", warning = "warning" }
+
+function Notifications.level(name)
+	return ALIAS[tostring(name or "info"):lower()] or "info"
+end
+
+-- opts = { clock, max (historial), window (s en los que un aviso igual cuenta como repetido) }
+function Notifications.new(opts)
+	opts = opts or {}
+	return setmetatable({ list = {}, clock = opts.clock or os.clock, max = opts.max or 30, window = opts.window or 4,
+		counts = { info = 0, success = 0, warning = 0, error = 0 } }, Notifications)
+end
+
+-- Apunta una notificación. Devuelve la entrada y si hay que MOSTRARLA (false = repetida hace poco: solo suma).
+function Notifications:push(level, title, text)
+	level = Notifications.level(level)
+	title, text = tostring(title or ""), tostring(text or "")
+	local now = self.clock()
+	self.counts[level] += 1
+	for i = #self.list, math.max(1, #self.list - 5), -1 do
+		local e = self.list[i]
+		if e.level == level and e.title == title and e.text == text and now - e.last <= self.window then
+			e.count += 1
+			e.last = now
+			return e, false
+		end
+	end
+	local e = { level = level, title = title, text = text, count = 1, first = now, last = now }
+	table.insert(self.list, e)
+	if #self.list > self.max then table.remove(self.list, 1) end
+	return e, true
+end
+
+-- Historial, lo más reciente primero (opcional: solo un nivel)
+function Notifications:history(limit, level)
+	local out = {}
+	for i = #self.list, 1, -1 do
+		local e = self.list[i]
+		if not level or e.level == level then table.insert(out, e) end
+		if limit and #out >= limit then break end
+	end
+	return out
+end
+
+function Notifications:clear()
+	table.clear(self.list)
+end
+
+-- Texto de una entrada para listas ("x3" si se repitió)
+function Notifications.line(e, now)
+	local ago = now and math.max(0, math.floor(now - e.last)) or nil
+	return string.format("[%s]%s %s%s%s", e.level, e.count > 1 and (" x" .. e.count) or "", e.title ~= "" and (e.title .. ": ") or "",
+		e.text, ago and string.format("  (hace %ds)", ago) or "")
+end
+
+return Notifications
+end
 __modules["ElHoyoUI"] = function(...)
 --!nocheck
 --[[
@@ -565,58 +1346,48 @@ __modules["ElHoyoUI"] = function(...)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local Library, round, clamp, sat, FontMedium, FontSemi, Palettes, Accent, White, Black, T, A, applyPalette, tr, New, Box, Stroke, Shadow, setXY, setWH, Files, encodeJSON, decodeJSON, toHex, fromHex, safeName, Screen, Stage, StageScale, Probe, Scale, buildScreen, Widths, measure, preloadFonts, mouseAbs, toStage, inside, viewport, Scope
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
 local HttpService = game:GetService("HttpService")
 
 -- Version: nivel de API. ElHoyoHub.lua se niega a usar una librería más vieja que la que necesita (UI_MIN_VERSION).
 -- 2 = v1.3.1 (Unload completo, escala limitada, ventana dentro de la pantalla).
-local Library = { Version = 3, Language = 1, Theme = "Abismo", ThemeNames = { "Abismo", "Light" } } -- 1 = español
+Library = { Version = 5, Language = 1, Theme = "Abismo", ThemeNames = { "Abismo", "Light" } } -- 1 = español
 
-local floor, ceil, max, min, abs, exp, huge = math.floor, math.ceil, math.max, math.min, math.abs, math.exp, math.huge
-local function round(x) return floor(x + 0.5) end
-local function clamp(x, a, b) return (x < a and a) or (x > b and b) or x end
-local function sat(x) return clamp(x, 0, 1) end
+-- (1.5.0) sin alias locales de math: math.floor etc. compilan igual (GETIMPORT) y no gastan registros
+function round(x) return math.floor(x + 0.5) end
+function clamp(x, a, b) return (x < a and a) or (x > b and b) or x end
+function sat(x) return clamp(x, 0, 1) end
 
 local FONT_ID = "rbxassetid://12187365364" -- Inter
-local FontMedium = Font.new(FONT_ID, Enum.FontWeight.Medium)
-local FontSemi = Font.new(FONT_ID, Enum.FontWeight.SemiBold)
+FontMedium = Font.new(FONT_ID, Enum.FontWeight.Medium)
+FontSemi = Font.new(FONT_ID, Enum.FontWeight.SemiBold)
 
 --[[ ---------------------------------------- Theme ---------------------------------------- ]]
 
-local function rgb(r, g, b, a) return { Color3.new(r, g, b), a or 1 } end
-local function u8(r, g, b, a) return { Color3.fromRGB(r, g, b), a or 1 } end
+-- Colores: src/ui/Tokens.lua (sistema de diseño, 1.5.0). Aquí solo se pasan a Color3: { Color3, opacidad }.
+local Tokens = import("Tokens")
+Palettes = {}
+for theme, p in Tokens.palettes do
+	local out = {}
+	for name, v in p do
+		local hex, alpha = v, 1
+		if type(v) == "table" then hex, alpha = v[1], v[2] end
+		out[name] = { Color3.fromHex(hex), alpha }
+	end
+	Palettes[theme] = out
+end
+Library.Tokens = Tokens
+Library.Layout = import("Layout") -- colocación y escala (1.5.0)
+Library.Search = import("Search") -- búsqueda global (1.5.0)
 
-local Palettes = {
-	Abismo = {
-		Text = u8(236, 236, 244), Disabled = u8(128, 128, 150), Soft = u8(190, 190, 206),
-		Border = u8(38, 34, 48), PopupBorder = u8(52, 46, 64),
-		FrameInactive = u8(26, 24, 34), FrameActive = u8(44, 16, 28), TabActive = u8(40, 26, 36),
-		Button = u8(28, 26, 36), ButtonHovered = u8(18, 17, 24), ButtonActive = u8(22, 20, 29),
-		Side = u8(16, 15, 22), Top = u8(12, 11, 17), Body = u8(13, 12, 19),
-		Group = u8(19, 18, 26), Popup = u8(19, 18, 26), FieldBg = u8(28, 26, 36),
-		SwitchOff = u8(30, 27, 38), SwitchRim = rgb(1, 1, 1, .07), KnobOff = u8(140, 136, 156),
-		Divider = rgb(1, 1, 1, 30 / 255), LabelOff = u8(150, 148, 162), LabelOn = rgb(1, 1, 1),
-		Separator = u8(30, 28, 39), Ink = rgb(1, 1, 1), SwatchLine = rgb(1, 1, 1, .08),
-	},
-	Light = {
-		Text = rgb(.11, .118, .145), Disabled = rgb(.463, .482, .529), Soft = rgb(.31, .325, .369),
-		Border = rgb(.855, .867, .894), PopupBorder = rgb(.8, .816, .855),
-		FrameInactive = rgb(.89, .902, .929), FrameActive = rgb(.82, .859, .957), TabActive = rgb(.851, .871, .918),
-		Button = rgb(.906, .914, .937), ButtonHovered = rgb(.867, .878, .906), ButtonActive = rgb(.831, .843, .875),
-		Side = rgb(.918, .925, .945), Top = rgb(.957, .961, .973), Body = rgb(.945, .949, .965),
-		Group = rgb(.988, .988, .992), Popup = rgb(.965, .969, .98), FieldBg = rgb(.898, .906, .933),
-		SwitchOff = rgb(.792, .808, .847), SwitchRim = rgb(0, 0, 0, .06), KnobOff = rgb(1, 1, 1),
-		Divider = rgb(0, 0, 0, .1), LabelOff = rgb(.463, .482, .529), LabelOn = rgb(.11, .118, .145),
-		Separator = rgb(.855, .867, .894), Ink = rgb(.11, .118, .145), SwatchLine = rgb(0, 0, 0, .12),
-	},
-}
-
-local Accent = Color3.fromRGB(225, 29, 72) -- rojo carmesí del logo
-local White, Black = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
-local T, A = {}, {}
+Accent = Color3.fromHex(Tokens.ACCENT) -- rojo carmesí del logo
+White, Black = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+T, A = {}, {}
 
 local Fallback = Palettes.Abismo -- a theme file may name only some colours; the rest come from here
 
-local function applyPalette()
+function applyPalette()
 	local palette = Palettes[Library.Theme] or Fallback
 	for name, value in Fallback do
 		local entry = palette[name] or value
@@ -631,6 +1402,9 @@ applyPalette()
 local Translations = {
 	["Search functions..."] = { "Buscar funciones..." },
 	["No matching functions"] = { "No hay coincidencias" },
+	["No results. Try another word."] = { "Sin resultados. Prueba otra palabra." },
+	["Recent"] = { "Recientes" }, ["Catalog"] = { "Catálogo" }, ["Settings"] = { "Ajustes" },
+	["Click to fold or unfold this group."] = { "Pulsa para plegar o desplegar este grupo." },
 	["Functions"] = { "Funciones" },
 	["Select"] = { "Elegir" },
 	["Click to enable or disable this option."] = { "Pulsa para activar o desactivar esta opción." },
@@ -665,6 +1439,9 @@ local Translations = {
 	["Config Renamed"] = { "Perfil renombrado" },
 	["Config Restored"] = { "Perfil restaurado" },
 	["Config Duplicated"] = { "Perfil duplicado" },
+	["Config not loaded"] = { "Perfil no cargado" },
+	["Delete forever?"] = { "¿Borrar para siempre?" },
+	["Click again to delete %s forever"] = { "Vuelve a pulsar para borrar %s para siempre" },
 	["Created new config"] = { "Nuevo perfil creado" },
 	["Saved changes to %s"] = { "Cambios guardados en %s" },
 	["Loaded config: %s"] = { "Perfil cargado: %s" },
@@ -684,21 +1461,21 @@ local Translations = {
 }
 Library.Translations = Translations -- El Hoyo Hub añade aquí sus propios textos
 
-local function tr(text)
+function tr(text)
 	local row = Library.Language > 0 and Translations[text]
 	return row and row[Library.Language] or text
 end
 
 --[[ ---------------------------------------- Instances ------------------------------------ ]]
 
-local function New(class, props, parent)
+function New(class, props, parent)
 	local object = Instance.new(class)
 	for key, value in props do object[key] = value end
 	if parent then object.Parent = parent end
 	return object
 end
 
-local function Box(parent, x, y, w, h, color, radius)
+function Box(parent, x, y, w, h, color, radius)
 	local frame = New("Frame", {
 		Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h), BorderSizePixel = 0,
 		BackgroundColor3 = color or White, BackgroundTransparency = color and 0 or 1,
@@ -707,14 +1484,14 @@ local function Box(parent, x, y, w, h, color, radius)
 	return frame
 end
 
-local function Stroke(frame, color, thickness)
+function Stroke(frame, color, thickness)
 	return New("UIStroke", {
 		Color = color or White, Thickness = thickness or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 	}, frame)
 end
 
 -- Not every client has UIShadow yet. Those that don't simply go without a shadow.
-local function Shadow(parent, blur, transparency, offsetY)
+function Shadow(parent, blur, transparency, offsetY)
 	local ok, shadow = pcall(function()
 		return New("UIShadow", {
 			BlurRadius = UDim.new(0, blur), Color = Black, Offset = UDim2.fromOffset(0, offsetY or 0), Transparency = transparency,
@@ -723,15 +1500,15 @@ local function Shadow(parent, blur, transparency, offsetY)
 	return ok and shadow or nil
 end
 
-local function setXY(frame, x, y) frame.Position = UDim2.fromOffset(x, y) end
-local function setWH(frame, w, h) frame.Size = UDim2.fromOffset(w, h) end
+function setXY(frame, x, y) frame.Position = UDim2.fromOffset(x, y) end
+function setWH(frame, w, h) frame.Size = UDim2.fromOffset(w, h) end
 
 --[[ ---------------------------------------- Files ----------------------------------------- ]]
 
 local hasDisk = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
 	and type(isfolder) == "function" and type(makefolder) == "function" and type(listfiles) == "function"
 
-local Files = { memory = {}, disk = hasDisk }
+Files = { memory = {}, disk = hasDisk }
 
 function Files.folder(path)
 	if hasDisk then pcall(function() if not isfolder(path) then makefolder(path) end end) end
@@ -773,24 +1550,24 @@ function Files.list(folder)
 	return names
 end
 
-local function encodeJSON(value)
+function encodeJSON(value)
 	local ok, text = pcall(HttpService.JSONEncode, HttpService, value)
 	return ok and text or nil
 end
 
-local function decodeJSON(text)
+function decodeJSON(text)
 	if not text then return nil end
 	local ok, value = pcall(HttpService.JSONDecode, HttpService, text)
 	return ok and value or nil
 end
 
-local function toHex(color, alpha)
+function toHex(color, alpha)
 	local text = string.format("%02X%02X%02X", round(color.R * 255), round(color.G * 255), round(color.B * 255))
 	if alpha and alpha < 1 then text ..= string.format("%02X", round(alpha * 255)) end
 	return text
 end
 
-local function fromHex(text)
+function fromHex(text)
 	if type(text) ~= "string" then return nil end
 	local digits = string.gsub(text, "[^%x]", "")
 	if #digits ~= 6 and #digits ~= 8 then return nil end
@@ -798,13 +1575,13 @@ local function fromHex(text)
 	return Color3.fromRGB(byte(1), byte(3), byte(5)), #digits == 8 and byte(7) / 255 or 1
 end
 
-local function safeName(name) return (string.gsub(name, '[\\/:*?"<>|]', "_")) end
+function safeName(name) return (string.gsub(name, '[\\/:*?"<>|]', "_")) end
 
 --[[ ---------------------------------------- Screen ---------------------------------------- ]]
 
-local Screen, Stage, StageScale, Probe
-local Scale = 1
-local function buildScreen()
+-- (declarada arriba) Screen, Stage, StageScale, Probe
+Scale = 1
+function buildScreen()
 	if Screen then return end
 	local parent = (gethui and gethui()) or game:GetService("CoreGui")
 	local previous = parent:FindFirstChild("ElHoyoUI")
@@ -822,8 +1599,8 @@ local function buildScreen()
 	}, Screen)
 end
 
-local Widths = {}
-local function measure(text, size, font)
+Widths = {}
+function measure(text, size, font)
 	local key = (font == FontSemi and "S" or "M") .. size .. text
 	local cached = Widths[key]
 	if cached then return cached end
@@ -834,7 +1611,7 @@ local function measure(text, size, font)
 end
 
 -- Inter is a cloud font, so everything measured must wait until it has arrived.
-local function preloadFonts()
+function preloadFonts()
 	local ok, service = pcall(game.GetService, game, "TextService")
 	if not ok or not service then return end
 	for _, font in { FontMedium, FontSemi } do
@@ -847,21 +1624,22 @@ local function preloadFonts()
 end
 
 -- Mouse in the same space as AbsolutePosition.
-local function mouseAbs() return UserInputService:GetMouseLocation() + Screen.AbsolutePosition end
-local function toStage(point) return (point - Stage.AbsolutePosition) / Scale end
-local function inside(gui, p)
+function mouseAbs() return UserInputService:GetMouseLocation() + Screen.AbsolutePosition end
+function toStage(point) return (point - Stage.AbsolutePosition) / Scale end
+function inside(gui, p)
 	local a, s = gui.AbsolutePosition, gui.AbsoluteSize
 	return p.X >= a.X and p.Y >= a.Y and p.X < a.X + s.X and p.Y < a.Y + s.Y
 end
-local function viewport() return Stage.AbsoluteSize / Scale end
+function viewport() return Stage.AbsoluteSize / Scale end
 
 --[[ ---------------------------------------- Scopes ---------------------------------------- ]]
 -- A scope owns painters (redrawn on theme, language and fades) and hit regions. Its effective
 -- alpha is what a pushed ImGuiStyleVar_Alpha would have been.
 
-local Scope = {}
+Scope = {}
 Scope.__index = Scope
 
+end
 local function newScope(parent)
 	local scope = setmetatable({ parent = parent, own = 1, alpha = parent and parent.alpha or 1, painters = {}, items = {}, wheels = {}, kids = {}, inert = false }, Scope)
 	if parent then table.insert(parent.kids, scope) end
@@ -891,10 +1669,12 @@ local Root = newScope(nil)
 
 --[[ ---------------------------------------- Animation ------------------------------------- ]]
 
-local Moving, Queue, Stepping = {}, {}, false
-local Tickers = {}
+local Moving, Queue, Stepping, Tickers, Anim, Run, stepAnimations, Popups, Windows, Hover, Held, Dragging, Tip, ShowTip, HideTip, Hit, Wheel, pick, targetAt, updatePointer, closePopupsTo, onPress, onRelease
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
+Moving, Queue, Stepping = {}, {}, false
+Tickers = {}
 
-local function Anim(value, speed, callback, epsilon)
+function Anim(value, speed, callback, epsilon)
 	return setmetatable({ v = value, t = value, speed = speed or 15, cb = callback, eps = epsilon or 0.002 }, { __index = {
 		to = function(self, target, newSpeed)
 			if newSpeed then self.speed = newSpeed end
@@ -911,14 +1691,14 @@ local function Anim(value, speed, callback, epsilon)
 	} })
 end
 
-local function Run(fn) Tickers[fn] = true end
+function Run(fn) Tickers[fn] = true end
 
-local function stepAnimations(dt)
-	dt = min(dt, 0.05)
+function stepAnimations(dt)
+	dt = math.min(dt, 0.05)
 	Stepping = true
 	for anim in Moving do
-		anim.v += (anim.t - anim.v) * (1 - exp(-anim.speed * dt))
-		if abs(anim.t - anim.v) < anim.eps then
+		anim.v += (anim.t - anim.v) * (1 - math.exp(-anim.speed * dt))
+		if math.abs(anim.t - anim.v) < anim.eps then
 			anim.v = anim.t
 			Moving[anim] = nil
 		end
@@ -936,22 +1716,22 @@ end
 -- ImGui's rules, not Roblox's: the top popup owns the pointer, a press outside only closes,
 -- the held widget keeps the pointer, and the first widget submitted wins an overlap.
 
-local Popups, Windows = {}, {}
-local Hover, Held, Dragging = nil, nil, nil
-local Tip = { item = nil, time = 0 }
-local ShowTip, HideTip
+Popups, Windows = {}, {}
+Hover, Held, Dragging = nil, nil, nil
+Tip = { item = nil, time = 0 }
+-- (declarada arriba) ShowTip, HideTip
 
-local function Hit(scope, gui, handlers)
+function Hit(scope, gui, handlers)
 	handlers.gui = gui
 	table.insert(scope.items, handlers)
 	return handlers
 end
 
-local function Wheel(scope, gui, fn)
+function Wheel(scope, gui, fn)
 	table.insert(scope.wheels, { gui = gui, fn = fn })
 end
 
-local function pick(scope, p, field)
+function pick(scope, p, field)
 	if scope.inert or (scope.clip and not inside(scope.clip, p)) then return nil end
 	for i = #scope.kids, 1, -1 do
 		local found = pick(scope.kids[i], p, field)
@@ -963,7 +1743,7 @@ local function pick(scope, p, field)
 	return nil
 end
 
-local function targetAt(p, field)
+function targetAt(p, field)
 	if #Popups > 0 then
 		local top = Popups[#Popups]
 		return inside(top.frame, p) and pick(top.scope, p, field) or nil
@@ -983,7 +1763,7 @@ local function setHover(item)
 	Tip.item, Tip.time = item, 0
 end
 
-local function updatePointer(dt)
+function updatePointer(dt)
 	local p = mouseAbs()
 	if Held then
 		if Held.drag then Held.drag(p) end
@@ -1000,14 +1780,14 @@ local function updatePointer(dt)
 	end
 end
 
-local closePopupsTo
+-- (declarada arriba) closePopupsTo
 
 local function beginDrag(owner, p)
 	local grab = toStage(p) - owner.dragTarget
 	Dragging = function(point) owner:dragTo(toStage(point) - grab) end
 end
 
-local function onPress(p)
+function onPress(p)
 	if #Popups > 0 then
 		local level = 0
 		for i = #Popups, 1, -1 do
@@ -1037,7 +1817,7 @@ local function onPress(p)
 	end
 end
 
-local function onRelease(p)
+function onRelease(p)
 	Dragging = nil
 	local item = Held
 	Held = nil
@@ -1045,6 +1825,7 @@ local function onRelease(p)
 		if item.up then item.up(p) end
 		if item.click and inside(item.gui, p) then item.click(p) end
 	end
+end
 end
 
 local Connected = false
@@ -1088,6 +1869,8 @@ end
 -- of the em. They are rasterised with exact coverage to whatever size the widget asks for, then
 -- drawn as runs of 1px frames, which is what a baked font atlas amounts to.
 
+local glyphContours, Shapes, LazyRoots, ShapeMeta
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
 local GlyphData = {
 	CROSSHAIRS = {512,"500,224,509,227,512,236,512,276,509,285,500,288,470,288,449,353,408,408,353,449,288,470,288,500,285,509,276,512,236,512,227,509,224,500,224,470,159,449,104,408,63,353,42,288,12,288,3,285,0,276,0,236,3,227,12,224,42,224,63,159,104,104,159,63,224,42,224,12,227,3,236,0,276,0,285,3,288,12,288,42,353,63,408,104,449,159,470,224;288,405,329,390,364,364,390,329,405,288,364,288,355,285,352,276,352,236,355,227,364,224,405,224,390,183,364,148,329,122,288,107,288,148,285,157,276,160,236,160,227,157,224,148,224,107,183,122,148,148,122,183,107,224,148,224,157,227,160,236,160,276,157,285,148,288,107,288,122,329,148,364,183,390,224,405,224,364,227,355,236,352,276,352,285,355,288,364;278,234,288,256,278,278,256,288,234,278,224,256,234,234,256,224"},
 	MOUSE = {384,"0,352,0,224,384,224,384,352,379,394,363,432,337,465,304,491,266,507,224,512,160,512,118,507,80,491,47,465,21,432,5,394;176,0,176,192,0,192,0,160,5,118,21,80,47,47,80,21,118,5,160,0;224,0,266,5,304,21,337,47,363,80,379,118,384,160,384,192,208,192,208,0"},
@@ -1167,18 +1950,18 @@ local GlyphData = {
 
 local GlyphCache, RasterCache = {}, {}
 
-local function glyphContours(name)
+function glyphContours(name)
 	local cached = GlyphCache[name]
 	if cached then return cached end
 	local data = assert(GlyphData[name], name)
-	local contours, x0, y0, x1, y1 = {}, huge, huge, -huge, -huge
+	local contours, x0, y0, x1, y1 = {}, math.huge, math.huge, -math.huge, -math.huge
 	for part in string.gmatch(data[2], "[^;]+") do
 		local c, i = {}, 0
 		for number in string.gmatch(part, "-?%d+") do
 			i += 1
 			local value = tonumber(number)
 			c[i] = value
-			if i % 2 == 1 then x0, x1 = min(x0, value), max(x1, value) else y0, y1 = min(y0, value), max(y1, value) end
+			if i % 2 == 1 then x0, x1 = math.min(x0, value), math.max(x1, value) else y0, y1 = math.min(y0, value), math.max(y1, value) end
 		end
 		table.insert(contours, c)
 	end
@@ -1189,8 +1972,8 @@ end
 
 local function addSpan(cov, a, b, weight, width)
 	if b <= 0 or a >= width then return end
-	a, b = max(a, 0), min(b, width)
-	local i0, i1 = floor(a), floor(b)
+	a, b = math.max(a, 0), math.min(b, width)
+	local i0, i1 = math.floor(a), math.floor(b)
 	if i0 == i1 then
 		cov[i0] = (cov[i0] or 0) + (b - a) * weight
 		return
@@ -1205,14 +1988,14 @@ local byX = function(a, b) return a[1] < b[1] end
 -- contours: lists of x,y in design pixels. device: how many device pixels one design pixel is.
 local function rasterize(contours, unit, device)
 	local k = unit * device
-	local edges, minX, minY, maxX, maxY = {}, huge, huge, -huge, -huge
+	local edges, minX, minY, maxX, maxY = {}, math.huge, math.huge, -math.huge, -math.huge
 	for _, c in contours do
 		local n = #c // 2
 		for i = 1, n do
 			local x1, y1 = c[i * 2 - 1] * k, c[i * 2] * k
 			local j = i % n + 1
 			local x2, y2 = c[j * 2 - 1] * k, c[j * 2] * k
-			minX, maxX, minY, maxY = min(minX, x1), max(maxX, x1), min(minY, y1), max(maxY, y1)
+			minX, maxX, minY, maxY = math.min(minX, x1), math.max(maxX, x1), math.min(minY, y1), math.max(maxY, y1)
 			if y1 < y2 then
 				table.insert(edges, { y1, y2, x1, (x2 - x1) / (y2 - y1), 1 })
 			elseif y2 < y1 then
@@ -1220,8 +2003,8 @@ local function rasterize(contours, unit, device)
 			end
 		end
 	end
-	local x0, y0 = floor(minX), floor(minY)
-	local width, height = ceil(maxX) - x0, ceil(maxY) - y0
+	local x0, y0 = math.floor(minX), math.floor(minY)
+	local width, height = math.ceil(maxX) - x0, math.ceil(maxY) - y0
 	local rects, open = {}, {}
 	local SUB = 5
 	for row = 0, height - 1 do
@@ -1241,9 +2024,9 @@ local function rasterize(contours, unit, device)
 		end
 		local nextOpen, x = {}, 0
 		while x < width do
-			local level = floor(min(cov[x] or 0, 1) * 15 + 0.5)
+			local level = math.floor(math.min(cov[x] or 0, 1) * 15 + 0.5)
 			local start = x
-			repeat x += 1 until x >= width or floor(min(cov[x] or 0, 1) * 15 + 0.5) ~= level
+			repeat x += 1 until x >= width or math.floor(math.min(cov[x] or 0, 1) * 15 + 0.5) ~= level
 			if level > 0 then
 				local key = start * 4096 + (x - start) * 16 + level
 				local rect = open[key]
@@ -1261,10 +2044,10 @@ local function rasterize(contours, unit, device)
 	return { x0 = x0, y0 = y0, w = width, h = height, rects = rects }
 end
 
-local Shapes = setmetatable({}, { __mode = "k" })
-local LazyRoots = {}
+Shapes = setmetatable({}, { __mode = "k" })
+LazyRoots = {}
 
-local ShapeMeta = {}
+ShapeMeta = {}
 ShapeMeta.__index = ShapeMeta
 
 function ShapeMeta:rebuild()
@@ -1280,7 +2063,7 @@ function ShapeMeta:rebuild()
 	self.raster = raster
 	-- Offsets are whole numbers, so the holder rounds up and each run is placed by its share of
 	-- the holder's real device size. Every run then lands on an exact device pixel at any scale.
-	local holderW, holderH = ceil(raster.w / Scale), ceil(raster.h / Scale)
+	local holderW, holderH = math.ceil(raster.w / Scale), math.ceil(raster.h / Scale)
 	local deviceW, deviceH = holderW * Scale, holderH * Scale
 	for _, r in raster.rects do
 		table.insert(self.frames, New("Frame", {
@@ -1320,6 +2103,7 @@ function ShapeMeta:center(cx, cy)
 end
 
 function ShapeMeta:setVisible(state) self.holder.Visible = state end
+end
 
 local function Shape(parent, contours, unit, key)
 	local shape = setmetatable({
@@ -1403,7 +2187,7 @@ end
 
 local function Label(parent, text, x, y, size, font, color)
 	return New("TextLabel", {
-		Text = text, Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(max(measure(text, size, font) + 4, 4), ceil(size * 1.3)),
+		Text = text, Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(math.max(measure(text, size, font) + 4, 4), math.ceil(size * 1.3)),
 		BackgroundTransparency = 1, BorderSizePixel = 0, FontFace = font or FontMedium, TextSize = size,
 		TextColor3 = color or White, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
 	}, parent)
@@ -1412,7 +2196,7 @@ end
 local function setText(label, text, size, font)
 	if label.Text ~= text then
 		label.Text = text
-		label.Size = UDim2.fromOffset(max(measure(text, size, font) + 4, 4), label.Size.Y.Offset)
+		label.Size = UDim2.fromOffset(math.max(measure(text, size, font) + 4, 4), label.Size.Y.Offset)
 	end
 end
 
@@ -1432,7 +2216,7 @@ local function ScrollText(parent, x, y, w, h, size, font)
 		end
 		local width = object.textW
 		local rectW = clip.Size.X.Offset
-		local band = min(18, rectW * 0.4)
+		local band = math.min(18, rectW * 0.4)
 		local left, right = sat(object.scroll / band), sat((object.over - object.scroll) / band)
 		local a0 = object.scroll / width
 		local a1 = (object.scroll + band) / width
@@ -1459,10 +2243,10 @@ local function ScrollText(parent, x, y, w, h, size, font)
 		Run(function(dt)
 			if object.over > 0 and object.hovered then
 				object.wait += dt
-				if object.wait >= 0.25 then object.scroll = min(object.over, object.scroll + 40 * dt) end
+				if object.wait >= 0.25 then object.scroll = math.min(object.over, object.scroll + 40 * dt) end
 			else
 				object.wait = 0
-				object.scroll += (0 - object.scroll) * (1 - exp(-14 * dt))
+				object.scroll += (0 - object.scroll) * (1 - math.exp(-14 * dt))
 				if object.scroll < 0.01 then object.scroll = 0 end
 			end
 			refreshFade()
@@ -1478,8 +2262,8 @@ local function ScrollText(parent, x, y, w, h, size, font)
 		if self.text == text then return end
 		self.text = text
 		setText(label, text, size, font)
-		self.textW = max(measure(text, size, font), 1)
-		self.over = max(0, self.textW - clip.Size.X.Offset)
+		self.textW = math.max(measure(text, size, font), 1)
+		self.over = math.max(0, self.textW - clip.Size.X.Offset)
 		self.scroll = 0
 		refreshFade()
 	end
@@ -1494,7 +2278,7 @@ local function ScrollText(parent, x, y, w, h, size, font)
 	function object:width(w2)
 		setWH(clip, w2, h)
 		if self.textW then
-			self.over = max(0, self.textW - w2)
+			self.over = math.max(0, self.textW - w2)
 			refreshFade()
 		end
 	end
@@ -1515,7 +2299,7 @@ local function buildSurface(frame, width, height, rounding, border)
 	local shadow = Shadow(surface, 26, 0.5, 6)
 	local ring
 	if border then
-		ring = Stroke(Box(frame, 1, 1, width - 2, height - 2, nil, max(rounding - 1, 0)), T.PopupBorder)
+		ring = Stroke(Box(frame, 1, 1, width - 2, height - 2, nil, math.max(rounding - 1, 0)), T.PopupBorder)
 	end
 	return surface, shadow, ring
 end
@@ -1571,7 +2355,7 @@ function Card:dragTo(target)
 	if self.dragging then return end
 	self.dragging = true
 	Run(function(dt)
-		self.drag = self.drag:Lerp(self.dragTarget, 1 - exp(-20 * dt))
+		self.drag = self.drag:Lerp(self.dragTarget, 1 - math.exp(-20 * dt))
 		if (self.dragTarget - self.drag).Magnitude < 0.5 then self.drag = self.dragTarget end
 		self:apply()
 		if self.drag == self.dragTarget then
@@ -1588,10 +2372,10 @@ function Card:startFade()
 	Run(function(dt)
 		local value = self.state
 		if self.isOpen then
-			value += (1 - value) * (1 - exp(-15 * dt))
+			value += (1 - value) * (1 - math.exp(-15 * dt))
 			if value > 0.998 then value = 1 end
 		else
-			value = max(0, value - dt / 0.16)
+			value = math.max(0, value - dt / 0.16)
 			if value < 0.01 then value = 0 end
 		end
 		self.state = value
@@ -1647,7 +2431,7 @@ end
 local function keepOnScreen(card, x, y, margin)
 	margin = margin or 10
 	local view = viewport()
-	return Vector2.new(clamp(x, margin, max(margin, view.X - card.width - margin)), clamp(y, margin, max(margin, view.Y - card.height - margin)))
+	return Vector2.new(clamp(x, margin, math.max(margin, view.X - card.width - margin)), clamp(y, margin, math.max(margin, view.Y - card.height - margin)))
 end
 
 -- Beside the click, centred on its row, outside the menu when there is room.
@@ -1656,13 +2440,14 @@ local function placeBeside(card, click)
 	if CurrentWindow then
 		local a = CurrentWindow:pos()
 		local top, bottom = a.Y, a.Y + 600
-		y = clamp(y, top + 16 + card.height * 0.5, max(top + 16 + card.height * 0.5, bottom - 16 - card.height * 0.5))
+		y = clamp(y, top + 16 + card.height * 0.5, math.max(top + 16 + card.height * 0.5, bottom - 16 - card.height * 0.5))
 	end
 	return keepOnScreen(card, x, y - card.height * 0.5)
 end
 
 --[[ ---------------------------------------- Tooltip --------------------------------------- ]]
 
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
 local TipFrame, TipTitle, TipBody, TipOwner, TipCard
 local TipAlpha = 0
 
@@ -1682,7 +2467,7 @@ end
 local function runTip()
 	Run(function(dt)
 		local showing = TipOwner ~= nil
-		TipAlpha = showing and min(1, TipAlpha + dt / 0.12) or max(0, TipAlpha - dt / 0.14)
+		TipAlpha = showing and math.min(1, TipAlpha + dt / 0.12) or math.max(0, TipAlpha - dt / 0.14)
 		TipCard.scope:setAlpha(TipAlpha)
 		if TipAlpha == 0 then
 			TipFrame.Visible = false
@@ -1700,11 +2485,11 @@ ShowTip = function(item)
 	local title, body = tr(item.tip[1]), tr(item.tip[2])
 	TipTitle.Text, TipBody.Text = title, body
 	local titleW, bodyW = measure(title, 14, FontSemi), measure(body, 12)
-	local lines = bodyW > 320 and ceil(bodyW / 320) or 1
-	local width = ceil(max(titleW, min(bodyW, 320))) + 28
+	local lines = bodyW > 320 and math.ceil(bodyW / 320) or 1
+	local width = math.ceil(math.max(titleW, math.min(bodyW, 320))) + 28
 	TipBody.TextWrapped = lines > 1
 	setWH(TipTitle, titleW + 4, 18)
-	setWH(TipBody, min(bodyW, 320) + 2, lines * 15 + 2)
+	setWH(TipBody, math.min(bodyW, 320) + 2, lines * 15 + 2)
 	TipCard.width = width
 	TipCard.height = 12 + 17 + 8 + lines * 15 + 12
 	resizeSurface(TipCard, width, TipCard.height)
@@ -1724,6 +2509,7 @@ end
 
 HideTip = function()
 	TipOwner = nil
+end
 end
 
 --[[ ---------------------------------------- Small parts ----------------------------------- ]]
@@ -1761,33 +2547,35 @@ local function SoftBar(parent, x, y, w, color, corners)
 	return bar, g
 end
 
-local function circle(frame)
+local circle, newColor, Preview, encodeColor, decodeColor, buildPicker
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
+function circle(frame)
 	frame:FindFirstChildOfClass("UICorner").CornerRadius = UDim.new(1, 0)
 	return frame
 end
 
 --[[ ---------------------------------------- Colours --------------------------------------- ]]
 
-local function newColor(c, alpha, c2, alpha2, gradient)
+function newColor(c, alpha, c2, alpha2, gradient)
 	return { a = c, aa = alpha or 1, b = c2 or c, ba = alpha2 or alpha or 1, gradient = gradient or false }
 end
 Library.Color = newColor
 
-local function Preview(parent, x, y, size, radius, scope)
+function Preview(parent, x, y, size, radius, scope)
 	local base = Box(parent, x, y, size, size, Color3.fromRGB(204, 204, 204), radius)
-	local cell = max(2, size / 3)
+	local cell = math.max(2, size / 3)
 	local checks = {}
 	for row = 0, 2 do
 		for col = 0, 2 do
 			if (row + col) % 2 == 1 then
-				local px, py = floor(col * cell), floor(row * cell)
-				table.insert(checks, Box(base, px, py, ceil(cell), ceil(cell), Color3.fromRGB(128, 128, 128)))
+				local px, py = math.floor(col * cell), math.floor(row * cell)
+				table.insert(checks, Box(base, px, py, math.ceil(cell), math.ceil(cell), Color3.fromRGB(128, 128, 128)))
 			end
 		end
 	end
 	local fill = Box(base, 0, 0, size, size, White, radius)
 	local grad = New("UIGradient", {}, fill)
-	local lineFrame = Box(base, 1, 1, size - 2, size - 2, nil, max(radius - 1, 1))
+	local lineFrame = Box(base, 1, 1, size - 2, size - 2, nil, math.max(radius - 1, 1))
 	local line = Stroke(lineFrame)
 	return base, function(value, alpha)
 		alpha = alpha or scope.alpha
@@ -1802,11 +2590,11 @@ local function Preview(parent, x, y, size, radius, scope)
 	end
 end
 
-local function encodeColor(col)
+function encodeColor(col)
 	return { c = toHex(col.a), a = col.aa, c2 = toHex(col.b), a2 = col.ba, g = col.gradient }
 end
 
-local function decodeColor(col, data)
+function decodeColor(col, data)
 	if type(data) ~= "table" then return end
 	col.a = fromHex(data.c) or col.a
 	col.b = fromHex(data.c2) or col.b
@@ -1824,7 +2612,7 @@ local function hexOf(c, a)
 end
 
 -- Builds the picker's controls into a card. Returns the y the extras start at.
-local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
+function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 	local card, parent, scope = flow.card, flow.parent, flow.scope
 	local p0, y0, w = flow.x, flow.y, flow.w
 	local slot = 1
@@ -1929,7 +2717,7 @@ local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 	local alphaY = hueY + 8 + 12
 	local alphaBase = Box(parent, p0, alphaY, w, 8, Color3.fromRGB(204, 204, 204), 4)
 	local alphaChecks = {}
-	for col = 1, floor(w / 4) - 2 do
+	for col = 1, math.floor(w / 4) - 2 do
 		for row = 0, 1 do
 			if (col + row) % 2 == 1 then
 				table.insert(alphaChecks, Box(alphaBase, col * 4, row * 4, 4, 4, Color3.fromRGB(128, 128, 128)))
@@ -1953,7 +2741,7 @@ local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 	local pctW = 44
 	local pctX = btnX - (allowGradient and 6 or 0) - pctW
 	local valX = p0 + fmtWidth + 12
-	local valW = max(40, pctX - 6 - valX)
+	local valW = math.max(40, pctX - 6 - valX)
 	fmtChevron:center(p0 + fmtChevron.boxW * 0.5, ry + 13)
 	local valBox = Box(parent, valX, ry, valW, rowH, White, 6)
 	local _, previewPaint = Preview(parent, valX + 8, ry + 7, 12, 3, scope)
@@ -2101,18 +2889,18 @@ local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 		if viewTicking then return end
 		viewTicking = true
 		Run(function(dt)
-			local ease = 1 - exp(-18 * dt)
+			local ease = 1 - math.exp(-18 * dt)
 			local st2, col2 = state(slot), current()
 			local d2 = st2.stop
 			local _, ca2 = stops(col2, d2)
 			local dh = st2.h[d2] - view.h
 			if dh > 0.5 then dh -= 1 elseif dh < -0.5 then dh += 1 end
 			view.h = (view.h + dh * ease) % 1
-			if abs(dh) < 0.0005 then view.h = st2.h[d2] end
-			local settled = abs(dh) < 0.0005
+			if math.abs(dh) < 0.0005 then view.h = st2.h[d2] end
+			local settled = math.abs(dh) < 0.0005
 			local function approach(value, target)
 				local nextValue = value + (target - value) * ease
-				if abs(target - nextValue) < 0.0005 then return target end
+				if math.abs(target - nextValue) < 0.0005 then return target end
 				settled = false
 				return nextValue
 			end
@@ -2241,7 +3029,7 @@ local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 			end
 		else
 			local numbers = {}
-			for n in string.gmatch(input.Text, "%d+") do table.insert(numbers, min(tonumber(n), 255)) end
+			for n in string.gmatch(input.Text, "%d+") do table.insert(numbers, math.min(tonumber(n), 255)) end
 			if #numbers == 3 then
 				setStop(col, st.stop, Color3.fromRGB(numbers[1], numbers[2], numbers[3]), a)
 				if onChange then onChange(col) end
@@ -2252,7 +3040,7 @@ local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 	input.FocusLost:Connect(function() redraw() end)
 	pctInput.FocusLost:Connect(function()
 		local n = tonumber(string.match(pctInput.Text, "%d+"))
-		if n then setAlpha(min(n, 100) / 100) else redraw() end
+		if n then setAlpha(math.min(n, 100) / 100) else redraw() end
 	end)
 	Wheel(scope, pctBox, function(z)
 		local st, col = state(slot), current()
@@ -2287,6 +3075,7 @@ local function buildPicker(flow, slots, allowGradient, onChange, onSlot)
 	end
 	return ry + rowH, ry + rowH + 12
 end
+end
 
 --[[ ---------------------------------------- Rows ------------------------------------------ ]]
 
@@ -2320,9 +3109,11 @@ end
 -- Where the content really ends, without the gap left after the last section.
 function Flow:bottom() return self.y - self.trail end
 
-function Flow:note(label)
+-- 1.5.0: la entrada lleva la descripción (tip) y la clave estable del control (la misma base que su id en perfiles)
+function Flow:note(label, tip)
 	if not self.search then return nil end
-	local entry = { label = label, box = self.search.box, tabName = self.search.tabName, tab = self.search.tab, flash = 0, paint = nil }
+	local entry = { label = label, box = self.search.box, tabName = self.search.tabName, tab = self.search.tab, flash = 0, paint = nil,
+		tip = type(tip) == "string" and tip or nil, key = (self.path or "?") .. "/" .. tostring(label), group = "controls" }
 	table.insert(self.search.win.searchIndex, entry)
 	return entry
 end
@@ -2350,7 +3141,7 @@ function Flow:changed()
 end
 
 local function flashColor(color, entry)
-	if entry and entry.flash > 0 then return color:Lerp(Accent, min(1, entry.flash / 0.7)) end
+	if entry and entry.flash > 0 then return color:Lerp(Accent, math.min(1, entry.flash / 0.7)) end
 	return color
 end
 
@@ -2449,7 +3240,7 @@ function Flow:dotsButton(row, x, y, o)
 		local a = scope.alpha
 		rect.BackgroundColor3 = T.FrameInactive
 		rect.BackgroundTransparency = 1 - 0.85 * t.v * a
-		local col = T.Disabled:Lerp(T.Text, max(t.v, isUp and 1 or 0))
+		local col = T.Disabled:Lerp(T.Text, math.max(t.v, isUp and 1 or 0))
 		for _, d in dots do d.BackgroundColor3, d.BackgroundTransparency = col, 1 - a end
 	end
 	t.cb = paint
@@ -2467,7 +3258,7 @@ function Flow:dotsButton(row, x, y, o)
 				card = newCard({
 					width = width, name = "Options",
 					build = function(c)
-						local flow = newFlow({ parent = c.content, scope = c.scope, x = 10, y = 10, w = width - 20, rw = min(240, width - 20), card = c, level = c.level, win = win, path = path .. "/" .. (o.name or "Options") .. " options", store = store })
+						local flow = newFlow({ parent = c.content, scope = c.scope, x = 10, y = 10, w = width - 20, rw = math.min(240, width - 20), card = c, level = c.level, win = win, path = path .. "/" .. (o.name or "Options") .. " options", store = store })
 						o.build(flow)
 						c:setHeight(flow:bottom() + 10)
 					end,
@@ -2493,8 +3284,8 @@ function Flow:Toggle(o)
 	local icon, text = splitIcon(o.Name)
 	local value = o.Default == true
 	local row = Box(self.parent, self.x, top, W, 25)
-	local entry = self:note(text)
-	local labelRight = W - 30 - 8
+	local entry = self:note(text, o.Tip)
+	local labelRight = W - 30 - 8 - 10 -- 10 px para el punto de estado
 	if o.Color then
 		local sx, sy = self:swatchRect()
 		self:makeSwatch(row, sx, sy, o.Color, { name = text, extras = o.ColorExtras, onChange = o.ColorChanged, Flag = o.Flag and (o.Flag .. ".Color") or nil })
@@ -2514,9 +3305,17 @@ function Flow:Toggle(o)
 		textX = 18
 	end
 	local label = ScrollText(row, textX, 0, labelRight - textX, 25, 12)
+	-- Punto de estado (1.5.0): el interruptor es la INTENCIÓN; el punto, el estado REAL que informa el hub
+	-- (Components): verde en marcha, ámbar esperando, rojo error, gris no disponible. Sin estado, no se ve.
+	local dot = Box(row, W - 30 - 11, 10, 6, 6, T.Muted, 3)
+	local status = nil
 	local function paint()
-		local t = max(on.v, hover.v)
+		local t = math.max(on.v, hover.v)
 		local color = flashColor(T.LabelOff:Lerp(T.LabelOn, t), entry)
+		if status == "Unavailable" then color = T.Disabled end
+		local token = status and Library.Tokens.status[status]
+		dot.Visible = token ~= nil and not (status == "Disabled" and not value)
+		if token then dot.BackgroundColor3, dot.BackgroundTransparency = T[token] or T.Muted, 1 - scope.alpha end
 		label:set(tr(text))
 		label:paint(color, scope.alpha)
 		if iconShape then iconShape:paint(color, scope.alpha) end
@@ -2534,6 +3333,12 @@ function Flow:Toggle(o)
 		flow:changed()
 	end
 	function object:Get() return value end
+	-- Estado real (Components): "Running", "Waiting", "Error", "Unavailable"… o nil para ocultar el punto
+	function object:SetStatus(state)
+		if status == state then return end
+		status = state
+		paint()
+	end
 	Hit(scope, row, {
 		hover = function(b) hover:to(b and 1 or 0); label:hover(b) end,
 		click = function() object:Set(not value) end,
@@ -2554,11 +3359,11 @@ function Flow:Slider(o)
 	local format = o.Format or (decimals > 0 and ("%." .. decimals .. "f") or "%d")
 	local value = clamp(o.Default or lo, lo, hi)
 	local row = Box(self.parent, self.x, top, W, 25)
-	local entry = self:note(o.Name)
+	local entry = self:note(o.Name, o.Tip)
 	local numberW = 38
 	local right = W - numberW - 12
-	local left = floor(max(min(82, W * 0.45), right - 74))
-	if right < left + 36 then left = floor(max(0, right - 36)) end
+	local left = math.floor(math.max(math.min(82, W * 0.45), right - 74))
+	if right < left + 36 then left = math.floor(math.max(0, right - 36)) end
 	local trackW = right - left
 	local track = SoftBar(row, left, 10, trackW, T.FieldBg)
 	local fill = SoftBar(row, left, 10, 0, Accent)
@@ -2577,7 +3382,7 @@ function Flow:Slider(o)
 	local function paint()
 		local a = scope.alpha
 		local x = fillA.v
-		local color = flashColor(T.Disabled:Lerp(T.Text, max(x > 0.1 and 1 or 0, hoverA.v)), entry)
+		local color = flashColor(T.Disabled:Lerp(T.Text, math.max(x > 0.1 and 1 or 0, hoverA.v)), entry)
 		label:set(tr(o.Name))
 		label:paint(color, a)
 		track.BackgroundColor3, track.BackgroundTransparency = T.FieldBg, 1 - A.FieldBg * a
@@ -2589,7 +3394,7 @@ function Flow:Slider(o)
 		box.BackgroundColor3, box.BackgroundTransparency = T.FieldBg, 1 - A.FieldBg * a
 		stroke.Color, stroke.Transparency = T.Border:Lerp(Accent, focusA.v), 1 - a
 		local text = editing and input.Text or shown()
-		local boxW = max(numberW, ceil(measure(text ~= "" and text or "0", 12)) + 14)
+		local boxW = math.max(numberW, math.ceil(measure(text ~= "" and text or "0", 12)) + 14)
 		if box.Size.X.Offset ~= boxW then
 			setWH(box, boxW, 21)
 			setXY(box, W - boxW, 2)
@@ -2612,13 +3417,13 @@ function Flow:Slider(o)
 			return
 		end
 		value = new
-		fillA:to((value - lo) / max(hi - lo, 1e-6) * trackW)
+		fillA:to((value - lo) / math.max(hi - lo, 1e-6) * trackW)
 		if o.Callback and not silent then o.Callback(value) end
 		flow:changed()
 		paint()
 	end
 	function object:Get() return value end
-	fillA:set((value - lo) / max(hi - lo, 1e-6) * trackW)
+	fillA:set((value - lo) / math.max(hi - lo, 1e-6) * trackW)
 	scope:paint(paint)
 
 	input.Focused:Connect(function()
@@ -2656,8 +3461,8 @@ function Flow:Slider(o)
 	})
 	Wheel(scope, row, function(z)
 		if editing then return end
-		local notches = z > 0 and ceil(z) or floor(z)
-		object:Set(value + notches * max(step, floor((hi - lo) * 0.01 + 0.5)))
+		local notches = z > 0 and math.ceil(z) or math.floor(z)
+		object:Set(value + notches * math.max(step, math.floor((hi - lo) * 0.01 + 0.5)))
 	end)
 	self:flag(o, o.Name, function() return value end, function(v)
 		if type(v) == "number" then object:Set(v) end
@@ -2666,6 +3471,7 @@ function Flow:Slider(o)
 	return object
 end
 
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
 local function chevronShape(parent, up)
 	local d = up and -1 or 1
 	return Shape(parent, strokeContours({ -3, -1.5 * d, 0, 1.5 * d, 3, -1.5 * d }, 1.15), 1, up and "CHEV_U" or "CHEV_D")
@@ -2684,7 +3490,7 @@ local function selectableRows(card, listW, options, isSelected, onPick, indent)
 			plate.BackgroundColor3, plate.BackgroundTransparency = T.FrameInactive, 1 - hover.v * 0.6 * a
 			check:paint(Accent, t.v * a)
 			check:center(15 + (1 - t.v) * -4, 12.5)
-			label.TextColor3 = T.Disabled:Lerp(T.Text, max(t.v, hover.v))
+			label.TextColor3 = T.Disabled:Lerp(T.Text, math.max(t.v, hover.v))
 			label.TextTransparency = 1 - a
 			setText(label, tr(option), 12)
 			if indent then setXY(label, round(10 + 18 * indent.v), capY(12.5, 12)) end
@@ -2705,8 +3511,8 @@ local function dropdown(self, o, multi)
 	local W, scope, level = self.rw, self.scope, self.level
 	local options = o.Options
 	local row = Box(self.parent, self.x, self.y, W, 25)
-	local entry = self:note(o.Name)
-	local comboW = min(130, max(70, W - 72))
+	local entry = self:note(o.Name, o.Tip)
+	local comboW = math.min(130, math.max(70, W - 72))
 	if o.Color then self:makeSwatch(row, W - comboW - 8 - 15, 5, o.Color, { name = o.Name }) end
 	local bb = Box(row, W - comboW, 2, comboW, 21, T.FieldBg, 8)
 	local line = Stroke(Box(bb, 1, 1, comboW - 2, 19, nil, 7), T.Border)
@@ -2739,7 +3545,7 @@ local function dropdown(self, o, multi)
 	end
 	local function paint()
 		local a = scope.alpha
-		local color = T.Disabled:Lerp(T.Text, max(openA.v, hover.v))
+		local color = T.Disabled:Lerp(T.Text, math.max(openA.v, hover.v))
 		bb.BackgroundColor3, bb.BackgroundTransparency = T.FieldBg, 1 - A.FieldBg * a
 		line.Color, line.Transparency = T.Border, 1 - a
 		arrowDown:paint(T.Text, a * (1 - openA.v))
@@ -2787,7 +3593,7 @@ local function dropdown(self, o, multi)
 	local function ensure()
 		if card then return card end
 		local listW = comboW
-		for _, option in options do listW = max(listW, ceil(measure(tr(option), 12)) + 46) end
+		for _, option in options do listW = math.max(listW, math.ceil(measure(tr(option), 12)) + 46) end
 		local height = 12 + #options * 25 + (#options - 1) * 4
 		card = newCard({
 			width = listW, rounding = 10, padding = 6, name = multi and "MultiList" or "ComboList",
@@ -2812,7 +3618,7 @@ local function dropdown(self, o, multi)
 			place = function(c)
 				local at, size = toStage(bb.AbsolutePosition), bb.AbsoluteSize / Scale
 				local hostEdge = flow.hostRight and flow.hostRight() or at.X + size.X
-				local x = max(at.X + size.X, hostEdge) + 8
+				local x = math.max(at.X + size.X, hostEdge) + 8
 				local middle = at.Y + size.Y * 0.5
 				if multi then return keepOnScreen(c, x, middle - height * 0.5, 3) end
 				c.middle = middle
@@ -2863,7 +3669,7 @@ function Flow:SubMenu(o)
 	self:rowBegin()
 	local W, scope, level, top = self.rw, self.scope, self.level, self.y
 	local row = Box(self.parent, self.x, top, W, 25)
-	local entry = self:note(o.Name)
+	local entry = self:note(o.Name, o.Tip)
 	local t = Anim(0, 15)
 	local chevron = Glyph(row, "CHEVRON_RIGHT", 14)
 	chevron:center(W - 4 - chevron.boxW * 0.5, 12.5)
@@ -2892,7 +3698,7 @@ function Flow:SubMenu(o)
 					setText(title, tr(o.Name), 14, FontSemi)
 					title.TextColor3, title.TextTransparency = T.Text, 1 - c.scope.alpha
 				end)
-				local inner = newFlow({ parent = c.content, scope = c.scope, x = 10, y = 36, w = width - 20, rw = min(240, width - 20), card = c, level = c.level, win = flow.win, path = flow.path .. "/" .. o.Name, store = flow.store })
+				local inner = newFlow({ parent = c.content, scope = c.scope, x = 10, y = 36, w = width - 20, rw = math.min(240, width - 20), card = c, level = c.level, win = flow.win, path = flow.path .. "/" .. o.Name, store = flow.store })
 				o.Build(inner)
 				c:setHeight(inner:bottom() + 10)
 			end,
@@ -2925,7 +3731,7 @@ function Flow:Color(o)
 	self:rowBegin()
 	local W, scope, top = self.rw, self.scope, self.y
 	local row = Box(self.parent, self.x, top, W, 25)
-	local entry = self:note(o.Name)
+	local entry = self:note(o.Name, o.Tip)
 	local t = Anim(0, 15)
 	self:makeSwatch(row, W - 15, 5, o.Color or (o.Slots and o.Slots[1].value), { name = o.Name, slots = o.Slots, extras = o.Extras, onChange = o.Callback })
 	local label = ScrollText(row, 0, 0, W - 15 - 8, 25, 12)
@@ -3041,7 +3847,7 @@ function Flow:Button(o)
 	self:rowBegin()
 	local W, scope, top = self.rw, self.scope, self.y
 	local row = Box(self.parent, self.x, top, W, 25)
-	local entry = self:note(o.Name)
+	local entry = self:note(o.Name, o.Tip)
 	local plate = Box(row, 0, 1, W, 23, T.FrameInactive, 6)
 	local icon, text = splitIcon(o.Name)
 	icon = icon or o.Icon
@@ -3158,16 +3964,19 @@ function Flow:PopupToggle(icon, label, default, callback)
 	self:flag({}, label, function() return value end, function(v) object:Set(v == true) end)
 	return object
 end
+end
 
-local function choiceWidth(options)
+local choiceWidth, choiceRows, optionCard
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
+function choiceWidth(options)
 	local widest = 0
-	for _, option in options do widest = max(widest, measure(tr(option), 12)) end
-	return ceil(max(170, widest + 64))
+	for _, option in options do widest = math.max(widest, measure(tr(option), 12)) end
+	return math.ceil(math.max(170, widest + 64))
 end
 
 local function checkContours()
 	local sz = 9
-	local thickness = max(sz / 5, 1)
+	local thickness = math.max(sz / 5, 1)
 	sz -= thickness * 0.5
 	local p = thickness * 0.25
 	local third = sz / 3
@@ -3176,7 +3985,7 @@ local function checkContours()
 end
 
 -- Rows of a little option card: a sliding check, the label pushed along behind it.
-local function choiceRows(c, flowW, options, isSelected, onPick, startY)
+function choiceRows(c, flowW, options, isSelected, onPick, startY)
 	local rows = {}
 	for i, option in options do
 		local row = Box(c.content, 10, startY + (i - 1) * 33, flowW, 33)
@@ -3191,7 +4000,7 @@ local function choiceRows(c, flowW, options, isSelected, onPick, startY)
 			check:paint(T.Text, t.v * a)
 			setXY(label, round(10 + 22 * t.v), capY(16.5, 12))
 			setText(label, tr(option), 12)
-			label.TextColor3, label.TextTransparency = T.Disabled:Lerp(T.Text, max(t.v, hover.v)), 1 - a
+			label.TextColor3, label.TextTransparency = T.Disabled:Lerp(T.Text, math.max(t.v, hover.v)), 1 - a
 		end
 		t.cb, hover.cb = paint, paint
 		c.scope:paint(paint)
@@ -3204,7 +4013,7 @@ local function choiceRows(c, flowW, options, isSelected, onPick, startY)
 	return rows
 end
 
-local function optionCard(flow, options, getIndex, setIndex, rowTop, onState)
+function optionCard(flow, options, getIndex, setIndex, rowTop, onState)
 	local card, rows
 	local width = choiceWidth(options)
 	card = newCard({
@@ -3241,7 +4050,7 @@ function Flow:Option(icon, label, options, default, callback)
 		chevron:paint(color, scope.alpha)
 		-- a long value stops short of the row's own label
 		local right = round(chevX - 6)
-		local room = max(20, right - ceil(r.labelEnd()) - 12)
+		local room = math.max(20, right - math.ceil(r.labelEnd()) - 12)
 		setWH(value, room, 16)
 		setXY(value, right - room, capY(16.5, 12))
 		value.Text = tr(options[index])
@@ -3270,6 +4079,7 @@ function Flow:Option(icon, label, options, default, callback)
 		if i then object:Set(i) end
 	end)
 	return object
+end
 end
 
 --[[ ---------------------------------------- Shared bits ----------------------------------- ]]
@@ -3311,6 +4121,8 @@ local function MenuRow(c, y, width, icon, label, colors, onClick)
 	Hit(c.scope, row, { hover = function(b) t:to(b and 1 or 0) end, click = onClick })
 end
 
+local Logo, PlayerAvatar, pushNotification
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
 local Avatar = {}
 do
 	local head, body = {}, {}
@@ -3343,7 +4155,7 @@ do
 end
 
 -- Logo de El Hoyo Hub: cuadrado oscuro con anillos que se hunden hacia un centro negro; el segundo, rojo.
-local function Logo(parent, x, y, size, scope)
+function Logo(parent, x, y, size, scope)
 	local holder = Box(parent, x, y, size, size, Color3.fromRGB(18, 17, 24), round(size * 0.24))
 	local rings = {}
 	local shades = { 0.30, 0.0, 0.42, 0.56, 0.7 } -- el segundo anillo es el rojo
@@ -3368,7 +4180,7 @@ local function Logo(parent, x, y, size, scope)
 end
 
 -- Foto del jugador (o la silueta de siempre si Roblox no la da)
-local function PlayerAvatar(parent, x, y, size, scope)
+function PlayerAvatar(parent, x, y, size, scope)
 	local ok, image = pcall(function()
 		return Players:GetUserThumbnailAsync(Players.LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
 	end)
@@ -3385,26 +4197,48 @@ end
 
 --[[ ---------------------------------------- Notifications --------------------------------- ]]
 
-local Notes, NoteLayer = {}, nil
+local Notes, NoteLayer, NotesLog = {}, nil, nil
 
-local function pushNotification(title, message)
+-- 1.5.0: nivel (info | success | warning | error, también ok/warn) con su color de Tokens; una notificación igual
+-- en menos de 4 s no se apila: la que se ve suma "×N". Historial en Library.NotificationLog (módulo Notifications).
+function pushNotification(title, message, level)
+	NotesLog = NotesLog or import("Notifications").new()
+	Library.NotificationLog = NotesLog
+	local entry, show = NotesLog:push(level, title, message)
+	if not show then
+		for _, n in Notes do
+			if n.entry == entry then
+				n.age = math.min(n.age, 0.4)
+				n.setCount(entry.count)
+			end
+		end
+		return
+	end
 	if not NoteLayer then
 		NoteLayer = Box(Stage, 0, 0, 0, 0)
 		NoteLayer.Size = UDim2.fromScale(1, 1)
 		NoteLayer.ZIndex = 200000
 	end
-	local frame = Box(NoteLayer, 0, 0, 280, 72)
-	local bg = Box(frame, 0, 0, 280, 72, Color3.fromRGB(8, 9, 16), 10)
+	local W, H = 300, 64
+	local levelToken = Library.Tokens.notify[entry.level] or "Info"
+	local frame = Box(NoteLayer, 0, 0, W, H)
+	local bg = Box(frame, 0, 0, W, H, T.Popup, 8)
 	local shadow = Shadow(bg, 16, 0.55, 3)
-	local line = Stroke(Box(bg, 1, 1, 278, 70, nil, 9), White)
+	local line = Stroke(Box(bg, 1, 1, W - 2, H - 2, nil, 7), T.PopupBorder)
+	local stripe = Box(frame, 0, 10, 3, H - 20, T[levelToken] or Accent, 2)
 	local noteScope = newScope(nil)
-	local logo = Logo(frame, 12, 14, 44, noteScope)
-	local head = Label(frame, title, 68, capY(26, 12), 12)
-	local body = Label(frame, message, 68, capY(46, 12), 12)
-	local barBack = Box(frame, 4, 67, 272, 3, Color3.fromRGB(30, 35, 50), 1)
-	local bar = Box(frame, 4, 67, 272, 3, Accent, 1)
-	local note = { frame = frame, age = 0, offset = 1 }
+	local logo = Logo(frame, 14, 14, 36, noteScope)
+	local head = Label(frame, title, 62, capY(22, 12), 12, FontSemi)
+	local body = Label(frame, message, 62, capY(42, 12), 12)
+	local count = Label(frame, "", W - 40, capY(22, 11), 11, FontSemi)
+	local barBack = Box(frame, 10, H - 4, W - 20, 2, T.FrameInactive, 1)
+	local bar = Box(frame, 10, H - 4, W - 20, 2, T[levelToken] or Accent, 1)
+	body.TextTruncate = Enum.TextTruncate.AtEnd
+	body.Size = UDim2.fromOffset(W - 74, 16)
+	local note = { frame = frame, age = 0, offset = 1, entry = entry }
+	function note.setCount(n) count.Text = n > 1 and ("×" .. n) or "" end
 	table.insert(Notes, note)
+	local _ = logo
 	Run(function(dt)
 		note.age += dt
 		local age = note.age
@@ -3415,16 +4249,19 @@ local function pushNotification(title, message)
 		alpha = sat(alpha)
 		local index = table.find(Notes, note)
 		local view = viewport()
-		setXY(frame, round(view.X - 280 - 12 + note.offset * 300), 12 + 80 * (index - 1))
+		setXY(frame, round(view.X - W - 12 + note.offset * 320), 12 + (H + 8) * (index - 1))
+		local accent = T[levelToken] or Accent
 		if shadow then shadow.Transparency = 1 - 0.45 * alpha end
-		bg.BackgroundTransparency = 1 - alpha
-		line.Transparency = 1 - (8 / 255) * alpha
+		bg.BackgroundColor3, bg.BackgroundTransparency = T.Popup, 1 - alpha
+		line.Color, line.Transparency = T.PopupBorder, 1 - alpha
+		stripe.BackgroundColor3, stripe.BackgroundTransparency = accent, 1 - alpha
 		noteScope:setAlpha(alpha)
-		head.TextColor3, head.TextTransparency = White, 1 - alpha
-		body.TextColor3, body.TextTransparency = Color3.fromRGB(130, 132, 143), 1 - alpha
-		barBack.BackgroundTransparency = 1 - (120 / 255) * alpha
-		bar.BackgroundColor3, bar.BackgroundTransparency = Accent, 1 - alpha
-		setWH(bar, round(272 * sat(1 - age / 3)), 3)
+		head.TextColor3, head.TextTransparency = T.Text, 1 - alpha
+		body.TextColor3, body.TextTransparency = T.Disabled, 1 - alpha
+		count.TextColor3, count.TextTransparency = accent, 1 - alpha
+		barBack.BackgroundColor3, barBack.BackgroundTransparency = T.FrameInactive, 1 - alpha
+		bar.BackgroundColor3, bar.BackgroundTransparency = accent, 1 - alpha
+		setWH(bar, round((W - 20) * sat(1 - age / 3)), 2)
 		if age > 4 then
 			table.remove(Notes, index)
 			frame:Destroy()
@@ -3433,7 +4270,7 @@ local function pushNotification(title, message)
 		return true
 	end)
 end
-
+end
 --[[ ---------------------------------------- Tabs and boxes -------------------------------- ]]
 
 local TabMeta = {}
@@ -3529,7 +4366,7 @@ function TabMeta:layout()
 		local remaining = gridH - cursors[i]
 		local h
 		if box.height == "auto" then
-			h = min(natural, remaining - 2)
+			h = math.min(natural, remaining - 2)
 		elseif box.height > 0 then
 			h = box.height
 		elseif box.height < 0 then
@@ -3537,21 +4374,21 @@ function TabMeta:layout()
 		else
 			h = remaining - 2
 		end
-		h = floor(h)
+		h = math.floor(h)
 		box.boxHeight = h
 		local x = i == 1 and 0 or (widths[1] + 8)
-		setXY(box.holder, floor(x), cursors[i])
+		setXY(box.holder, math.floor(x), cursors[i])
 		setWH(box.holder, box.width, h)
 		setWH(box.fill, box.width, h - 18)
 		setWH(box.lineFrame, box.width - 2, h - 20)
 		setWH(box.content, box.width, h - 18)
 		if box.scroller then
 			local viewH = h - 18
-			setWH(box.inner, box.width, max(natural - 18, viewH))
-			box.scroller.max = max(0, natural - 18 - viewH)
-			setXY(box.fadeBottom, 0, viewH - min(40, viewH * 0.25))
-			setWH(box.fadeTop, box.width, min(40, viewH * 0.25))
-			setWH(box.fadeBottom, box.width, min(40, viewH * 0.25))
+			setWH(box.inner, box.width, math.max(natural - 18, viewH))
+			box.scroller.max = math.max(0, natural - 18 - viewH)
+			setXY(box.fadeBottom, 0, viewH - math.min(40, viewH * 0.25))
+			setWH(box.fadeTop, box.width, math.min(40, viewH * 0.25))
+			setWH(box.fadeBottom, box.width, math.min(40, viewH * 0.25))
 			box.paintFades()
 		end
 		cursors[i] += h + 8
@@ -3611,8 +4448,8 @@ function Flow:Framed(label, o)
 		line.Transparency = 1 - (0.55 + 0.45 * on.v) * a
 		setText(name, tr(text), 12)
 		name.TextColor3 = T.Text
-		name.TextTransparency = 1 - (0.85 + 0.15 * max(hot.v, on.v)) * a
-		if glyph then glyph:paint(T.Text, (0.85 + 0.15 * max(hot.v, on.v)) * a) end
+		name.TextTransparency = 1 - (0.85 + 0.15 * math.max(hot.v, on.v)) * a
+		if glyph then glyph:paint(T.Text, (0.85 + 0.15 * math.max(hot.v, on.v)) * a) end
 	end
 	hot.cb, on.cb = paint, paint
 	scope:paint(paint)
@@ -3632,10 +4469,11 @@ function WindowMeta:pos() return self.position end
 
 function WindowMeta:dragTo(target)
 	self.dragTarget = target
+	if self.queueSettings then self.queueSettings() end -- guarda la posición (agrupado: una escritura por pausa)
 	if self.moving then return end
 	self.moving = true
 	Run(function(dt)
-		self.position = self.position:Lerp(self.dragTarget, 1 - exp(-20 * dt))
+		self.position = self.position:Lerp(self.dragTarget, 1 - math.exp(-20 * dt))
 		if (self.dragTarget - self.position).Magnitude < 0.5 then self.position = self.dragTarget end
 		setXY(self.frame, round(self.position.X), round(self.position.Y))
 		if self.position == self.dragTarget then
@@ -3646,15 +4484,60 @@ function WindowMeta:dragTo(target)
 	end)
 end
 
+-- Barra lateral extensible (1.5.0): grupos plegables (clic en su título; plegados muestran cuántas secciones
+-- tienen), desplazamiento con la rueda cuando no cabe, barra de acento en la sección activa, última sección y grupos
+-- plegados recordados en settings.json, y navegación con win:stepTab(±1). Ya no hay límite de 11 secciones.
 function WindowMeta:Group(name)
 	self.groupFirst = self.groupFirst == nil
+	local win = self
+	local key = tostring(name)
+	local saved = type(self.saved.collapsed) == "table" and self.saved.collapsed or {}
+	local group = { kind = "group", first = self.groupFirst, key = key, collapsed = saved[key] == true, count = 0 }
 	local label = Label(self.sideInner, "", 10, 0, 11, FontSemi)
+	local hit = Box(self.sideInner, 0, 0, 150, 16)
+	local hot = Anim(0, 15)
 	local scope = self.sideScope
-	scope:paint(function()
-		setText(label, tr(name), 11, FontSemi)
-		label.TextColor3, label.TextTransparency = T.Title, 1 - 0.5 * scope.alpha
-	end)
-	table.insert(self.sideItems, { kind = "group", frame = label, first = self.groupFirst })
+	local function paint()
+		local text = tr(name)
+		if group.collapsed then text = text .. "  +" .. group.count end
+		setText(label, text, 11, FontSemi)
+		label.TextColor3, label.TextTransparency = T.Title, 1 - (0.5 + 0.3 * hot.v) * scope.alpha
+	end
+	hot.cb = paint
+	scope:paint(paint)
+	group.frame, group.hit, group.paint = label, hit, paint
+	Hit(scope, hit, {
+		hover = function(b) hot:to(b and 1 or 0) end,
+		click = function()
+			if not win:inSide(hit) then return end
+			win:toggleGroup(group)
+		end,
+		tip = { name, "Click to fold or unfold this group." },
+	})
+	self.currentGroup = group
+	table.insert(self.sideItems, group)
+end
+
+function WindowMeta:toggleGroup(group, state)
+	if state == nil then state = not group.collapsed end
+	if group.collapsed == state then return end
+	group.collapsed = state
+	group.paint()
+	self:relayoutSide()
+	self.queueSettings()
+end
+
+-- ¿Está este elemento dentro de la parte visible de la barra? (lo desplazado fuera no recibe clics)
+function WindowMeta:inSide(frame)
+	local clip, p = self.sideClip, frame.AbsolutePosition
+	if not clip then return true end
+	local c, cs = clip.AbsolutePosition, clip.AbsoluteSize
+	return p.Y + frame.AbsoluteSize.Y * 0.5 >= c.Y and p.Y + frame.AbsoluteSize.Y * 0.5 <= c.Y + cs.Y
+end
+
+function WindowMeta:scrollSide(to)
+	self.sideScroll = math.clamp(to, 0, self.sideMax or 0)
+	setXY(self.sideInner, 0, -round(self.sideScroll))
 end
 
 function WindowMeta:selectTab(tab, instantly)
@@ -3672,6 +4555,27 @@ function WindowMeta:selectTab(tab, instantly)
 	self:setExpanded(tab.expandedOwner or (parent) or (tab.children and tab) or nil)
 	for _, t in self.tabs do t:paintActive() end
 	if instantly then self.pageAnim:set(1) else self.pageAnim:set(0); self.pageAnim:to(1) end
+	-- su grupo se despliega y la fila queda a la vista
+	local top = parent or tab
+	if top.group and top.group.collapsed then self:toggleGroup(top.group, false) end
+	self:relayoutSide()
+	if top.sideY and self.sideMax then
+		self:scrollSide(Library.Layout.scrollTo(top.sideY, Library.Tokens.size.tab, self.sideScroll or 0, Library.Layout.SIDE.height, self.sideMax))
+	end
+	self.saved.lastTab = tab.name
+	if self.queueSettings then self.queueSettings() end
+	if self.onTabChanged then task.spawn(self.onTabChanged, tab) end
+end
+
+-- Siguiente / anterior sección seleccionable (las que tienen subsecciones se saltan: se entra en la primera)
+function WindowMeta:stepTab(dir)
+	local list = {}
+	for _, item in self.sideItems do
+		if item.kind == "tab" and not item.tab.children then table.insert(list, item.tab) end
+	end
+	if #list == 0 then return end
+	local i = table.find(list, self.current) or 0
+	self:selectTab(list[((i - 1 + dir) % #list) + 1])
 end
 
 function WindowMeta:setExpanded(owner)
@@ -3683,45 +4587,61 @@ end
 
 function WindowMeta:relayoutSide()
 	local y = 0
+	local hidden = false
 	for _, item in self.sideItems do
 		if item.kind == "group" then
 			if not item.first then y += 12 end
 			setXY(item.frame, 10, y + 1)
-			y = floor(y + 12.5 + 4)
+			setXY(item.hit, 0, y)
+			y = math.floor(y + 12.5 + 4)
+			hidden = item.collapsed
 		elseif item.kind == "tab" then
-			if item.tab.parentTab then
-				local parent = item.tab.parentTab
-				local v = parent.expandAnim.v
+			local tab = item.tab
+			if tab.parentTab then
+				local parent = tab.parentTab
+				local v = parent.hiddenInGroup and 0 or parent.expandAnim.v
 				local full = #parent.children * 34
-				item.tab.row.Visible = v > 0.01
-				item.tab.rowScope.own = v
-				item.tab.rowScope:refresh()
-				setXY(item.tab.row, 0, (item.subIndex - 1) * 34)
+				tab.row.Visible = v > 0.01
+				tab.rowScope.own = v
+				tab.rowScope:refresh()
+				setXY(tab.row, 0, (item.subIndex - 1) * 34)
 				if item.subIndex == #parent.children then
 					setWH(parent.subClip, 150, round(full * v))
 					y = parent.subBase + full * v
 				end
 			else
-				setXY(item.tab.row, 0, y)
-				if item.tab.children then
-					item.tab.subBase = y + 34
-					setXY(item.tab.subClip, 0, item.tab.subBase)
+				tab.hiddenInGroup = hidden
+				tab.row.Visible = not hidden
+				if tab.subClip then tab.subClip.Visible = not hidden end
+				if not hidden then
+					setXY(tab.row, 0, y)
+					tab.sideY = y
+					if tab.children then
+						tab.subBase = y + 34
+						setXY(tab.subClip, 0, tab.subBase)
+					end
+					y = y + 34
+				elseif tab.children then
+					tab.subBase = y
 				end
-				y = y + 34
 			end
 		end
 	end
+	self.sideMax = math.max(0, y - Library.Layout.SIDE.height)
+	self:scrollSide(self.sideScroll or 0)
 end
 
 function WindowMeta:Tab(o)
 	local win = self
 	local parentTab = o.Parent
-	local tab = setmetatable({ win = win, name = o.Name, boxes = {}, parentTab = parentTab }, TabMeta)
+	local tab = setmetatable({ win = win, name = o.Name, boxes = {}, parentTab = parentTab, group = not parentTab and self.currentGroup or nil }, TabMeta)
+	if tab.group then tab.group.count += 1 end
 	local host = parentTab and parentTab.subClip or self.sideInner
 	local row = Box(host, 0, 0, 150, 30)
 	local indent = parentTab and 10 or 0
 	local scope = newScope(self.sideScope)
 	local pill = Box(row, 6 + indent, 0, 138 - indent, 30, T.TabActive, 6)
+	local bar = Box(row, 6 + indent, 8, 2, 14, Accent, 1) -- indicador de sección activa
 	local glyph = Glyph(row, o.Icon, 14)
 	glyph:center(6 + indent + 9 + 8, 15)
 	local label = ScrollText(row, 6 + indent + 32, 0, 138 - indent - 32 - 8, 30, 12)
@@ -3730,6 +4650,7 @@ function WindowMeta:Tab(o)
 		local a = scope.alpha
 		pill.BackgroundColor3 = T.TabActive
 		pill.BackgroundTransparency = 1 - sat(active.v + hover.v * 0.4) * a
+		bar.BackgroundColor3, bar.BackgroundTransparency = Accent, 1 - active.v * a
 		local icon = T.Disabled
 		if hover.v > 0 then icon = icon:Lerp(T.Text, hover.v) end
 		if active.v > 0 then icon = icon:Lerp(Accent, active.v) end
@@ -3747,6 +4668,7 @@ function WindowMeta:Tab(o)
 	Hit(scope, row, {
 		hover = function(b) hover:to(b and 1 or 0); label:hover(b) end,
 		click = function()
+			if not win:inSide(row) then return end
 			if tab.children then
 				local cur = win.current
 				if not (cur and cur.parentTab == tab) then
@@ -3788,6 +4710,17 @@ end
 
 function WindowMeta:Finish()
 	for _, tab in self.tabs do tab:layout() end
+	-- modo compacto (poco alto): solo queda desplegado el grupo de la sección activa (sin guardarlo)
+	if self.compact then
+		local keep = self.current and (self.current.parentTab or self.current).group
+		for _, item in self.sideItems do
+			if item.kind == "group" and item ~= keep then item.collapsed = true; item.paint() end
+		end
+	end
+	-- vuelve a la última sección visitada (por su nombre estable)
+	for _, tab in self.tabs do
+		if tab.name == self.restoreTab and not tab.children then self:selectTab(tab, true) break end
+	end
 	self:relayoutSide()
 	for _, tab in self.tabs do tab:paintActive() end
 	self.configs.init()
@@ -3811,6 +4744,7 @@ function WindowMeta:Get(id)
 	return self.store.pending[id]
 end
 
+do -- bloque propio: sus locales no cuentan en el pico de registros (tools/wrap_block.js)
 local function settingsChanged()
 	if CurrentWindow then CurrentWindow.queueSettings() end
 end
@@ -3836,6 +4770,7 @@ function Library:SetLanguage(index)
 end
 
 function Library:SetScale(scale)
+	if CurrentWindow then CurrentWindow.userScale = scale end -- la elegida (la ajustada a la pantalla no se guarda)
 	setRasterScale(scale)
 	repaintAll()
 	settingsChanged()
@@ -3866,10 +4801,10 @@ local function buildSearch(win, top)
 		local width = 30 + (250 - 30) * e
 		setXY(plate, round(rightX - width), baseY)
 		setWH(plate, round(width), 30)
-		plate.BackgroundColor3, plate.BackgroundTransparency = T.FrameInactive, 1 - (0.5 + 0.3 * max(h, e)) * a
-		mag:paint(T.Disabled:Lerp(T.Text, max(h, e)), a)
+		plate.BackgroundColor3, plate.BackgroundTransparency = T.FrameInactive, 1 - (0.5 + 0.3 * math.max(h, e)) * a
+		mag:paint(T.Disabled:Lerp(T.Text, math.max(h, e)), a)
 		local textX = round(rightX - width + 12)
-		local textW = max(1, rightX - 30 + 4 - textX)
+		local textW = math.max(1, rightX - 30 + 4 - textX)
 		input.Visible = e > 0.01
 		placeholder.Visible = e > 0.01 and input.Text == ""
 		setXY(input, textX, capY(baseY + 15, 12))
@@ -3893,14 +4828,16 @@ local function buildSearch(win, top)
 		end
 		return table.concat(out)
 	end
-	local rowW, rowH = 238, 32
+	-- 1.5.0: lista más ancha (340), 10 filas, grupo y favorito a la derecha
+	local rowW, rowH, listW, ROWS = 328, 30, 340, 10
+	local GROUP_LABEL = { controls = "Functions", settings = "Settings", profiles = "Presets", catalog = "Catalog", history = "Recent" }
 	local function ensureList()
 		if listFrame then return end
-		local card = newCard({ width = 250, rounding = 12, name = "SearchList" })
+		local card = newCard({ width = listW, rounding = 10, name = "SearchList" })
 		card.frame.Active = true
 		listFrame, listScope = card, card.scope
 		table.insert(Windows, { frame = card.frame, scope = card.scope })
-		for i = 1, 8 do
+		for i = 1, ROWS do
 			local row = Box(card.content, 6, 6 + (i - 1) * rowH, rowW, rowH)
 			local bg = Box(row, 0, 0, rowW, rowH, T.FrameInactive, 6)
 			local labelClip = Box(row, 0, 0, rowW, rowH)
@@ -3909,8 +4846,9 @@ local function buildSearch(win, top)
 			local b = Label(labelClip, "", 0, capY(16, 12), 12)
 			local m = Label(labelClip, "", 0, capY(16, 12), 12)
 			local path = New("TextLabel", {
-				Text = "", BackgroundTransparency = 1, FontFace = FontMedium, TextSize = 12, Size = UDim2.fromOffset(150, 16),
-				Position = UDim2.fromOffset(rowW - 10 - 150, capY(16, 12)), TextXAlignment = Enum.TextXAlignment.Right, TextYAlignment = Enum.TextYAlignment.Top,
+				Text = "", BackgroundTransparency = 1, FontFace = FontMedium, TextSize = 11, Size = UDim2.fromOffset(170, 16),
+				Position = UDim2.fromOffset(rowW - 10 - 170, capY(15, 11)), TextXAlignment = Enum.TextXAlignment.Right, TextYAlignment = Enum.TextYAlignment.Top,
+				TextTruncate = Enum.TextTruncate.AtEnd,
 			}, row)
 			local t = Anim(0, 15)
 			local rowObj = { row = row }
@@ -3925,7 +4863,7 @@ local function buildSearch(win, top)
 			t.cb = paintRow
 			card.scope:paint(paintRow)
 			rowObj.fill = function(entry, startAt, needleLen)
-				local shown = tr(entry.label)
+				local shown = entry.group == "history" and entry.label or tr(entry.label)
 				local first = utf8.offset(shown, startAt or (utf8.len(shown) + 1)) or (#shown + 1)
 				local after = utf8.offset(shown, (startAt or 0) + needleLen) or (#shown + 1)
 				local part1, part2, part3 = string.sub(shown, 1, first - 1), string.sub(shown, first, after - 1), string.sub(shown, after)
@@ -3935,8 +4873,10 @@ local function buildSearch(win, top)
 				local w1 = part1 ~= "" and measure(part1, 12) or 0
 				setXY(m, round(10 + w1), capY(16, 12))
 				setXY(b, round(10 + w1 + (part2 ~= "" and measure(part2, 12) or 0)), capY(16, 12))
-				path.Text = tr(entry.tabName) .. "   " .. tr(entry.box or "")
-				setWH(labelClip, max(1, rowW - 10 - measure(path.Text, 12) - 6), rowH)
+				local where = entry.path or (tr(entry.tabName or "") .. " · " .. tr(entry.box or ""))
+				local star = entry.key and win.isFavorite and win.isFavorite(entry.key) and "★ " or ""
+				path.Text = star .. tr(GROUP_LABEL[entry.group or "controls"] or "Functions") .. " · " .. where
+				setWH(labelClip, math.max(1, rowW - 10 - measure(path.Text, 12) - 6), rowH)
 				rowObj.entry = entry
 			end
 			rowObj.t = t
@@ -3954,7 +4894,7 @@ local function buildSearch(win, top)
 		local empty = Label(card.content, "", 16, capY(22, 12), 12)
 		empty.Visible = false
 		card.scope:paint(function()
-			setText(empty, tr("No matching functions"), 12)
+			setText(empty, tr("No results. Try another word."), 12)
 			empty.TextColor3, empty.TextTransparency = T.Disabled, 1 - card.scope.alpha
 		end)
 		card.empty = empty
@@ -3966,7 +4906,7 @@ local function buildSearch(win, top)
 		if show then
 			card.frame.Visible = true
 			local a = toStage(parent.AbsolutePosition)
-			card.base = Vector2.new(a.X + rightX - 250, a.Y + baseY + 30 + 8)
+			card.base = Vector2.new(a.X + rightX - listW, a.Y + baseY + 30 + 8)
 			card:apply()
 			card.isOpen = true
 		else
@@ -3974,29 +4914,43 @@ local function buildSearch(win, top)
 		end
 		card:startFade()
 	end
-	local function refreshHits()
-		local q = fold(input.Text)
-		table.clear(hits)
-		if q ~= "" then
-			local prefix = 0
-			for _, entry in win.searchIndex do
-				if #hits >= 8 then break end
-				if not string.match(entry.label, "^%d+$") then
-					local folded = fold(tr(entry.label))
-					local at = string.find(folded, q, 1, true)
-					if at then
-						at = utf8.len(folded, 1, at) -- characters, since folding can change byte lengths
-						if at == 1 then
-							prefix += 1
-							table.insert(hits, prefix, { entry, at })
-						else
-							table.insert(hits, { entry, at })
-						end
-					end
-				end
+	-- Entradas para buscar: los controles (con su texto traducido, descripción y sección) y lo que añadan los
+	-- proveedores del hub (win.searchProviders: perfiles, catálogo…). Se rehace en cada búsqueda: es barato.
+	local function candidates(q)
+		local list = {}
+		for _, entry in win.searchIndex do
+			if not string.match(entry.label, "^%d+$") then
+				entry.text = tr(entry.label)
+				entry.group = (entry.tab and entry.tab.name == "Settings") and "settings" or "controls"
+				table.insert(list, { label = entry.text, tip = entry.tip and tr(entry.tip) or nil, group = entry.group,
+					path = tr(entry.tabName or "") .. " " .. tr(entry.box or ""), source = entry })
 			end
 		end
-		sel = clamp(sel, 1, max(1, #hits))
+		for _, provider in win.searchProviders or {} do
+			local ok, extra = pcall(provider, q)
+			if ok and type(extra) == "table" then
+				for _, e in extra do table.insert(list, { label = e.label, tip = e.tip, group = e.group or "catalog", aliases = e.aliases, path = e.path, source = e }) end
+			end
+		end
+		return list
+	end
+	local function refreshHits()
+		local raw = input.Text
+		table.clear(hits)
+		if raw:match("^%s*$") then
+			-- sin texto: las últimas búsquedas (elegir una la vuelve a escribir; no ejecuta nada)
+			for _, h in win.saved.searchHistory or {} do
+				if #hits >= ROWS then break end
+				table.insert(hits, { { label = h, group = "history", path = "", history = true }, nil })
+			end
+		else
+			for _, h in Library.Search.rank(candidates(raw), raw, { limit = ROWS }) do
+				local src = h.entry.source
+				table.insert(hits, { src, h.field == "label" and h.at or nil })
+			end
+		end
+		local q = fold(raw)
+		sel = clamp(sel, 1, math.max(1, #hits))
 		ensureList()
 		for i, row in listRows do
 			local hit = hits[i]
@@ -4004,9 +4958,9 @@ local function buildSearch(win, top)
 			if hit then row.fill(hit[1], hit[2], utf8.len(q)) end
 			row.t:to(i == sel and 1 or 0)
 		end
-		listFrame.empty.Visible = #hits == 0
-		listFrame:setHeight(12 + max(1, #hits) * rowH)
-		setList(isOpen and q ~= "" and input:IsFocused())
+		listFrame.empty.Visible = #hits == 0 and q ~= ""
+		listFrame:setHeight(12 + math.max(1, #hits) * rowH)
+		setList(isOpen and (q ~= "" or #hits > 0) and input:IsFocused())
 	end
 	local function setOpen(state)
 		isOpen = state
@@ -4021,13 +4975,24 @@ local function buildSearch(win, top)
 		end
 	end
 	results = function(entry)
+		-- se apunta la búsqueda en el historial (solo el texto; nunca se ejecuta nada al elegir)
+		if not entry.history then
+			win.saved.searchHistory = Library.Search.remember(win.saved.searchHistory or {}, input.Text)
+			if win.queueSettings then win.queueSettings() end
+		end
+		if entry.history then input.Text = entry.label; input.CursorPosition = #input.Text + 1; return end
+		if entry.pick then -- de un proveedor (perfil, entidad del catálogo): lleva a su sección
+			setOpen(false)
+			task.spawn(entry.pick)
+			return
+		end
 		win:selectTab(entry.tab)
 		local tabObj = entry.tab
 		if tabObj and tabObj.parentTab then win:setExpanded(tabObj.parentTab) end
 		setOpen(false)
 		entry.flash = 1.2
 		Run(function(dt)
-			entry.flash = max(0, entry.flash - dt)
+			entry.flash = math.max(0, entry.flash - dt)
 			if entry.paint then entry.paint() end
 			return entry.flash > 0
 		end)
@@ -4051,15 +5016,30 @@ local function buildSearch(win, top)
 	Hit(scope, input, {})
 	connect(UserInputService.InputBegan, function(input2)
 		if not isOpen then return end
+		local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
 		if input2.KeyCode == Enum.KeyCode.Escape then
 			setOpen(false)
+		elseif ctrl and input2.KeyCode == Enum.KeyCode.Return and hits[sel] and hits[sel][1].key and win.toggleFavorite then
+			win.toggleFavorite(hits[sel][1].key) -- Ctrl+Enter: favorito (no ejecuta la función)
+			refreshHits()
 		elseif #hits > 0 and (input2.KeyCode == Enum.KeyCode.Down or input2.KeyCode == Enum.KeyCode.Up) then
 			local count = #hits
 			sel = input2.KeyCode == Enum.KeyCode.Down and sel % count + 1 or (sel - 2) % count + 1
 			for k, r in listRows do r.t:to(k == sel and 1 or 0) end
 		end
 	end)
-	win.search = { setOpen = setOpen }
+	win.search = { setOpen = setOpen, isOpen = function() return isOpen end }
+	-- ir a un control por su clave estable (favoritos, accesos rápidos): misma navegación que un resultado
+	function win:goToKey(key)
+		for _, entry in self.searchIndex do
+			if entry.key == key then results(entry) return true end
+		end
+		return false
+	end
+	function win:findKey(key)
+		for _, entry in self.searchIndex do if entry.key == key then return entry end end
+		return nil
+	end
 end
 
 -- Presets on disk. One JSON file per preset; `selected` is the one loaded right now.
@@ -4080,15 +5060,20 @@ local function newConfigs(win, onChanged)
 		for id, control in store.controls do values[id] = control.get() end
 		return values
 	end
+	-- v4: aplicar un perfil es atómico. Si el hub puso win.profileApply (módulo Profiles), valida todo antes y deshace
+	-- si algo falla; si no, se aplica como siempre. Devuelve ok, problemas.
 	local function apply(values)
-		if type(values) ~= "table" then return end
+		if type(values) ~= "table" then return false, { "values no es una tabla" } end
+		if win.profileApply then return win.profileApply(values, store.controls, store.pending) end
 		for id, value in values do
 			local control = store.controls[id]
 			if control then control.set(value) else store.pending[id] = value end
 		end
+		return true, {}
 	end
 	local function writeConfig(dir, cfg, values)
-		Files.write(pathFor(dir, cfg.name), encodeJSON({ name = cfg.name, created = cfg.created, modified = cfg.modified, values = values }))
+		Files.write(pathFor(dir, cfg.name), encodeJSON({ name = cfg.name, created = cfg.created, modified = cfg.modified, values = values,
+			profileVersion = win.profileVersion }))
 	end
 	local function readValues(dir, cfg)
 		local data = decodeJSON(Files.read(pathFor(dir, cfg.name)))
@@ -4135,10 +5120,25 @@ local function newConfigs(win, onChanged)
 		writeConfig(configDir, cfg, snapshot())
 	end
 
+	-- El perfil activo solo cambia si se aplicó entero
 	function M.load(i)
+		local ok, problems = apply(readValues(configDir, M.list[i]))
+		if not ok then return false, problems end
 		M.selected = i
-		apply(readValues(configDir, M.list[i]))
 		win.queueSettings()
+		return true
+	end
+	-- Para el hub (v4): valores actuales, valores guardados de un perfil, volver a lo guardado, crear desde valores
+	M.snapshot = snapshot
+	function M.peek(i) return M.list[i] and readValues(configDir, M.list[i]) or nil end
+	function M.revert() return apply(readValues(configDir, M.current())) end
+	function M.createFrom(name, values)
+		local time = stamp()
+		local cfg = { name = unique(M.list, name), created = time, modified = time }
+		table.insert(M.list, cfg)
+		writeConfig(configDir, cfg, values)
+		if win.configsChanged then win.configsChanged() end
+		return #M.list, cfg
 	end
 
 	function M.rename(i, name)
@@ -4169,7 +5169,7 @@ local function newConfigs(win, onChanged)
 		writeConfig(trashDir, cfg, values)
 		table.insert(M.trash, cfg)
 		if #M.list == 0 then M.create("Default") end
-		if M.selected > i or M.selected > #M.list then M.selected = max(1, M.selected - 1) end
+		if M.selected > i or M.selected > #M.list then M.selected = math.max(1, M.selected - 1) end
 		win.queueSettings()
 		return cfg
 	end
@@ -4191,8 +5191,13 @@ local function newConfigs(win, onChanged)
 	end
 
 	-- Hands the preset's file to the clipboard, where the executor provides one.
+	-- v4: con win.profileExport (módulo Profiles) se copia una versión SIN secretos
 	function M.export(i)
 		if type(setclipboard) ~= "function" then return false end
+		if win.profileExport then
+			local okText, text = pcall(win.profileExport, M.list[i], readValues(configDir, M.list[i]))
+			return okText and (pcall(setclipboard, text)) or false
+		end
 		return (pcall(setclipboard, Files.read(pathFor(configDir, M.list[i].name)) or ""))
 	end
 
@@ -4247,7 +5252,11 @@ local function buildConfigPopup(win, configs, onChanged)
 	end
 	local function pick(i)
 		if i == configs.selected then return end
-		configs.load(i)
+		local ok, problems = configs.load(i)
+		if not ok then
+			notify("Config not loaded", "%s", tostring(problems and problems[1] or "?"))
+			return
+		end
 		notify("Config Loaded", "Loaded config: %s", configs.list[i].name)
 		rebuild()
 		onChanged()
@@ -4263,11 +5272,11 @@ local function buildConfigPopup(win, configs, onChanged)
 		rowsScope.clip = listClip
 		for _, child in listInner:GetChildren() do child:Destroy() end
 		local list = order()
-		local rows = max(1, #list)
-		local listH = min(rows, 7) * (rowH + rowGap) - rowGap
+		local rows = math.max(1, #list)
+		local listH = math.min(rows, 7) * (rowH + rowGap) - rowGap
 		setWH(listClip, inner, listH)
 		setWH(listInner, inner, rows * (rowH + rowGap) - rowGap)
-		listScroll.max = max(0, rows * (rowH + rowGap) - rowGap - listH)
+		listScroll.max = math.max(0, rows * (rowH + rowGap) - rowGap - listH)
 		listScroll.y = clamp(listScroll.y, 0, listScroll.max)
 		setXY(listInner, 0, -listScroll.y)
 		card:setHeight(10 + listY + listH + 10)
@@ -4419,7 +5428,15 @@ local function buildConfigPopup(win, configs, onChanged)
 				local y = (i - 1) * 33
 				local name = Label(holder, cfg.name, 2, y + capY(16.5, 12), 12)
 				binScope:paint(function() name.TextColor3, name.TextTransparency = T.Text, 1 - binScope.alpha end)
+				-- borrar para siempre pide un segundo clic en 4 s (v4)
 				IconButton(holder, binScope, "TRASH", 196 - 52 - 6, y, 26, 33, red, function()
+					local now = os.clock()
+					if not (configs.purgeArmed and configs.purgeArmed.name == cfg.name and now - configs.purgeArmed.at < 4) then
+						configs.purgeArmed = { name = cfg.name, at = now }
+						notify("Delete forever?", "Click again to delete %s forever", cfg.name)
+						return
+					end
+					configs.purgeArmed = nil
 					configs.purge(i)
 					binRebuild()
 				end)
@@ -4430,7 +5447,7 @@ local function buildConfigPopup(win, configs, onChanged)
 					rebuild()
 				end)
 			end
-			local n = max(1, #configs.trash)
+			local n = math.max(1, #configs.trash)
 			setWH(holder, 196, n * 33)
 			c:setHeight(20 + n * 33)
 			binScope:refresh()
@@ -4577,7 +5594,7 @@ local function buildUserCard(win, profile)
 				accentValue.a = Accent
 				paintAccent(accentValue, scope.alpha)
 				swRing.Transparency = 1 - 0.35 * swHot.v * scope.alpha
-				cog:paint(T.Disabled:Lerp(T.Text, max(cogT.v, r.t.v * 0.6)), scope.alpha)
+				cog:paint(T.Disabled:Lerp(T.Text, math.max(cogT.v, r.t.v * 0.6)), scope.alpha)
 			end)
 			swHot.cb, cogT.cb = r.paint, r.paint
 			scope:paint(r.paint)
@@ -4637,7 +5654,7 @@ local function buildSpotify(win)
 		if widget.moving then return end
 		widget.moving = true
 		Run(function(dt)
-			widget.position = widget.position:Lerp(widget.dragTarget, 1 - exp(-9 * dt))
+			widget.position = widget.position:Lerp(widget.dragTarget, 1 - math.exp(-9 * dt))
 			if (widget.dragTarget - widget.position).Magnitude < 0.5 then widget.position = widget.dragTarget end
 			setXY(frame, round(widget.position.X), round(widget.position.Y))
 			if widget.position == widget.dragTarget then
@@ -4673,7 +5690,7 @@ local function buildSpotify(win)
 		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Top,
 	}, content)
 	local btnLabelW = measure(tr("Open Spotify"), 11, FontSemi)
-	local btnW = round(min(w, btnLabelW + 52))
+	local btnW = round(math.min(w, btnLabelW + 52))
 	local btn = Box(content, round(pad + (w - btnW) * 0.5), y + 88, btnW, 30, Accent, 15)
 	local ext = Glyph(btn, "EXTERNAL_LINK_ALT", 14)
 	local block = ext.boxW + 7 + btnLabelW
@@ -4731,7 +5748,7 @@ local function buildSpotify(win)
 		end,
 	})
 	local shown = Anim(0, 12, function(v)
-		scope:setAlpha(max(v, 0))
+		scope:setAlpha(math.max(v, 0))
 		frame.Visible = v > 0.004
 	end, 0.004)
 	table.insert(Windows, widget)
@@ -4792,10 +5809,21 @@ function Library:CreateWindow(o)
 	connectInput()
 	local folder = o.Folder or "ElHoyoHub"
 	local saved = loadSaved(folder)
-	if tonumber(saved.scale) and saved.scale ~= 1 then setRasterScale(saved.scale) end
+	-- 1.5.0: la escala del usuario se respeta si la ventana cabe; si no, se usa la mayor que cabe (sin guardarla)
+	local userScale = math.clamp(tonumber(saved.scale) or 1, Library.Layout.SCALE.min, Library.Layout.SCALE.max)
+	local function fit()
+		local px = viewport() * Scale
+		local s, why = Library.Layout.fitScale({ px.X, px.Y }, userScale)
+		if math.abs(s - Scale) > 1e-3 then setRasterScale(s) end
+		return why, px
+	end
+	local fitWhy, px = fit()
 	local view = viewport()
-	-- en pantallas más pequeñas que la ventana, la esquina queda dentro (se ve la barra para arrastrarla)
-	local start = o.Position or Vector2.new(max(0, floor((view.X - 800) * 0.5)), max(0, floor((view.Y - 600) * 0.5)))
+	-- posición guardada (validada: siempre se ve la cabecera) o centrada
+	local sp = type(saved.position) == "table" and saved.position or nil
+	local sx, sy = (sp and tonumber(sp[1])) or math.floor((view.X - 800) * 0.5), (sp and tonumber(sp[2])) or math.floor((view.Y - 600) * 0.5)
+	sx, sy = Library.Layout.clampWindow({ sx, sy }, { 800, 600 }, { view.X, view.Y }, 0)
+	local start = o.Position or Vector2.new(math.floor(sx), math.floor(sy))
 	local frame = Box(Stage, start.X, start.Y, 800, 600)
 	frame.Active, frame.Name, frame.ZIndex = true, "Menu", 10
 	New("TextButton", { Modal = true, Text = "", BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 0) }, frame) -- frees a locked mouse
@@ -4803,6 +5831,7 @@ function Library:CreateWindow(o)
 	local win = setmetatable({
 		frame = frame, scope = scope, position = start, dragTarget = start, tabs = {}, sideItems = {}, searchIndex = {}, Library = Library,
 		folder = folder, saved = saved, store = { controls = {}, pending = {}, used = {} },
+		userScale = userScale, autoScaled = fitWhy == "fit", restoreTab = saved.lastTab, compact = Library.Layout.compact({ px.X, px.Y }, Scale),
 	}, WindowMeta)
 	win.settingsStore = { controls = {}, pending = type(saved.values) == "table" and saved.values or {}, used = {} }
 	table.insert(Windows, win)
@@ -4815,8 +5844,14 @@ function Library:CreateWindow(o)
 		for id, control in win.settingsStore.controls do values[id] = control.get() end
 		local current = win.configs and win.configs.current()
 		Files.write(folder .. "/settings.json", encodeJSON({
-			theme = Library.Theme, accent = toHex(Accent), language = Library.Language, scale = Scale,
+			theme = Library.Theme, accent = toHex(Accent), language = Library.Language, scale = win.userScale,
 			lastConfig = current and current.name or nil, values = values,
+			-- 1.5.0: última sección, grupos plegados y posición de la ventana
+			lastTab = win.saved.lastTab, collapsed = (function()
+				local out = {}
+				for _, item in win.sideItems do if item.kind == "group" and item.collapsed then out[item.key] = true end end
+				return out
+			end)(), position = { math.floor(win.dragTarget.X), math.floor(win.dragTarget.Y) },
 		}))
 	end
 	-- Dragging the accent colour changes it every frame, so writes wait for a pause.
@@ -4869,7 +5904,23 @@ function Library:CreateWindow(o)
 	tracked(o.Brand or "EL HOYO", 60, 15, 14, FontSemi, 0.935, 1)
 	tracked(o.SubBrand or "HUB", 60, 31, 11, FontSemi, 2.17, 0.62)
 
-	win.sideInner = Box(frame, 10, 70, 150, 470)
+	-- la barra lateral recorta y se desplaza con la rueda (1.5.0)
+	win.sideClip = Box(frame, 10, 70, 150, Library.Layout.SIDE.height)
+	win.sideClip.ClipsDescendants = true
+	win.sideInner = Box(win.sideClip, 0, 0, 150, Library.Layout.SIDE.height)
+	Wheel(sideScope, win.sideClip, function(z) win:scrollSide((win.sideScroll or 0) - z * Library.Tokens.size.tab) end)
+	-- al cambiar el tamaño de la pantalla: reajustar la escala y que la ventana siga a la vista
+	local camera = workspace.CurrentCamera
+	if camera then
+		connect(camera:GetPropertyChangedSignal("ViewportSize"), function()
+			local why, now = fit()
+			win.autoScaled = why == "fit"
+			win.compact = Library.Layout.compact({ now.X, now.Y }, Scale)
+			local v = viewport()
+			local x, y = Library.Layout.clampWindow({ win.dragTarget.X, win.dragTarget.Y }, { 800, 600 }, { v.X, v.Y }, 0)
+			win:dragTo(Vector2.new(math.floor(x), math.floor(y)))
+		end)
+	end
 
 	-- content area
 	local pagesScope = newScope(scope)
@@ -4900,14 +5951,14 @@ function Library:CreateWindow(o)
 		local name = current and current.name or "None"
 		local textW = measure(name, 12)
 		local chevW = glyphContours("CHEVRON_DOWN").adv / 512 * 14
-		local dropW = floor(clamp(textW + chevW + 40, 125, 300))
+		local dropW = math.floor(clamp(textW + chevW + 40, 125, 300))
 		local btnW = 35 + dropW
 		setWH(presetPlate, btnW, 30)
 		setWH(dropHit, dropW, 30)
 		local labelArea = dropW - chevW - 24
 		setWH(dropClip, 12 + labelArea, 30)
 		setText(dropLabel, name, 12)
-		setXY(dropLabel, round(12 + (labelArea - min(textW, labelArea)) * 0.5), capY(15, 12))
+		setXY(dropLabel, round(12 + (labelArea - math.min(textW, labelArea)) * 0.5), capY(15, 12))
 		dropChevron:center(190 + btnW - 12 - chevW * 0.5, 30)
 	end
 	local function paintTop()
@@ -4926,6 +5977,7 @@ function Library:CreateWindow(o)
 		paintTop()
 	end
 	win.configs = newConfigs(win, presetsChanged)
+	win.configsChanged = presetsChanged
 	layoutTop()
 	local function updatePreset()
 		presetA:to((saveHot or dropHot) and 1 or 0)
@@ -4989,8 +6041,8 @@ function Library:CreateWindow(o)
 		end)
 	end
 	win.Screen = Screen
-	win.Notify = function(_, title, text) pushNotification(title, text) end
-	Library.Notify = function(_, title, text) pushNotification(title, text) end
+	win.Notify = function(_, title, text, level) pushNotification(title, text, level) end
+	Library.Notify = function(_, title, text, level) pushNotification(title, text, level) end
 	return win
 end
 
@@ -5024,9 +6076,9 @@ local function IconTabs(win, parent, scope, topRight, icons, labels, trailing, o
 	local function paintSeg(i)
 		local seg = segs[i]
 		local a = scope.alpha
-		local plateA = max(seg.open.v, max(seg.hot.v, i == held and 1 or 0) * 0.5)
+		local plateA = math.max(seg.open.v, math.max(seg.hot.v, i == held and 1 or 0) * 0.5)
 		seg.plate.BackgroundColor3, seg.plate.BackgroundTransparency = T.FrameInactive, 1 - 0.9 * plateA * a
-		local color = T.Disabled:Lerp(T.Text, max(seg.hot.v, i == held and 1 or 0)):Lerp(Accent, seg.open.v)
+		local color = T.Disabled:Lerp(T.Text, math.max(seg.hot.v, i == held and 1 or 0)):Lerp(Accent, seg.open.v)
 		seg.glyph:paint(color, a)
 		setText(seg.label, tr(labels[i]), 12)
 		seg.label.TextColor3, seg.label.TextTransparency = color, 1 - seg.open.v * a
@@ -5083,7 +6135,7 @@ local function Chips(flow, labels, getValues, refreshers)
 	local x, y = 0, 0
 	local scope = flow.scope
 	for i, label in labels do
-		local width = ceil(measure(tr(label), 12) + pad * 2)
+		local width = math.ceil(measure(tr(label), 12) + pad * 2)
 		if x > 0 and x + width > avail then
 			x = 0
 			y += h + gapY
@@ -5140,7 +6192,7 @@ local function buildAmbience(win)
 	scope:paint(paint)
 	local function apply()
 		paint()
-		content:setAlpha(max(sat((state - 0.45) / 0.55), 0.0001))
+		content:setAlpha(math.max(sat((state - 0.45) / 0.55), 0.0001))
 		clip.Visible = state > 0
 	end
 	local function setOpen(open)
@@ -5151,10 +6203,10 @@ local function buildAmbience(win)
 		win.topScope.inert = open
 		Run(function(dt)
 			if isOpen then
-				state += (1 - state) * (1 - exp(-15 * dt))
+				state += (1 - state) * (1 - math.exp(-15 * dt))
 				if state > 0.998 then state = 1 end
 			else
-				state = max(0, state - dt / 0.16)
+				state = math.max(0, state - dt / 0.16)
 				if state < 0.01 then state = 0 end
 			end
 			apply()
@@ -5166,7 +6218,7 @@ local function buildAmbience(win)
 	IconButton(holder, content, "ELLIPSIS_H", 630 - 14 - 48 - 2, 12, 24, 24, DimHot, function() end)
 	local gap = 14
 	local usable = 630 - gap * 2 - gap
-	local w1 = floor(usable * 0.454)
+	local w1 = math.floor(usable * 0.454)
 	local w2 = usable - w1
 	-- left column: no box round the map list
 	local title = Label(holder, "", gap + 12, 46, 11, FontSemi)
@@ -5549,6 +6601,7 @@ if type(_G) == "table" then
 	end
 	_G.ElHoyoUI = Library
 end
+end
 
 return Library
 end
@@ -5556,7 +6609,7 @@ __modules["Console"] = function(...)
 -- Console: la ventana de registro del hub (arrastrable, ⌫ borrar, × cerrar, máx. 150 líneas) y log().
 -- Movida tal cual desde src/main.lua (1.4.0): mismo aspecto y comportamiento. El hub le inyecta lo que usa.
 -- deps = { gui, C (colores), UIS, UI (librería, para Notify), life, config, T, cleanup }
--- Devuelve { frame, set(show), shown(), log(msg, nivel, notify), setTitle(texto) }.
+-- Devuelve { frame, set(show), shown(), log(msg, nivel, notify), setTitle(texto), onVisible = nil (lo pone el hub) }.
 local Console = {}
 
 function Console.new(deps)
@@ -5651,9 +6704,11 @@ local MAX_LINES = 150
 local lines, lineCount = {}, 0
 local LEVEL_COLOR = { info = C.text, ok = C.on, warn = C.warn, error = C.err }
 local consoleShown = false
+local api = {} -- api.onVisible(show): aviso al hub (Components) cada vez que se muestra u oculta
 local function setConsole(show)
 	consoleShown = show
 	consoleWin.Visible = show
+	if api.onVisible then api.onVisible(show) end
 end
 headerIcon("×", -34, function() setConsole(false) end)
 headerIcon("⌫", -64, function()
@@ -5687,16 +6742,15 @@ local function log(msg, level, notify)
 	end)
 	if UI.Notify and (level == "error" or (config.notify and (notify or level == "warn"))) then
 		local title = level == "error" and "Error" or level == "warn" and T("Aviso", "Warning") or "El Hoyo Hub"
-		pcall(UI.Notify, UI, title, msg)
+		pcall(UI.Notify, UI, title, msg, level) -- 1.5.0: el nivel da el color
 	end
 end
-return {
-	frame = consoleWin,
-	set = setConsole,
-	shown = function() return consoleShown end,
-	log = log,
-	setTitle = function(text) consoleTitle.Text = text end,
-}
+api.frame = consoleWin
+api.set = setConsole
+api.shown = function() return consoleShown end
+api.log = log
+api.setTitle = function(text) consoleTitle.Text = text end
+return api
 end
 
 return Console
@@ -5754,10 +6808,187 @@ function Ownership.new(toggles, spawn)
 		table.clear(self.owners)
 		return n
 	end
+
+	------------------------------------------------------------------ Recursos compartidos (1.5.2)
+	-- Turnos de recursos que varias funciones usan a la vez: "move" (mover el personaje; el antiguo busy/claimMove)
+	-- y "hand" (la herramienta equipada). Coordinación: un dueño por recurso; una petición de otro se deniega y se
+	-- apunta; `preempt` (la Huida) quita el turno y, al soltarlo, se lo DEVUELVE al anterior (antes se perdía).
+	-- `use` solo observa (no bloquea): apunta usos solapados, para detectar conflictos sin cambiar el comportamiento.
+	-- epoch = personaje actual: tras reaparecer, lo pedido con el personaje anterior se marca como referencia vieja.
+	local clock = os.clock
+	self.leases, self.stack, self.uses, self.events, self.epoch = {}, {}, {}, {}, 1
+	self.MAX_EVENTS = 40
+	local function event(kind, resource, owner, detail)
+		table.insert(self.events, { kind = kind, resource = resource, owner = owner, detail = detail, at = clock(), epoch = self.epoch })
+		if #self.events > self.MAX_EVENTS then table.remove(self.events, 1) end
+	end
+	self.event = event
+	function self.setClock(fn) clock = fn end
+
+	function self.holder(resource)
+		local l = self.leases[resource]
+		return l and l.owner or nil
+	end
+	-- Pide el turno. Devuelve ok y quién lo tiene. opts.preempt: lo quita a quien lo tenga (y se lo devuelve luego)
+	function self.acquire(resource, owner, opts)
+		local l = self.leases[resource]
+		if l and l.owner == owner then
+			l.epoch = self.epoch
+			return true, owner
+		end
+		if l and not (opts and opts.preempt) then
+			event("denied", resource, owner, l.owner)
+			return false, l.owner
+		end
+		if l then
+			self.stack[resource] = self.stack[resource] or {}
+			table.insert(self.stack[resource], l)
+			event("preempted", resource, owner, l.owner)
+		end
+		self.leases[resource] = { owner = owner, at = clock(), epoch = self.epoch }
+		return true, owner
+	end
+	-- Suelta el turno. Si no lo tenía (ya lo soltó otro, p. ej. al apagar la función), se apunta como liberación tardía.
+	function self.release(resource, owner)
+		local l = self.leases[resource]
+		if not l or l.owner ~= owner then
+			-- también puede estar guardado debajo de quien se lo quitó: se borra de ahí
+			local st = self.stack[resource]
+			for i = #(st or {}), 1, -1 do
+				if st[i].owner == owner then table.remove(st, i); return true end
+			end
+			event("late_release", resource, owner, l and l.owner or nil)
+			return false
+		end
+		local st = self.stack[resource]
+		local prev = st and table.remove(st)
+		self.leases[resource] = prev
+		if prev then event("restored", resource, prev.owner, owner) end
+		return true
+	end
+	-- Uso observado (sin bloquear): devuelve una función para terminarlo. Si otro lo estaba usando, conflicto.
+	function self.use(resource, owner)
+		local list = self.uses[resource] or {}
+		self.uses[resource] = list
+		for _, u in list do
+			if u.owner ~= owner then event("overlap", resource, owner, u.owner) end
+		end
+		local entry = { owner = owner, at = clock(), epoch = self.epoch }
+		table.insert(list, entry)
+		return function()
+			local i = table.find(list, entry)
+			if i then table.remove(list, i) end
+		end
+	end
+	-- ¿Quién está usando el recurso (aparte de except)? Para que una función espere en vez de pisar a otra.
+	function self.inUse(resource, except)
+		for _, u in self.uses[resource] or {} do
+			if u.owner ~= except then return u.owner end
+		end
+		return nil
+	end
+	-- ¿Alguien pidió el recurso a su dueño hace menos de `window` s y se le denegó? (para ceder el turno)
+	function self.wanted(resource, holder, window)
+		local now = clock()
+		for i = #self.events, 1, -1 do
+			local e = self.events[i]
+			if now - e.at > (window or 3) then break end
+			if e.kind == "denied" and e.resource == resource and e.detail == holder then return e.owner end
+		end
+		return nil
+	end
+	-- Personaje nuevo (reaparición): lo pedido con el anterior queda como referencia vieja. Los usos de la mano se
+	-- cierran (la herramienta del cuerpo anterior ya no existe); los turnos de movimiento se avisan, no se quitan.
+	function self.newEpoch(reason)
+		self.epoch += 1
+		for resource, l in self.leases do
+			if l.epoch < self.epoch then event("stale", resource, l.owner, reason) end
+		end
+		for resource, list in self.uses do
+			for _, u in list do event("stale_use", resource, u.owner, reason) end
+			table.clear(list)
+		end
+		return self.epoch
+	end
+	-- Turnos que llevan demasiado (posible recurso sin liberar)
+	function self.leaked(maxAge)
+		local out, now = {}, clock()
+		for resource, l in self.leases do
+			if now - l.at > (maxAge or 300) then table.insert(out, { resource = resource, owner = l.owner, age = now - l.at }) end
+		end
+		return out
+	end
+	-- Resumen para el Diagnóstico
+	function self.coordination()
+		local counts = {}
+		for _, e in self.events do counts[e.kind] = (counts[e.kind] or 0) + 1 end
+		local held = {}
+		for resource, l in self.leases do held[resource] = l.owner end
+		return { held = held, counts = counts, events = self.events, epoch = self.epoch }
+	end
 	return self
 end
 
 return Ownership
+end
+__modules["Protection"] = function(...)
+-- Protection: la DECISIÓN de la Huida automática (1.5.2), separada de Roblox para poder probarla con simulaciones.
+-- No añade capacidades: misma regla que antes (vida bajo el límite -> sube; vuelve al 90 % o a los 60 s), con los
+-- fallos de 1.5.0 corregidos (no se paraba al apagarla, decía "recuperado" al agotar el tiempo, seguía con el
+-- personaje viejo). También lee la vida de las dos fuentes posibles para DIAGNOSTICAR (no para decidir) por qué
+-- podría no saltar: Humanoid.Health frente al atributo Health del personaje que documenta EscaneoPersonaje.
+local Protection = {}
+
+Protection.RECOVER = 0.9 -- vuelve con el 90 % de la vida
+Protection.TIMEOUT = 60 -- como mucho 60 s arriba
+
+-- Lectura de vida. humanoid = { Health, MaxHealth } o nil; attrs = atributos del personaje (tabla) o nil.
+-- La decisión usa SOLO el Humanoid (como siempre). attr* son para el diagnóstico.
+function Protection.read(humanoid, attrs)
+	local r = { ok = false }
+	if humanoid then
+		r.health, r.max = tonumber(humanoid.Health), tonumber(humanoid.MaxHealth)
+		r.ok = r.health ~= nil and r.max ~= nil and r.max > 0
+		r.pct = r.ok and r.health / r.max or nil
+	end
+	if type(attrs) == "table" then
+		r.attrHealth, r.attrShield, r.attrMax = tonumber(attrs.Health), tonumber(attrs.Shield), tonumber(attrs.MaxHealth)
+	end
+	-- Indicio de que el juego lleva la vida en su atributo y no en el Humanoid (hipótesis: hay que verlo en el juego)
+	r.mismatch = (r.ok and r.attrHealth ~= nil and math.abs(r.attrHealth - r.health) > 0.5) == true
+	return r
+end
+
+-- Un paso de la máquina de estados. state = { escaping, since, character } (se modifica).
+-- input = { enabled, limit (%), reading, character (identidad), now, alive (hub) }
+-- Devuelve acción ("start" | "stop" | nil) y motivo.
+function Protection.step(state, input)
+	local r = input.reading or {}
+	if not state.escaping then
+		if not input.enabled then return nil, "apagada" end
+		if not r.ok then return nil, "sin personaje o sin vida legible" end
+		if r.health <= 0 then return nil, "muerto (esperando reaparición)" end
+		if r.pct < (input.limit or 35) / 100 then
+			state.escaping, state.since, state.character = true, input.now, input.character
+			return "start", string.format("vida %d%% < %d%%", math.floor(r.pct * 100 + 0.5), input.limit)
+		end
+		return nil, string.format("vigilando: vida %d%% (límite %d%%)", math.floor(r.pct * 100 + 0.5), input.limit)
+	end
+	local why
+	if input.alive == false then why = "hub cerrado"
+	elseif not input.enabled then why = "apagada durante la huida"
+	elseif input.character ~= state.character then why = "personaje nuevo (reaparición)"
+	elseif not r.ok or r.health <= 0 then why = "muerto durante la huida"
+	elseif r.pct >= Protection.RECOVER then why = "recuperado"
+	elseif input.now - state.since >= Protection.TIMEOUT then why = "tiempo agotado (sin recuperar)" end
+	if why then
+		state.escaping, state.since, state.character = false, nil, nil
+		return "stop", why
+	end
+	return nil, string.format("huyendo: vida %d%%", math.floor(r.pct * 100 + 0.5))
+end
+
+return Protection
 end
 __modules["Knowledge"] = function(...)
 -- Knowledge: consultas sobre el catálogo del juego (datos en src/generated/CatalogIndex.lua, generado por
@@ -5816,8 +7047,15 @@ local function lower(s) return tostring(s or ""):lower() end
 -- Aguanta índices incompletos (campos que faltan = vacíos) y entradas sin id (se ignoran: validate las informa).
 function Knowledge.new(index)
 	index = type(index) == "table" and index or {}
-	local self = setmetatable({ meta = index.meta or {}, list = {}, byId = {}, byName = {}, incoming = {} }, Knowledge)
+	local self = setmetatable({ meta = index.meta or {}, list = {}, byId = {}, byName = {}, incoming = {}, cache = {} }, Knowledge)
+	local lists = list(self.meta.lists)
 	for _, e in list(index.entities) do
+		-- esquema 3 (compacto): wiki = número de meta.lists, card solo si no es el nombre, srcEvidence. Se expande
+		-- aquí una vez a la forma del esquema 2 (source = { list, card } | { evidence }); el 2 se lee tal cual.
+		if type(e) == "table" and e.source == nil then
+			if e.wiki then e.source = { list = lists[e.wiki], card = e.card or e.name }
+			elseif e.srcEvidence then e.source = { evidence = e.srcEvidence } end
+		end
 		if type(e) == "table" and type(e.id) == "string" and self.byId[e.id] == nil then
 			self.byId[e.id] = e
 			table.insert(self.list, e)
@@ -5909,9 +7147,31 @@ end
 
 -- Búsqueda por texto (nombre, alias o id) con filtros. Orden: igual > empieza por > contiene; luego por nombre.
 -- Texto vacío = todo lo que pase el filtro. limit opcional.
+-- Clave de caché de una búsqueda (el catálogo no cambia en la sesión: el resultado de una búsqueda tampoco)
+local FILTER_KEYS = { "category", "verification", "group", "role", "contradictory", "incomplete", "has", "includeArchived", "archived" }
+local function cacheKey(q, filter)
+	local parts = { q }
+	for _, k in FILTER_KEYS do table.insert(parts, tostring(filter[k])) end
+	if filter.categories then table.insert(parts, table.concat(filter.categories, ",")) end
+	return table.concat(parts, "|")
+end
+Knowledge.CACHE_MAX = 64
+
 function Knowledge:search(text, filter, limit)
 	filter = filter or {}
 	local q = lower(text):gsub("^%s+", ""):gsub("%s+$", "")
+	local key = cacheKey(q, filter)
+	local cached = self.cache[key]
+	if cached then
+		self.cacheHits = (self.cacheHits or 0) + 1
+		local out = {}
+		for i, e in cached do
+			if limit and i > limit then break end
+			out[i] = e
+		end
+		return out
+	end
+	self.cacheMisses = (self.cacheMisses or 0) + 1
 	local scored = {}
 	for _, e in self.list do
 		if matches(e, filter) then
@@ -5932,11 +7192,14 @@ function Knowledge:search(text, filter, limit)
 		if a.score ~= b.score then return a.score > b.score end
 		return lower(a.e.name) < lower(b.e.name)
 	end)
-	local out = {}
+	local all, out = {}, {}
 	for i, s in scored do
-		if limit and i > limit then break end
-		out[i] = s.e
+		all[i] = s.e
+		if not limit or i <= limit then out[i] = s.e end
 	end
+	self.cacheSize = (self.cacheSize or 0) + 1
+	if self.cacheSize > Knowledge.CACHE_MAX then table.clear(self.cache); self.cacheSize = 1 end -- tope de memoria
+	self.cache[key] = all
 	return out
 end
 
@@ -6165,7 +7428,9 @@ function Knowledge.validate(index)
 			for _, field in { "aliases", "relations", "unknown", "contradictions", "facts", "abilities", "roles" } do
 				if e[field] ~= nil and type(e[field]) ~= "table" then table.insert(problems, where .. ": " .. field .. " no es lista") end
 			end
-			if e.source == nil and e.verification ~= "unknown" then table.insert(warnings, where .. ": sin fuente") end
+			if e.source == nil and e.wiki == nil and e.srcEvidence == nil and e.verification ~= "unknown" then
+				table.insert(warnings, where .. ": sin fuente")
+			end
 		end
 	end
 	for _, e in index.entities do
@@ -6190,249 +7455,645 @@ end
 
 return Knowledge
 end
+__modules["KnowledgeView"] = function(...)
+-- KnowledgeView: capa de presentación del catálogo para el explorador (y cualquier vista informativa). Sobre
+-- Knowledge: filtros agrupados (grupo, estado, papel), orden, búsqueda con alias, etiquetas traducidas, estado de
+-- verificación, datos desconocidos y navegación por entidades relacionadas con historial. Sin Roblox ni UI: devuelve
+-- textos ya formateados; el hub solo los pinta. Solo lee: nada de aquí se convierte en órdenes para el juego.
+local KnowledgeView = {}
+KnowledgeView.__index = KnowledgeView
+
+-- Grupos (combo "Mostrar"): ≤ 9 opciones para que la lista desplegable quepa en pantalla
+KnowledgeView.GROUPS = {
+	{ label = { "Todo", "All" }, filter = {} },
+	{ label = { "Mundo (islas y lugares)", "World (islands, places)" }, filter = { categories = { "island", "region", "location" } } },
+	{ label = { "NPCs", "NPCs" }, filter = { category = "npc" } },
+	{ label = { "Enemigos y jefes", "Enemies and bosses" }, filter = { category = "enemy" } },
+	{ label = { "Misiones y eventos", "Quests and events" }, filter = { categories = { "objective", "event" } } },
+	{ label = { "Objetos y armas", "Items and weapons" }, filter = { categories = { "item", "weapon" } } },
+	{ label = { "Frutas", "Fruits" }, filter = { category = "fruit" } },
+	{ label = { "Sistemas y progresión", "Systems & progression" }, filter = { categories = { "system", "mechanic" } } },
+	{ label = { "Información", "Info" }, filter = { category = "info" } },
+}
+-- Estado de la información
+KnowledgeView.STATUS = {
+	{ label = { "Cualquiera", "Any" }, filter = {} },
+	{ label = { "Confirmado", "Confirmed" }, filter = { verification = "confirmed" } },
+	{ label = { "Documentado", "Documented" }, filter = { verification = "documented" } },
+	{ label = { "Deducido", "Inferred" }, filter = { verification = "inferred" } },
+	{ label = { "Contradictorio", "Contradictory" }, filter = { contradictory = true } },
+	{ label = { "Incompleto", "Incomplete" }, filter = { incomplete = true } },
+	{ label = { "Con requisitos", "With requirements" }, filter = { has = "requirements" } },
+	{ label = { "Con recompensas", "With rewards" }, filter = { has = "rewards" } },
+	{ label = { "Archivado", "Archived" }, filter = { archived = "only" } },
+}
+-- Papel (para lo que la wiki marca: jefes, comerciantes, quien da misiones…)
+KnowledgeView.ROLES = {
+	{ label = { "Cualquiera", "Any" }, role = nil },
+	{ label = { "Jefe", "Boss" }, role = "boss" },
+	{ label = { "Élite", "Elite" }, role = "elite" },
+	{ label = { "Comerciante", "Merchant" }, role = "merchant" },
+	{ label = { "Da misiones", "Quest giver" }, role = "quest_giver" },
+}
+KnowledgeView.SORTS = {
+	{ label = { "Relevancia", "Relevance" }, key = "relevance" },
+	{ label = { "Nombre", "Name" }, key = "name" },
+	{ label = { "Estado (confirmado primero)", "Status (confirmed first)" }, key = "status" },
+	{ label = { "Categoría", "Category" }, key = "category" },
+}
+local STATUS_RANK = { confirmed = 1, inferred = 2, documented = 3, possibly_obsolete = 4, unknown = 5, archived = 6 }
+
+-- k = Knowledge; tr({es, en}) -> texto en el idioma actual
+function KnowledgeView.new(k, tr)
+	return setmetatable({ k = k, tr = tr or function(p) return p[1] end, query = "", group = 1, status = 1, role = 1,
+		sort = 1, results = {}, sel = 1, related = {}, relSel = 1, history = {}, focus = nil }, KnowledgeView)
+end
+
+local function merge(...)
+	local out = {}
+	for _, f in { ... } do for k, v in f do out[k] = v end end
+	return out
+end
+function KnowledgeView:filter()
+	local f = merge(KnowledgeView.GROUPS[self.group].filter, KnowledgeView.STATUS[self.status].filter)
+	f.role = KnowledgeView.ROLES[self.role].role
+	return f
+end
+function KnowledgeView:label(key) local p = self.k.LABELS[key]; return p and self.tr(p) or tostring(key) end
+
+-- Recalcula los resultados (búsqueda + filtros + orden). Vuelve a la primera y borra el historial.
+function KnowledgeView:run()
+	local list = self.k:search(self.query, self:filter())
+	local sortKey = KnowledgeView.SORTS[self.sort].key
+	if sortKey ~= "relevance" then
+		local lowerName = function(e) return e.name:lower() end
+		table.sort(list, function(a, b)
+			if sortKey == "status" then
+				local ra, rb = STATUS_RANK[a.verification] or 9, STATUS_RANK[b.verification] or 9
+				if ra ~= rb then return ra < rb end
+			elseif sortKey == "category" and a.category ~= b.category then
+				return self:label(a.category) < self:label(b.category)
+			end
+			return lowerName(a) < lowerName(b)
+		end)
+	end
+	self.results, self.sel, self.history, self.focus = list, 1, {}, nil
+	self:_related()
+	return #list
+end
+
+function KnowledgeView:set(field, value)
+	self[field] = value
+	return self:run()
+end
+function KnowledgeView:reset()
+	self.query, self.group, self.status, self.role, self.sort = "", 1, 1, 1, 1
+	return self:run()
+end
+
+-- Entidad que se está viendo: la elegida en la lista o, si se navegó por relacionadas, esa
+function KnowledgeView:current() return self.focus or self.results[self.sel] end
+
+-- Relacionadas útiles de la entidad actual (sin las menciones/enlaces entrantes: son ruido), sin repetir
+function KnowledgeView:_related()
+	local e = self:current()
+	local out, seen = {}, {}
+	for _, r in e and self.k:relations(e.id) or {} do
+		if r.entity and not seen[r.id] and (r.direction == "out" or (r.type ~= "mentions" and r.type ~= "links_to")) then
+			seen[r.id] = true
+			table.insert(out, { entity = r.entity, label = self:label(r.direction == "in" and ("in:" .. r.type) or r.type) })
+		end
+	end
+	self.related, self.relSel = out, 1
+end
+
+function KnowledgeView:move(step)
+	if self.focus then return false end -- dentro de una relacionada: primero "Volver"
+	if #self.results == 0 then return false end
+	self.sel = ((self.sel - 1 + step) % #self.results) + 1
+	self:_related()
+	return true
+end
+function KnowledgeView:nextRelated()
+	if #self.related == 0 then return false end
+	self.relSel = (self.relSel % #self.related) + 1
+	return true
+end
+-- Abre la relacionada marcada (guarda de dónde viene para "Volver")
+function KnowledgeView:openRelated()
+	local r = self.related[self.relSel]
+	if not r then return false end
+	table.insert(self.history, { focus = self.focus, relSel = self.relSel })
+	self.focus = r.entity
+	self:_related()
+	return true
+end
+function KnowledgeView:back()
+	local h = table.remove(self.history)
+	if not h then return false end
+	self.focus = h.focus
+	self:_related()
+	self.relSel = math.min(h.relSel, math.max(1, #self.related))
+	return true
+end
+
+local function short(self, verification)
+	return (self:label(verification):match("^(%S+)"))
+end
+
+-- Lista visible: contador, ventana de `rows` filas alrededor de la elegida, "?N" = datos desconocidos
+function KnowledgeView:listText(rows)
+	rows = rows or 7
+	local n = #self.results
+	if n == 0 then
+		return self.tr({ "Sin resultados. Prueba otro nombre o pulsa \"Restablecer filtros\".",
+			"No results. Try another name or press \"Reset filters\"." })
+	end
+	local out = { string.format(self.tr({ "%d resultados · %d/%d", "%d results · %d/%d" }), n, self.sel, n) }
+	local first = math.clamp(self.sel - math.floor(rows / 2), 1, math.max(1, n - rows + 1))
+	for i = first, math.min(n, first + rows - 1) do
+		local e = self.results[i]
+		local st = self.k:status(e.id)
+		local unknown = #(e.unknown or {})
+		table.insert(out, (i == self.sel and not self.focus and "▶ " or "    ") .. e.name .. " · " .. self:label(e.category) .. " · "
+			.. short(self, st.label) .. (unknown > 0 and (" · ?" .. unknown) or ""))
+	end
+	return table.concat(out, "\n")
+end
+
+-- Ficha: título, ruta de navegación, fuentes una por línea, secciones, relacionadas numeradas (▶ = la marcada)
+function KnowledgeView:sheetLines()
+	local e = self:current()
+	local sheet = e and self.k:sheet(e.id, self.tr)
+	if not sheet then return {} end
+	local out = { "■ " .. sheet.name .. " — " .. sheet.categoryLabel }
+	if #self.history > 0 then
+		table.insert(out, self.tr({ "  (desde la lista: ", "  (from the list: " }) .. #self.history .. self.tr({ " saltos; \"‹ Volver\" para regresar)", " jumps; \"‹ Back\" to return)" }))
+	end
+	for _, sec in sheet.sections do
+		if sec.key == "sources" then
+			table.insert(out, sec.title .. ":")
+			for _, item in sec.items do table.insert(out, "  • " .. item) end
+		elseif sec.key == "unknownSection" then
+			table.insert(out, "? " .. sec.title .. ": " .. table.concat(sec.items, ", "))
+		elseif sec.key ~= "relationsSection" then
+			table.insert(out, sec.title .. ": " .. table.concat(sec.items, " · "))
+		end
+	end
+	if #self.related > 0 then
+		table.insert(out, self:label("relationsSection") .. " (" .. #self.related .. "):")
+		for i, r in self.related do
+			table.insert(out, (i == self.relSel and "  ▶ " or "    ") .. r.label .. " › " .. r.entity.name)
+		end
+	end
+	return out
+end
+
+-- Opciones traducidas de un combo (GROUPS, STATUS, ROLES, SORTS) como pares {es, en} para la UI
+function KnowledgeView.options(list)
+	local out = {}
+	for i, o in list do out[i] = o.label end
+	return out
+end
+
+return KnowledgeView
+end
 __modules["CatalogIndex"] = function(...)
 -- GENERADO por tools/gen_catalog.js desde datos.json y data/overlay.json. No editar a mano.
 -- Índice compacto del catálogo (data/catalog.json tiene los textos). Lo consulta el módulo Knowledge.
 return {
-	meta = {schema = 2, version = "96e9c99e", wikiLastActivity = "2026-11-17T00:16:38.605Z", total = 235},
+	meta = {schema=3,version="96e9c99e",wikiLastActivity="2026-11-17T00:16:38.605Z",total=235,lists={"Enemies","World Events","Uncommon Devil Fruits","Rare Devil Fruits","Common Devil Fruits","Ultra Rare Devil Fruits","About","Points of Interest","NPCs (Locations)","Systems","Talents"}},
 	entities = {
-		{id = "enemy.abyss_crustacean", name = "Abyss Crustacean", category = "enemy", verification = "documented", roles = {"boss"}, source = {card = "Fishing"}, relations = {{"summoned_by", "item.deep_reach_rod", "wiki"}}, unknown = {"drops", "internalName", "level", "location", "respawnTime"}, facts = {{"spawn", "Each fish caught with the Deep Reach Rod has a 1% chance to hook the Abyss Crustacean (Lv. 3000), which drags you and everyone nearby into its trench."}, {"duration", "It has 2,000,000 health and 10 minutes before it sinks back into the dark."}}},
-		{id = "enemy.angry_bob", name = "Angry Bob", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Angry Bob"}, unknown = {"drops", "internalName", "level", "location"}, facts = {{"reward", "For now, just leave him alone, he doesn’t give much anyways."}}},
-		{id = "enemy.bandits", name = "Bandits", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Bandits"}, relations = {{"located_at", "island.windmill_and_town_island", "wiki"}}, unknown = {"drops", "internalName", "level"}},
-		{id = "enemy.blue_crab", name = "Blue Crab", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Blue Crab"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.boar", name = "Boar", category = "enemy", group = "other", verification = "confirmed", internal = {"Alive.NPCs 'Lv12 Boar'"}, source = {list = "Enemies", card = "Boar"}, evidence = {level = "confirmed", note = "Auto Quest (Defeat)"}, unknown = {"drops", "level", "location"}},
-		{id = "enemy.captain_blacksurf", name = "Captain Blacksurf", category = "enemy", group = "other", verification = "documented", roles = {"boss"}, source = {list = "Enemies", card = "Captain Blacksurf"}, relations = {{"links_to", "island.deepwaken_trench", "wiki-link"}, {"mentions", "island.deepwaken_trench", "name"}, {"located_at", "island.deepwaken_trench", "wiki"}, {"drops", "item.merlins_logbook", "wiki"}}, unknown = {"internalName", "level", "respawnTime"}},
-		{id = "enemy.cave_demons", name = "Cave Demons", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Cave Demons"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.crab", name = "Crab", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Crab"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.death_spire_knight", name = "Caballero de Death Spire (sin nombre)", category = "enemy", verification = "documented", roles = {"boss", "summoned"}, source = {card = "Death Spire"}, relations = {{"located_at", "island.death_spire", "wiki"}, {"summoned_by", "objective.offer_fruits", "wiki"}}, unknown = {"drops", "internalName", "level", "name", "respawnTime"}, facts = {{"spawn", "if you bring 13 devil fruits for the lower circle, and 3 for what’s at the top, you can summon a knight of steel, darkness, and evil."}}},
-		{id = "enemy.fishman_pirates", name = "Fishman Pirates", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Fishman Pirates"}, relations = {{"links_to", "enemy.captain_blacksurf", "wiki-link"}, {"mentions", "enemy.captain_blacksurf", "name"}}, unknown = {"drops", "internalName", "level", "location"}, facts = {{"reward", "Followers of Captain Blacksurf, not sure what he gives these subordinates of his in terms of payment for them to follow him so closely and blindly."}}},
-		{id = "enemy.freddy", name = "Freddy", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Freddy"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.gecko_moria", name = "Gecko Moria", category = "enemy", group = "halloween", verification = "possibly_obsolete", roles = {"boss", "seasonal"}, source = {list = "Enemies", card = "Gecko Moria"}, relations = {{"links_to", "island.halloween_island", "wiki-link"}, {"mentions", "island.halloween_island", "name"}, {"in_region", "region.halloween", "wiki-group"}, {"located_at", "island.halloween_island", "wiki"}}, unknown = {"drops", "internalName", "level", "respawnTime"}},
-		{id = "enemy.ghost", name = "Ghost", category = "enemy", group = "halloween", verification = "possibly_obsolete", source = {list = "Enemies", card = "Ghost"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, unknown = {"drops", "internalName", "level"}},
-		{id = "enemy.gunner_captain", name = "Gunner Captain", category = "enemy", group = "other", verification = "documented", roles = {"boss?"}, source = {list = "Enemies", card = "Gunner Captain"}, unknown = {"drops", "internalName", "level", "location"}, contradictions = {"El hub lo busca en IslandCaver; la wiki no dice su isla (Caver Island es 'The Gunners Cave Island': relación probable, no confirmada)."}},
-		{id = "enemy.gunslinger", name = "Gunslinger", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Gunslinger"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.gunslinger_brothers", name = "Gunslinger Brothers", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Gunslinger Brothers"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.gunslinger_elites", name = "Gunslinger Elites", category = "enemy", verification = "documented", roles = {"elite"}, source = {card = "The Expert"}, unknown = {"drops", "internalName", "level", "location", "members"}, facts = {{"requirement", "Elite: kill one of the Gunslinger Elites."}}},
-		{id = "enemy.marines", name = "Marines", category = "enemy", verification = "documented", roles = {"elite"}, source = {card = "Marine Base"}, relations = {{"located_at", "island.marine_base", "wiki"}}, unknown = {"drops", "internalName", "level"}, facts = {{"requirement", "A logia won't serve you well since they all know how to use Buso Haki."}}},
-		{id = "enemy.perona_ghost_princess", name = "Perona, Ghost Princess", aliases = {"Perona"}, category = "enemy", group = "halloween", verification = "possibly_obsolete", roles = {"boss", "seasonal", "summoned"}, source = {list = "Enemies", card = "Perona, Ghost Princess"}, relations = {{"in_region", "region.halloween", "wiki-group"}, {"summoned_by", "objective.light_candles", "wiki"}, {"located_at", "island.halloween_island", "wiki"}}, unknown = {"drops", "internalName", "level", "respawnTime"}, facts = {{"spawn", "If you light four candles near her house, she spawns in the center to haunt."}}},
-		{id = "enemy.purple_crab", name = "Purple Crab", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Purple Crab"}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.ryuma", name = "Ryuma", category = "enemy", group = "halloween", verification = "possibly_obsolete", roles = {"boss?", "seasonal"}, source = {list = "Enemies", card = "Ryuma"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, unknown = {"drops", "internalName", "level"}, contradictions = {"El hub lo trata como jefe; la wiki no lo llama jefe."}},
-		{id = "enemy.the_freds", name = "The Freds", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "The Freds"}, relations = {{"links_to", "enemy.freddy", "wiki-link"}, {"mentions", "enemy.freddy", "name"}}, unknown = {"drops", "internalName", "level", "location"}},
-		{id = "enemy.thieves", name = "Thieves", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Thieves"}, relations = {{"located_at", "island.windmill_and_town_island", "wiki"}}, unknown = {"drops", "internalName", "level"}},
-		{id = "enemy.thug", name = "Thug", category = "enemy", group = "other", verification = "documented", source = {list = "Enemies", card = "Thug"}, relations = {{"mentions", "island.sams_bar_and_pirates_land", "name"}, {"located_at", "island.sams_bar_and_pirates_land", "wiki"}}, unknown = {"drops", "internalName", "level"}},
-		{id = "enemy.vokun", name = "Vokun", category = "enemy", verification = "documented", roles = {"elite"}, source = {card = "The Expert"}, unknown = {"drops", "internalName", "level", "location"}, facts = {{"requirement", "Elite: kill Vokun."}}},
-		{id = "enemy.zombie", name = "Zombie", category = "enemy", group = "halloween", verification = "possibly_obsolete", source = {list = "Enemies", card = "Zombie"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, unknown = {"drops", "internalName", "level"}},
-		{id = "event.crew_seige", name = "Crew Seige", category = "event", verification = "documented", source = {list = "World Events", card = "Crew Seige"}, unknown = {"duration", "frequency", "location", "trigger"}, facts = {{"reward", "Those who win and claim the flag get rewarded."}}},
-		{id = "event.ghost_ship", name = "Ghost Ship", category = "event", verification = "documented", source = {list = "World Events", card = "Ghost Ship"}, relations = {{"rewards", "item.treasure_map", "wiki"}}, unknown = {"duration", "frequency", "location", "trigger"}, facts = {{"reward", "Defeat them for rewards and a mysterious Treasure Map."}}},
-		{id = "event.ghost_ship__archived", name = "Ghost Ship", category = "event", verification = "archived", source = {list = "World Events", card = "Ghost Ship"}},
-		{id = "event.treasure_rain", name = "Treasure Rain", category = "event", verification = "documented", source = {list = "World Events", card = "Treasure Rain"}, relations = {{"rewards", "item.treasure_chest", "wiki"}}, unknown = {"frequency", "location", "trigger"}, facts = {{"duration", "This event last for a short time so find the chest quickly before others."}, {"spawn", "15 chests spawn total."}, {"cost", "Rare Chest (Blue Glow):~25,000 Beri, ~5 Gems"}, {"cost", "Epic Chest (Purple Glow): ~50,000 Beri, ~20 Gems, ~2 Compasses"}, {"cost", "Legendary (Gold glow): ~200,000 Beri, ~35 Gems, ~4 Compasses"}}},
-		{id = "event.xp_boost", name = "Evento de EXP (multiplicador)", category = "event", verification = "confirmed", internal = {"workspace @XpEventEndsAt", "workspace @XpEventMultiplier"}, source = {evidence = "fila 'xp' de Inicio"}, evidence = {level = "confirmed"}, unknown = {"duration", "frequency", "location", "trigger"}},
-		{id = "fruit.barrier", name = "Barrier", aliases = {"Bari Bari No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Barrier"}, unknown = {"internalName"}, abilities = {{"Wall", "move", "25 Defense"}, {"Slam", "move", "50 Melee"}, {"Prison", "move", "300 Defense"}, {"Room", "move", "100 Defense"}, {"Barrier Bat", "move", "200 Melee"}, {"Barrier Body", "move", "400 Defense"}}},
-		{id = "fruit.bomb", name = "Bomb", aliases = {"Bomu Bomu No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Bomb"}, unknown = {"internalName"}, facts = {{"spawn", "Every strike carries a hidden detonation."}, {"requirement", "(Requires a Bare-Handed Melee Fighting Style | Deals an additional instance of explosive damage on top of normal melee damage | Scales with Melee Stat & Melee Affinity)"}}, abilities = {{"Explosive Touch", "passive", nil}, {"Bomb Punch", "move", "50 Melee"}, {"Bomb Boost", "move", "50 Melee"}, {"Booger Bomb", "move", "200 Sniper"}, {"Bomb Wave", "move", "300 Sniper"}, {"Full Body", "move", "400 Defense"}}},
-		{id = "fruit.candy", name = "Candy", aliases = {"Ame Ame No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Candy"}, unknown = {"internalName"}, facts = {{"reward", "Sweetness gives way to sharpness."}, {"spawn", "(Max Damage: 250 | Base Damage: 150 | Additional 10 Damage for every 0.1 Defense Affinity with Haki | Damage scales with Defense Affinity | Increases user's damage resistance by 15% × Defense Affinity)"}, {"duration", "(Max Damage: 6,000 | Projectile Size scales with Sniper Affinity and Charge | Slow duration: 2–4 seconds, scales with Affinity)"}, {"duration", "(Stun duration: 2–4 seconds, scales with Affinity)"}}, abilities = {{"Logia Reflex", "passive", nil}, {"Candy Blades", "move", "50 Sword"}, {"Spike Body", "move", "75 Defense"}, {"Jawbreaker", "move", "100 Sniper"}, {"Syrup Trap", "move", "125 Defense"}, {"Syrup Wave", "move", "150 Melee"}, {"Syrup Hook", "move", "175 Sniper"}}},
-		{id = "fruit.chilly", name = "Chilly", aliases = {"Hie Hie No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Chilly"}, unknown = {"internalName"}, facts = {{"reward", "Additionally, their mastery over freezing temperatures grants immunity to the hypothermic effects of Snow."}, {"duration", "(Max Damage: 2,000 | Maximum Freeze duration: 6 seconds | Can freeze Tsunamis created by Quake)"}}, abilities = {{"Logia Reflex", "passive", nil}, {"Freezing Punch", "move", "100 Melee"}, {"Chilly Sword", "move", "50 Sword"}, {"Ice Path", "move", "70 Melee"}, {"Ice Wave", "move", "400 Sniper"}}},
-		{id = "fruit.chop", name = "Chop", aliases = {"Bara Bara No Mi"}, category = "fruit", verification = "documented", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Chop"}, unknown = {"internalName"}, facts = {{"duration", "Once reaching the target, the arm will slash away repeatedly for ~10 seconds."}}, abilities = {{"Chop Choke", "move", "100 Melee"}, {"Chop Pursuit", "move", "150 Sword"}, {"Chop Car", "move", "200 Melee"}, {"Chop Buzzsaw", "move", "250 Sword"}, {"Chop Festival", "move", "300 Melee"}}},
-		{id = "fruit.clear", name = "Clear", category = "fruit", verification = "archived", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Clear"}, unknown = {"internalName"}},
-		{id = "fruit.clone", name = "Clone", aliases = {"Mane Mane No Mi"}, category = "fruit", verification = "archived", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Clone"}, unknown = {"internalName"}},
-		{id = "fruit.dark", name = "Dark", aliases = {"Yami Yami No Mi"}, category = "fruit", verification = "documented", rarity = "Ultra Rare", fruitType = "Special Paramecia", source = {list = "Ultra Rare Devil Fruits", card = "Dark"}, unknown = {"internalName"}, facts = {{"requirement", "You may be one with the darkness, but you now carry the burden of the supernatural, having a body that must bear its costs."}}, abilities = {{"Inexorable Touch", "passive", nil}, {"Dark Body", "passive", nil}, {"Cursed", "passive", nil}, {"Dark Charge", "move", nil}, {"Dark Vortex", "move", nil}, {"Black Hole", "move", nil}}},
-		{id = "fruit.diamond", name = "Diamond", aliases = {"Kira Kira No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Diamond"}, unknown = {"internalName"}, facts = {{"spawn", "(Damage Reduction starts at 35% w/ maxed Defense Stat | Increases by 2.5% for every 0.1 Defense Affinity | Knockback Resistance scales with Affinity | Cannot be disabled by stuns | Weighs down and sinks small boats while active)"}}, abilities = {{"Diamond Bar", "passive", nil}, {"Diamond Capacity", "passive", nil}, {"Recharge", "passive", nil}, {"Activation Cooldown", "passive", nil}, {"Break Cooldown", "passive", nil}, {"Diamond Body", "move", "20 Defense"}, {"Diamond Sword", "move", "50 Sword"}, {"Diamond Cluster", "move", "80 Defense"}}},
-		{id = "fruit.dough", name = "Dough", aliases = {"Mochi Mochi No Mi"}, category = "fruit", verification = "documented", rarity = "Ultra Rare", fruitType = "Special Paramecia", source = {list = "Ultra Rare Devil Fruits", card = "Dough"}, unknown = {"internalName"}, abilities = {{"Burning Mochi", "move", "300 Sniper"}, {"Dough Bazooka", "move", "250 Melee"}, {"Mochi Gatling", "move", "500 Melee"}, {"Donut Roll", "move", "300 Melee"}, {"Mochi Wasteland", "move", "450 Defense"}, {"Torque Mochi", "move", "500 Defense"}}},
-		{id = "fruit.flare", name = "Flare", aliases = {"Mera Mera No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Flare"}, unknown = {"internalName"}, facts = {{"requirement", "(Immune to Melee, Sword, and Gun attacks without Haki | Burn deals up to 350 damage per tick at maximum Affinity | Burn damage scales with the required stat of each ability | Burn can be removed by entering water)"}, {"spawn", "The user releases a tremendous wave of fire that expands horizontally in every direction, creating a 360-degree explosion of flames capable of striking opponents surrounding them."}, {"duration", "Charging takes approximately 15 seconds."}}, abilities = {{"Logia Reflex", "passive", nil}, {"Jet", "move", "100 Melee"}, {"Fire Fist", "move", "50 Sniper"}, {"Fire Wave", "move", "200 Defense"}, {"Flame Pillar", "move", "250 Defense"}, {"Flame Emperor", "move", "400 Sniper"}}},
-		{id = "fruit.float", name = "Float", aliases = {"Fuwa Fuwa No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Float"}, unknown = {"internalName"}, facts = {{"duration", "(Increased Dash Distance | Reduced Dash Cooldown | Holding Spacebar/Jump activates Floating | Float Duration scales with Haki, ranging from 5–10 seconds | Flight Disabled | Stuns interrupt Floating)"}, {"spawn", "The user summons six small rocks that begin floating and orbiting around their body while the ability is being charged."}, {"duration", "(Charge Time: 6 seconds | Cooldown: 6 seconds | Six projectiles | 1,500 Damage per Rock × Affinity | Decent-sized projectile hitboxes | Rocks visually orbit the user similarly to Vampire's Necromancy)"}, {"spawn", "The user summons two enormous stone slabs on opposite sides of a targeted location before forcefully bringing them together."}, {"requirement", "Its broad area of effect makes it particularly effective against groups of opponents, although its relatively short range requires careful positioning."}, {"spawn", "The summoned construct uses the same environmental material manipulation mechanic as Gravity Assault."}, {"spawn", "The user summons six enormous lions around their position, commanding them to charge toward a central location."}, {"duration", "(Six Giant Lions | 5,000 Damage × Affinity per Lion | Ground Spike deals an additional 5,000 Damage × Affinity | Applies Slow similar to Tsunami | Charge Time: 20 seconds | Cooldown: 2 minutes | Uses the same charge and cooldown system as Meteor)"}}, abilities = {{"Weightless", "passive", nil}, {"Rock Rush", "move", "50 Sniper"}, {"Crushing Pillars", "move", "100 Defense"}, {"Float Prison", "move", "150 Defense"}, {"Lion's Mane", "move", "200 Melee"}, {"Float Slab", "move", "250 Defense"}, {"Lion's Cage", "move", "400 Sniper"}}},
-		{id = "fruit.gas", name = "Gas", aliases = {"Gasu Gasu No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Gas"}, unknown = {"internalName"}, abilities = {{"Logia Reflex", "passive", nil}, {"Gas Form", "move", "200 Melee"}, {"Blue Sword", "move", "50 Sword"}, {"Airless World", "move", "100 Defense"}, {"Gastille", "move", "200 Sniper"}, {"Flammable", "move", "250 Defense"}, {"Gas Robe", "move", "300 Defense"}}},
-		{id = "fruit.gravity", name = "Gravity", aliases = {"Zushi Zushi No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Paramecia", source = {list = "Rare Devil Fruits", card = "Gravity"}, unknown = {"internalName"}, facts = {{"spawn", "By altering the gravity surrounding themselves and their opponents, the user can levitate, repel enemies, crush targets beneath immense pressure, and summon devastating celestial objects from the heavens."}, {"reward", "Even the strongest will eventually yield to gravity."}, {"spawn", "The user manipulates gravitational forces to summon a barrage of meteors from above, raining them down across the surrounding area."}, {"spawn", "After being summoned, the meteor begins its descent, eventually crashing into the battlefield with tremendous destructive force and destroying everything caught within its impact."}}, abilities = {{"Gravity Flying", "move", "200 Defense"}, {"Gravity Repel", "move", "75 Sniper"}, {"Gravity Assault", "move", "100 Sniper"}, {"Crushing Force", "move", "300 Defense"}, {"Meteor Shower", "move", "300 Sniper"}, {"Meteor Crash", "move", "400 Sniper"}}},
-		{id = "fruit.gum", name = "Gum", aliases = {"Gomu Gomu No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Gum"}, unknown = {"internalName"}, facts = {{"reward", "Gum is a Paramecia-type Devil Fruit that grants the user's body the properties of rubber, allowing them to stretch, extend, and propel their limbs with tremendous force."}, {"reward", "The user's rubber composition grants immunity to melee and gun attacks, as well as Rumble abilities, provided the attacker does not have Haki."}, {"requirement", "This transformation unlocks an entirely new set of Jet-based techniques."}, {"requirement", "Upon unlocking Second Gear at 100 Melee, the user gains access to the Jet ability moveset while transformed."}, {"requirement", "Even the greatest engines must eventually slow down."}}, abilities = {{"Rubber Body", "passive", nil}, {"Normal Mode", "move", nil}, {"Pistol", "move", "25 Melee"}, {"Bazooka", "move", "50 Melee"}, {"Gatling", "move", "75 Melee"}, {"Gum Rocket", "move", "100 Melee"}, {"2nd Gear", "move", "100 Melee"}, {"Jet Pistol", "move", "125 Melee"}, {"Jet Bazooka", "move", "150 Melee"}, {"Jet Gatling", "move", "175 Melee"}, {"Jet Rocket", "move", "200 Melee"}, {"Gear Down", "move", "100 Melee"}, {"Smelt & Hot", "move", nil}, {"Vampire", "move", nil}, {"Venom", "move", nil}, {"Magma", "move", nil}, {"Candy & Snow", "move", nil}, {"Dark", "move", nil}}},
-		{id = "fruit.hobby", name = "Hobby", aliases = {"Hobi Hobi No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Hobby"}, unknown = {"internalName"}, facts = {{"requirement", "Those under the effect of your transformation skill cannot willingly end themselves and must wait for their time to be their self again by the grace of your mercy."}, {"requirement", "(Requires the target to be transformed)"}}, abilities = {{"Transform", "move", "50 Melee"}, {"Revert", "move", "50 Melee"}, {"Target", "move", "150 Melee"}}},
-		{id = "fruit.hollow", name = "Hollow", aliases = {"Horo Horo No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Paramecia", source = {list = "Rare Devil Fruits", card = "Hollow"}, unknown = {"internalName"}, facts = {{"requirement", "(Float-type flight | Momentum affects movement speed | Projection is immune to damage | Physical body remains vulnerable | Required for Possession)"}, {"spawn", "The user summons a multitude of miniature Hollows that seek out nearby enemies, relentlessly pursuing and damaging their targets."}, {"spawn", "(75 Base Damage per Hollow | Haki Supported & Damage and number of mini-hollows spawned scales w/ Sniper Affinity)"}}, abilities = {{"Projection", "move", "100 Defense"}, {"Fade", "move", "100 Defense"}, {"Negative Hollow", "move", "100 Sniper"}, {"Special Hollow", "move", "300 Sniper"}, {"Mini-Hollow", "move", "200 Sniper"}}},
-		{id = "fruit.hot", name = "Hot", aliases = {"Atsu Atsu No Mi"}, category = "fruit", verification = "documented", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Hot"}, unknown = {"internalName"}, facts = {{"reward", "Hot is a paramecia-type that give the user the ability to produce and control an unprecedented amount of heat."}, {"spawn", "Unleash every ounce of accumulated heat in a devastating burst."}}, abilities = {{"Nose Jet", "move", "200 Defense"}, {"Hot Body", "move", "50 Defense"}, {"Overheat", "move", "250 Defense"}, {"Overheat", "move", "C"}, {"Damage Formula", "move", nil}, {"Heatwave", "move", "300 Defense"}, {"Damage Formula", "move", nil}}},
-		{id = "fruit.light", name = "Light", aliases = {"Pika Pika No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Light"}, unknown = {"internalName"}, facts = {{"spawn", "A continuous stream of concentrated light, growing increasingly destructive with every passing moment."}, {"spawn", "(Duration: 5 seconds | 20 Hits | Hits every 0.25 seconds | Starting Damage: 10, scaling up to 20 with Affinity | Damage progressively increases with each hit | Starting Damage scales with Affinity)"}}, abilities = {{"Logia Reflex", "passive", nil}, {"Light Sword", "move", "100 Sword"}, {"Light Blast", "move", "20 Sniper"}, {"Yata Mirror", "move", "300 Melee"}, {"Light Beam", "move", "250 Sniper"}, {"Sacred Jewels", "move", "300 Defense"}}},
-		{id = "fruit.love", name = "Love", aliases = {"Mero Mero No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Love"}, unknown = {"internalName"}, abilities = {{"Petrified Vulnerability", "passive", nil}, {"Petrify", "move", "25 Defense"}, {"Glare", "move", "100 Sniper"}, {"Pistol Kiss", "move", "150 Sniper"}, {"Beam", "move", "200 Sniper"}, {"Slave Arrow", "move", "250 Sniper"}, {"Arrow Storm", "move", "300 Sniper"}}},
-		{id = "fruit.luck", name = "Luck", aliases = {"Raki Raki No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Luck"}, unknown = {"internalName"}, facts = {{"reward", "Its unique mechanics revolve around a Luck Bar, rewarding fortunate outcomes while allowing the user to gradually improve the effectiveness of their abilities."}, {"duration", "(Removes current stun | Increased Luck for 5 seconds)"}, {"reward", "The user activates a roulette-style slot machine, rolling for a variety of potential rewards."}, {"reward", "However, matching three identical symbols grants a special reward depending on the result."}, {"duration", "- 3 Skulls: The user is stunned for 1 second but receives additional Luck Bar."}, {"reward", "- 3 Sevens: Increases the user's health regeneration and significantly enhances the luck effectiveness of other abilities, preventing them from producing unfavorable rewards."}, {"cost", "There is a 1-in-6 chance of the coin landing on its damaging outcome, dealing damage equivalent to 25% of the target's health multiplied by the user's Sniper Affinity."}, {"reward", "Any other result grants the user additional Luck Bar based on their Sniper Affinity."}, {"requirement", "When the user is already benefiting from luck-enhancing effects granted by other abilities, the probability of obtaining the damaging outcome increases to 1-in-3."}, {"spawn", "The user summons a golden skull that radiates an aura of luck, temporarily enhancing their fortune and draining the health of nearby opponents."}, {"duration", "(Luck enhancement lasts 5 seconds × Defense Affinity | Nearby opponents lose 2.5–5% of their health per second | Fortune's Purge detonates the skull for additional damage)"}}, abilities = {{"Fortune's Favor", "passive", nil}, {"Fortune's Purge", "move", nil}, {"Slot Machine", "move", nil}, {"Dice Roll", "move", nil}, {"Coin Throw", "move", nil}, {"Golden Casino", "move", nil}}},
-		{id = "fruit.magma", name = "Magma", aliases = {"Magu Magu No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Magma"}, unknown = {"internalName"}, facts = {{"reward", "Their elemental nature also grants natural resistance against other forms of heat and elemental attacks."}, {"reward", "While Magma Body is active, the user's intense temperature grants immunity to the slowing effects of Snow."}, {"reward", "(Max Damage: 400 | Applies Burn | Burn damage scales with Defense Affinity | Grants immunity to Snow's Slow while active)"}, {"duration", "(Max Damage: 6,000 | Chargeable | Magma Burn deals up to 200 damage over time | Burn duration: 20 seconds)"}, {"spawn", "The longer the ability is charged, the higher the magma fists spawn, allowing them to descend from greater heights and gradually grow larger as they fall."}}, abilities = {{"Logia Reflex", "passive", nil}, {"Magma's Dominance", "passive", nil}, {"Magma Body", "move", "200 Defense"}, {"Magma Pool", "move", "20 Defense"}, {"Great Eruption", "move", "50 Melee"}, {"Magma Flow", "move", "200 Sniper"}, {"Volcanic Leap", "move", "150 Melee"}, {"Magma Rain", "move", "400 Melee"}}},
-		{id = "fruit.ope", name = "Ope", aliases = {"Ope Ope No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Paramecia", source = {list = "Rare Devil Fruits", card = "Ope"}, unknown = {"internalName"}, facts = {{"reward", "Unlike most Devil Fruits, its abilities rely heavily on stamina management, rewarding users who carefully manage their resources and control the battlefield."}, {"spawn", "Every operation comes at a cost."}, {"requirement", "- Stamina Consumption: All Ope abilities require stamina to activate."}, {"reward", "- Kill Reward: Killing another player restores 50% of the user's stamina."}, {"requirement", "(Size scales with Defense and Defense Affinity | Required to use all other Ope abilities | Stamina regeneration is reduced while active )"}, {"duration", "(150 Stamina per use | Maximum Damage: 50% of target's maximum HP | Disables the target's Devil Fruit abilities for 2 seconds upon crushing the heart | Does not award Bounty or Beri upon killing the target)"}, {"duration", "(Maximum HP Reduction: 25% × Sword Affinity | Duration: 5 seconds × Sword Affinity | Uses Sword Affinity | Maximum HP reduction is not direct damage | Healing is capped at the temporarily reduced maximum HP)"}}, abilities = {{"Stamina Bar", "passive", nil}, {"Room", "move", "40 Defense"}, {"Shambles", "move", "100 Defense"}, {"Severance", "move", "200 Sword"}, {"Scalpel", "move", "400 Sword"}, {"Gamma Knife", "move", "300 Sword"}}},
-		{id = "fruit.phoenix", name = "Phoenix", aliases = {"Tori Tori No Mi"}, category = "fruit", verification = "documented", rarity = "Ultra Rare", fruitType = "Mythical Zoan", source = {list = "Ultra Rare Devil Fruits", card = "Phoenix"}, unknown = {"internalName"}, facts = {{"reward", "Phoenix is a Zoan-type devil fruit that grants the user the ability to turn into a phoenix and phoenix hybrid at will, as well as granting immense healing power to themselves and those around the user."}}, abilities = {{"Phoenix Flames", "passive", nil}}},
-		{id = "fruit.plasma", name = "Plasma", aliases = {"Zuma Zuma No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Paramecia", source = {list = "Rare Devil Fruits", card = "Plasma"}, unknown = {"internalName"}, facts = {{"requirement", "The sphere automatically attacks any opponents who venture sufficiently close, dealing continuous damage without requiring the user to manually target them."}, {"spawn", "The user releases a tremendous burst of plasma in every direction, damaging nearby opponents caught within its radius."}, {"spawn", "(Maximum Damage: 7,200 | Damage starts at 4,200 with maximum Defense and increases by 300 for every 0.1 Defense Affinity with Haki)"}}, abilities = {{"Logia Reflex", "passive", nil}, {"Energize", "move", "80 Melee"}, {"Plasma Coil", "move", "180 Sniper"}, {"Plasma Burst", "move", "240 Defense"}, {"Plasma Cannon", "move", "360 Sniper"}}},
-		{id = "fruit.pumpkin", name = "Pumpkin", aliases = {"Kabo Kabo No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", source = {list = "Rare Devil Fruits", card = "Pumpkin"}, unknown = {"internalName"}, facts = {{"spawn", "Pumpkin is a non-cannon seaonsal-born paramecia-type Devil Fruit that allows the user to summon and manipulate pumpkins, vines, and supernatural plant-based constructs."}, {"spawn", "The user summons a collection of vines that erupt from the ground at a targeted location, ensnaring anyone caught within their reach."}, {"duration", "(Max Range: 120 studs | Damage: 900 | Area Radius: 11–16 studs | Root Duration: 1.6 seconds | Rooted opponents can still attack | 9-second cooldown)"}, {"duration", "(Damage Reduction: 80–88% | Duration: 3.5–4.5 seconds | Burst Damage: 700 | Explosion Radius: 13–17 studs | Cooldown: 15 seconds after the ability ends | Stuns break the shell without triggering its explosion)"}, {"spawn", "Additional lanterns are gathered every 0.4 seconds, allowing the user to build up a devastating volley of explosive projectiles."}, {"spawn", "(Duration: 7 seconds | Area Width: 22–30 studs | Reduces enemy movement speed by 50% | Pumpkin eruption every 0.5–0.7 seconds | 160 Damage per tick| Damage cannot be dodged | Stuns do not terminate the ability | 20-second cooldown)"}, {"duration", "- Duration: 20–30 seconds."}, {"duration", "- Vine Snare: Root duration increases from 1.6 to 2.2 seconds."}, {"duration", "(Cooldown: 60 seconds after the transformation ends)"}}, abilities = {{"Pumpkin Bomb", "move", "50 Sniper"}, {"Vine Snare", "move", "100 Defense"}, {"Pumpkin Shield", "move", "150 Defense"}, {"Lantern Barrage", "move", "250 Sniper"}, {"Patch Field", "move", "350 Defense"}, {"Pumpking Form", "move", "450 Defense"}, {"Transformation Effects", "move", nil}, {"Enhanced Ability Interactions", "move", nil}}},
-		{id = "fruit.quake", name = "Quake", aliases = {"Gura Gura No Mi"}, category = "fruit", verification = "documented", rarity = "Ultra Rare", fruitType = "Paramecia", source = {list = "Ultra Rare Devil Fruits", card = "Quake"}, unknown = {"internalName"}, facts = {{"spawn", "Summon two tsunamis from both the left and right of the user."}, {"spawn", "The ground beneath your foes will be their downfall, every tremor comes unseen."}, {"spawn", "The user summons pillars of earth that deal damage."}}, abilities = {{"Seismic Wave", "move", nil}}},
-		{id = "fruit.rumble", name = "Rumble", aliases = {"Goro Goro No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Rumble"}, unknown = {"internalName"}, facts = {{"spawn", "By harnessing tremendous electrical energy, the user can summon lightning strikes, unleash devastating electrical bursts, and travel across the battlefield through instantaneous lightning teleports."}, {"spawn", "However, with sufficient charge, the technique changes entirely: instead of firing a beam, the user summons a darkened cloud above the targeted location, calling down a devastating lightning strike upon the area."}, {"spawn", "(Damage: 600 in beam form or up to 12,000 in charged form | Range and Damage scale with Affinity | Charged form summons a lightning cloud above the target location)"}, {"spawn", "Zeus heeds your call, summon a giant storm cloud overhead, unleashing a relentless barrage of lightning bolts upon the battlefield."}}, abilities = {{"Logia Reflex", "passive", nil}, {"Lightning Teleport", "passive", nil}, {"Rumble Staff", "move", "100 Sword"}, {"El Thor", "move", "200 Sniper"}, {"Lightning Blitz", "move", "50 Melee"}, {"Overload", "move", "100 Defense"}, {"Thunderstorm", "move", "400 Defense"}}},
-		{id = "fruit.sand", name = "Sand", aliases = {"Suna Suna No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Sand"}, unknown = {"internalName"}, facts = {{"spawn", "By controlling the shifting sands, the user can summon devastating sand formations, create bladed weapons, and unleash powerful sandstorms capable of trapping opponents."}}, abilities = {{"Logia Reflex", "passive", nil}, {"Sand Flying", "move", "100 Melee"}, {"Sand Spike", "move", "50 Sniper"}, {"Desert Spada", "move", "150 Sword"}, {"Sandstorm", "move", "100 Defense"}}},
-		{id = "fruit.shadow", name = "Shadow", aliases = {"Kage Kage No Mi"}, category = "fruit", verification = "possibly_obsolete", rarity = "Rare", fruitType = "Paramecia", source = {list = "Rare Devil Fruits", card = "Shadow"}, unknown = {"internalName"}, facts = {{"spawn", "(3,200 Damage per Hit | Attacks every 4 seconds | Pursuit Duration: 10 seconds | Maximum Tracking Range: 200 studs)"}, {"spawn", "(Punches every 0.75 seconds | Shadow Wave every 3.5 seconds | Shadow Wave Damage: 1,200 | Shadow Wave can hit airborne targets)"}, {"spawn", "The user gathers shadows to unleash an enormous explosion of destructive energy, with its initial blast becoming stronger for every shadow consumed."}, {"spawn", "(Initial Explosion: 4,000 Damage + 1,000 per Shadow | Increased Explosion Radius | Continuous Aura: 700 Damage every 2 seconds | 40% Damage Reduction | 40-second cooldown)"}}, abilities = {{"Brick Bat", "move", nil}, {"Kage Kiri", "move", nil}, {"Doppelman", "move", nil}, {"Kagemusha", "move", nil}, {"Shadow Zombie", "move", nil}, {"Shadow's Asgard", "move", nil}}},
-		{id = "fruit.slip", name = "Slip", aliases = {"Sube Sube No Mi"}, category = "fruit", verification = "documented", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Slip"}, unknown = {"abilities", "internalName"}},
-		{id = "fruit.smelt", name = "Smelt", aliases = {"Gutsu Gutsu No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "Smelt"}, unknown = {"internalName"}, facts = {{"reward", "The user's molten composition grants immunity to Flare and Magma attacks, allowing them to withstand the intense heat of these elements without suffering damage."}, {"requirement", "(Speed scales with Defense Affinity | Haki must remain active to retain the increased damage after activation)"}}, abilities = {{"Molten Body", "passive", nil}, {"Molten Sword", "move", "50 Sword"}, {"Silver Body", "move", "20 Defense"}, {"Spew", "move", "50 Defense"}, {"Ore Feast", "move", "100 Defense"}}},
-		{id = "fruit.smoke", name = "Smoke", aliases = {"Moku Moku No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Smoke"}, unknown = {"internalName"}, abilities = {{"Fly", "move", "100 Melee"}, {"White Out", "move", "100 Melee"}, {"White Fist", "move", "50 Melee"}, {"Whiteout Burst", "move", "300 Defense"}, {"Smoke Screen", "move", "350 Defense"}}},
-		{id = "fruit.snow", name = "Snow", aliases = {"Yuki Yuki No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Logia", source = {list = "Rare Devil Fruits", card = "Snow"}, unknown = {"internalName"}, facts = {{"requirement", "(Requires contact with another player to apply Hypothermia | Hypothermia deals 395 damage per tick for 15 ticks at 2.0 Defense Affinity and maximum Defense)"}, {"duration", "(Hypothermia deals 500 damage per tick | Size scales with Defense and Affinity | Both variants disappear after 10 seconds)"}}, abilities = {{"Logia Reflex", "passive", nil}, {"Snow Globe", "move", "100 Defense"}, {"Snow Body", "move", "100 Defense"}, {"Snow Pellet", "move", "150 Sniper"}, {"Snow Angel", "move", "200 Defense"}, {"Snow Boulder", "move", "100 Sniper"}, {"Snow Ring", "move", "200 Defense"}}},
-		{id = "fruit.spin", name = "Spin", aliases = {"Fruit Fruit No Mi"}, category = "fruit", verification = "documented", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Spin"}, unknown = {"abilities", "internalName"}},
-		{id = "fruit.spring", name = "Spring", aliases = {"Bane Bane No Mi"}, category = "fruit", verification = "confirmed", rarity = "Common", fruitType = "Paramecia", internal = {"Workspace.Instances.Drops 'Spring Fruit' (FruitItem = Spring)"}, source = {list = "Common Devil Fruits", card = "Spring"}, evidence = {level = "confirmed"}, abilities = {{"Jump", "move", "20 Melee"}}},
-		{id = "fruit.string", name = "String", aliases = {"Ito Ito No Mi"}, category = "fruit", verification = "documented", rarity = "Uncommon", fruitType = "Paramecia", source = {list = "Uncommon Devil Fruits", card = "String"}, unknown = {"internalName"}, facts = {{"duration", "The web stays up for around 5 seconds."}}, abilities = {{"Release", "move", "10 Sniper"}, {"Tether", "move", "50 Sniper"}, {"Sky String", "move", "50 Sniper"}, {"Flapping Thread", "move", "250 Sniper"}, {"Bird Cage", "move", "300 Defense"}, {"God Thread", "move", "400 Sniper"}}},
-		{id = "fruit.swim", name = "Swim", aliases = {"Sui Sui No Mi"}, category = "fruit", verification = "documented", rarity = "Common", fruitType = "Paramecia", source = {list = "Common Devil Fruits", card = "Swim"}, unknown = {"internalName"}, abilities = {{"Swim", "move", "80 Melee"}, {"Dive", "move", "100 Melee"}}},
-		{id = "fruit.vampire", name = "Vampire", aliases = {"Batto Batto No Mi"}, category = "fruit", verification = "documented", rarity = "Ultra Rare", fruitType = "Mythical Zoan", source = {list = "Ultra Rare Devil Fruits", card = "Vampire"}, unknown = {"internalName"}, facts = {{"spawn", "Every soul taken is another servant waiting to be awakened."}, {"reward", "Soul Collection: Killing an NPC or player through any means causes them to drop a soul, which can be collected and used for Necromancy."}, {"reward", "This ability grants increased movement speed and provides 50% damage reduction while active."}, {"spawn", "The user summons a swarm of bats that relentlessly pursue an individual target, rapidly dealing special damage."}}, abilities = {{"Soul Reaper", "passive", nil}, {"Sanguine Vampiris", "move", "50 Sword"}, {"Hypnosis", "move", "300 Sniper"}, {"Shadow Step", "move", "100 Melee"}, {"Necromancy", "move", "100 Defence"}, {"Bat Swarm", "move", "200 Sniper"}, {"Transform", "move", "400 Melee"}}},
-		{id = "fruit.venom", name = "Venom", aliases = {"Doku Doku No Mi"}, category = "fruit", verification = "documented", rarity = "Rare", fruitType = "Paramecia", source = {list = "Rare Devil Fruits", card = "Venom"}, unknown = {"internalName"}, facts = {{"spawn", "- Fast Venom: Deals damage every 0.1 seconds."}, {"spawn", "- Normal/Medium Venom: Deals damage every 0.4 seconds."}, {"spawn", "- Slow Venom: Deals damage every 0.6 seconds."}, {"requirement", "Requires Poison Coat to be active and will deactivate it upon use."}, {"spawn", "Travel through your summoned Venom Hydra, entering its body and emerging from its mouth, allowing long-distance movement similar to Light's Yata Mirror."}}, abilities = {{"Venom Immunity", "passive", nil}, {"Venom Composition", "passive", nil}, {"Damage Over Time", "passive", nil}, {"Venom Road", "passive", nil}, {"Venom Demon Interaction", "passive", nil}, {"Poison Breath", "move", "50 Sniper"}, {"Poison Coat", "move", "200 Defense"}, {"Venom Hydra", "move", "400 Sniper"}, {"Chloro Ball", "move", "400 Sniper"}, {"Venom Demon Interaction", "move", nil}, {"Venom Demon", "move", "500 Defense"}}},
-		{id = "info.credits", name = "Credits", category = "info", verification = "documented", source = {list = "About", card = "Credits"}},
-		{id = "info.credits__archived", name = "Credits", category = "info", verification = "archived", source = {list = "About", card = "Credits"}, facts = {{"requirement", "The simplicity of the game kept many players hooked, and albeit a rather addictive, unique, and fun fruit obtainment method."}}},
-		{id = "info.info", name = "Info", category = "info", verification = "archived", source = {list = "About", card = "Info"}},
-		{id = "info.legendary_mode", name = "Legendary Mode", category = "info", verification = "documented", source = {list = "About", card = "Legendary Mode"}, relations = {{"links_to", "island.mountain_island", "wiki-link"}, {"mentions", "island.mountain_island", "name"}}, facts = {{"requirement", "To obtain Legendary Mode, players must max out every stat except buso and/or ken haki, achieve a bounty of 10 million, and have eaten a devil fruit."}, {"requirement", "### “_TO KNOW EVERYTHING, YOU MUST GIVE… EVERYTHING._”"}}},
-		{id = "info.primordial", name = "Primordial", category = "info", verification = "documented", source = {list = "About", card = "Primordial"}, facts = {{"requirement", "The simplicity of the game kept many players hooked, and albeit a rather addictive, unique, and fun fruit obtainment method was one the greatest things to look forward to, alongside it’s unique and primary devil fruit mechanic: Legendary Mode."}}},
-		{id = "info.rarity_boxes", name = "Rarity Boxes", category = "info", verification = "unknown", source = {list = "About", card = "Rarity Boxes"}, unknown = {"description"}},
-		{id = "info.stats_and_affinity", name = "Stats & Affinity", category = "info", verification = "documented", source = {list = "About", card = "Stats & Affinity"}, facts = {{"requirement", "You level these up to increase devil fruit damage, weapon damage, effects, and unlock skills attuned to that specific stat."}}},
-		{id = "island.abandoned_base", name = "Abandoned Base", category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Abandoned Base"}, unknown = {"internalName"}, facts = {{"requirement", "There must’ve been a reason for it long ago considering the watch towers placement."}}},
-		{id = "island.big_snow", name = "Big Snow", category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Big Snow"}, unknown = {"internalName"}},
-		{id = "island.caver_island", name = "Caver Island", aliases = {"The Gunners Cave Island"}, category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandCaver"}, source = {list = "Points of Interest", card = "Caver Island"}, evidence = {level = "inferred", note = "QuestCaver (Sheriff Dale) en ella"}, relations = {{"mentions", "npc.krusch", "name"}}},
-		{id = "island.cliff_tops", name = "Cliff Tops", category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandCliffs"}, source = {list = "Points of Interest", card = "Cliff Tops"}, evidence = {level = "inferred"}},
-		{id = "island.clover_isle", name = "Clover Isle", aliases = {"Expertise Island"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Clover Isle"}, relations = {{"links_to", "npc.the_expert", "wiki-link"}, {"mentions", "npc.the_expert", "name"}}, unknown = {"internalName"}},
-		{id = "island.crab_isle", name = "Crab Isle", category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.Island15"}, source = {list = "Points of Interest", card = "Crab Isle"}, evidence = {level = "inferred", note = "tiene QuestCrabIsle al lado"}},
-		{id = "island.crescent", name = "Crescent", category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Crescent"}, unknown = {"internalName"}},
-		{id = "island.death_spire", name = "Death Spire", category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Death Spire"}, unknown = {"internalName"}, facts = {{"spawn", "They say if you bring 13 devil fruits for the lower circle, and 3 for what’s at the top, you can summon a knight of steel, darkness, and evil."}}},
-		{id = "island.deepwaken_trench", name = "Deepwaken Trench", category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandDeepwake"}, source = {list = "Points of Interest", card = "Deepwaken Trench"}, evidence = {level = "inferred", note = "nombre interno visto; correspondencia por nombre"}, relations = {{"mentions", "enemy.captain_blacksurf", "name"}}, facts = {{"spawn", "Every once in a while, the town’s champion swims by to challenge any of powerful locals."}, {"reward", "Be wary, he’s not an easy foe, and if by some miracle you do win, he may be humble enough to give you his surfboard."}}},
-		{id = "island.galley_isle", name = "Galley Isle", aliases = {"Plaza"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Galley Isle"}, relations = {{"mentions", "npc.fish_merchant", "name"}}, unknown = {"internalName"}},
-		{id = "island.gull_rock", name = "Gull Rock", aliases = {"Not much is on this rock"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Gull Rock"}, unknown = {"internalName"}},
-		{id = "island.halloween_island", name = "Halloween Island", aliases = {"Moria’s Land", "Shadow Island", "Spooky Island"}, category = "island", group = "halloween", verification = "inferred", internal = {"Map.Islands.IslandHalloween"}, source = {list = "Points of Interest", card = "Halloween Island"}, evidence = {level = "inferred", note = "nombre interno visto en 1.3.0"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, facts = {{"reward", "Or Shadow Island, considering the creepy vibes this place gives off, is a seasonal island that’s appeared from the fog this Halloween to grant several tricks… and a new treat."}, {"spawn", "Do not fear though, explore this island before it vanishes sometimes late Fall."}}},
-		{id = "island.jungle_island", name = "Jungle Island", aliases = {"The Jungle"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Jungle Island"}, unknown = {"internalName"}},
-		{id = "island.marine_base", name = "Marine Base", aliases = {"Marine Fort"}, category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.Island4"}, source = {list = "Points of Interest", card = "Marine Base"}, evidence = {level = "inferred", note = "tiene QuestMarine al lado"}, relations = {{"mentions", "enemy.marines", "name"}}},
-		{id = "island.merlins_island", name = "Merlin's Island", aliases = {"Merlin’s Island"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Merlin's Island"}, unknown = {"internalName"}},
-		{id = "island.mountain_island", name = "Mountain Island", category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandMountain"}, source = {list = "Points of Interest", card = "Mountain Island"}, evidence = {level = "inferred"}},
-		{id = "island.pyramid", name = "Pyramid", aliases = {"Pyramid Island"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Pyramid"}, unknown = {"internalName"}},
-		{id = "island.race_track_island", name = "Race Track Island", category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Race Track Island"}, unknown = {"internalName"}},
-		{id = "island.rasputins_tower", name = "Rasputin's Tower", category = "island", verification = "archived", source = {list = "Points of Interest", card = "Rasputin's Tower"}, unknown = {"internalName"}},
-		{id = "island.revelry_island", name = "Revelry Island", category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Revelry Island"}, unknown = {"internalName"}, facts = {{"reward", "The drinks are a life saver, and provide a boost far greater than what Sam’s bartender might give."}}},
-		{id = "island.rot_island", name = "Rot Island", aliases = {"Rotted Island"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Rot Island"}, unknown = {"internalName"}},
-		{id = "island.sams_bar_and_pirates_land", name = "Sam's Bar & Pirate's Land", aliases = {"Sam’s Bar", "Pirate's Land", "Sam's Bar"}, category = "island", group = "other", verification = "confirmed", internal = {"Map.Islands.IslandPirate"}, source = {list = "Points of Interest", card = "Sam's Bar & Pirate's Land"}, evidence = {level = "confirmed", note = "QuestMerchant2 'Quest Man' (~ -1305, 217, -1352); compass reclamado"}},
-		{id = "island.sand_dunes", name = "Sand Dunes", aliases = {"The Dunes"}, category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandSandCastle"}, source = {list = "Points of Interest", card = "Sand Dunes"}, evidence = {level = "inferred", note = "los Fred y su NPC están ahí"}, relations = {{"mentions", "npc.fortune_teller", "name"}, {"mentions", "enemy.the_freds", "name"}}, facts = {{"reward", "There’s a fortune teller in the back who gives strange compasses… nothing likes Sam’s."}}},
-		{id = "island.smith_island", name = "Smith Island", category = "island", group = "other", verification = "unknown", source = {list = "Points of Interest", card = "Smith Island"}, unknown = {"description", "internalName"}},
-		{id = "island.snowy_island", name = "Snowy Island", aliases = {"Little Snow"}, category = "island", group = "other", verification = "documented", source = {list = "Points of Interest", card = "Snowy Island"}, unknown = {"internalName"}},
-		{id = "island.tree_island", name = "Tree Island", aliases = {"Bob Land"}, category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandTREEA"}, source = {list = "Points of Interest", card = "Tree Island"}, evidence = {level = "inferred"}, relations = {{"mentions", "npc.calm_bob", "name"}}},
-		{id = "island.windmill_and_town_island", name = "Windmill & Town Island", aliases = {"Spawn Islands", "Windmill Island", "Town Island"}, category = "island", group = "other", verification = "inferred", internal = {"Map.Islands.IslandWindmill", "Map.Islands.IslandTown"}, source = {list = "Points of Interest", card = "Windmill & Town Island"}, evidence = {level = "inferred", note = "la wiki junta dos islas del juego"}, contradictions = {"La wiki junta en una tarjeta dos islas que en el juego son modelos distintos (IslandWindmill, IslandTown)."}, facts = {{"spawn", "Spawn Islands,"}}},
-		{id = "item.black_abyss_crab_toy", name = "Black Abyss Crab Toy", category = "item", verification = "documented", source = {card = "Fishing"}},
-		{id = "item.blessed_rod", name = "Blessed Rod (Tier 4)", category = "item", verification = "documented", source = {card = "Fishing"}, relations = {{"requires", "item.super_rod", "wiki"}, {"requires", "objective.sell_to_chef", "wiki"}, {"requires", "objective.open_caches", "wiki"}, {"requires", "objective.defeat_boss_times", "wiki"}, {"requires", "objective.bring_item", "wiki"}}, facts = {{"requirement", "Catch 2,000 fish, sell 500 to the Chef, open 15 Emerald Caches, beat Captain Blacksurf five times and bring Merlin his logbook (a rare drop of his). Then he blesses your Super Rod for 10,000,000 Beri."}}},
-		{id = "item.compass", name = "Compass", category = "item", verification = "confirmed", internal = {"Tool Compass"}, source = {evidence = "Auto Sam"}, evidence = {level = "confirmed"}},
-		{id = "item.deep_reach_rod", name = "Deep Reach Rod (Tier 5)", category = "item", verification = "documented", source = {card = "Fishing"}, relations = {{"requires", "item.blessed_rod", "wiki"}, {"requires", "objective.difficult_catches", "wiki"}, {"rewards", "item.black_abyss_crab_toy", "wiki"}}, facts = {{"requirement", "Catch 2,000 fish with a Blessed Rod in your bag and he tells you about the deep; land 25 Hard or Impossible catches with it and he hands you the Deep Cache"}}},
-		{id = "item.df_coin", name = "DFCoin", category = "item", verification = "documented", source = {card = "Suspicious Man"}},
-		{id = "item.essence", name = "Essence", category = "item", verification = "documented", source = {card = "Trait Sage"}, unknown = {"obtainment"}, facts = {{"cost", "Exchange two essences to gain a trait roll."}}},
-		{id = "item.fish", name = "Pez (Small / Medium / Large / Huge)", category = "item", verification = "confirmed", source = {card = "Fishing"}, facts = {{"reward", "Sell Value at 10/10: Small 1,000; Medium 5,000; Large 10,000; Huge 25,000 beri (x5 cooked)"}}},
-		{id = "item.fishing_cache", name = "Cache de pesca (Copper T1 … Ruby T7, Deep Reach)", category = "item", verification = "documented", source = {card = "Fishing"}, unknown = {"rewards"}, contradictions = {"La wiki dice 'Ruby requires at least Rod Tier 4', pero la tabla pone la Blessed Rod (Tier 4) como Unavailable en todas las dificultades."}, facts = {{"reward", "Caches can yield different rewards depending on the Tier, Copper is Tier 1, and Ruby is Tier 7."}}},
-		{id = "item.fruit_box", name = "Caja de fruta (Common Box…)", category = "item", verification = "confirmed", internal = {"Tool '<Rareza> Box'", "FruitBoxService.RE.Open"}, source = {evidence = "Auto abrir cajas"}, evidence = {level = "confirmed"}, unknown = {"dropRates", "obtainment"}},
-		{id = "item.golden_compass", name = "Golden Compass", category = "item", verification = "documented", source = {card = "Suspicious Man"}, facts = {{"cost", "Golden Compass: 14 DFCoins"}}},
-		{id = "item.haki_book", name = "Haki Book (Ken / Buso)", category = "item", verification = "confirmed", source = {evidence = "inventario"}, unknown = {"obtainment", "use"}},
-		{id = "item.merlins_logbook", name = "Logbook (drop de Captain Blacksurf)", category = "item", verification = "documented", source = {card = "Fishing"}},
-		{id = "item.package", name = "Package (Merlin)", category = "item", verification = "confirmed", internal = {"Tool Package"}, source = {evidence = "Auto Merlin"}, evidence = {level = "confirmed"}, unknown = {"obtainment"}},
-		{id = "item.stat_juice", name = "Zumo de fruta normal", category = "item", verification = "confirmed", source = {evidence = "Auto Stats"}},
-		{id = "item.sturdy_rod", name = "Sturdy Rod (Tier 2)", category = "item", verification = "documented", source = {card = "Fishing"}, relations = {{"requires", "objective.fish_count", "wiki"}}, facts = {{"requirement", "Obtainment: Keep fishing until you reach 200 Fish caught."}, {"duration", "Catch Rate: ~15 seconds per fish."}}},
-		{id = "item.super_rod", name = "Super Rod (Tier 3)", category = "item", verification = "documented", source = {card = "Fishing"}, relations = {{"requires", "item.sturdy_rod", "wiki"}}, facts = {{"requirement", "Owning the Sturdy Rod and 1 million Beri, then talking to Merlin will allow you to get the Super Rod."}, {"duration", "Catch Rate: ~10 seconds per fish."}}},
-		{id = "item.treasure_chest", name = "Cofre (Common / Rare / Epic / Legendary)", category = "item", verification = "confirmed", source = {card = "Treasure Rain"}, relations = {{"rewards", "item.compass", "wiki"}}, contradictions = {"Common Chest '~5,00 Beri' (errata en la wiki: ¿5.000?)."}, facts = {{"reward", "Epic Chest (Purple Glow): ~50,000 Beri, ~20 Gems, ~2 Compasses; Legendary (Gold glow): ~200,000 Beri, ~35 Gems, ~4 Compasses"}}},
-		{id = "item.treasure_map", name = "Treasure Map", category = "item", verification = "documented", source = {card = "Ghost Ship"}, unknown = {"use"}},
-		{id = "item.wood_rod", name = "Wood Rod (Tier 1)", category = "item", verification = "documented", source = {card = "Fishing"}, facts = {{"requirement", "Obtainment: Do a quest for Merlin, and he’ll give you this rod."}, {"duration", "Catch Rate: ~25 seconds per fish."}}},
-		{id = "location.fisher_plaza", name = "Fisher Plaza", category = "location", verification = "documented", source = {card = "Fishing"}, unknown = {"island"}},
-		{id = "mechanic.cooking", name = "Cocinar pescado (x5 de valor)", category = "mechanic", verification = "documented", source = {card = "Fishing"}, relations = {{"part_of", "system.fishing", "wiki"}, {"related", "npc.chef", "wiki"}}, unknown = {"location", "remotes"}},
-		{id = "mechanic.expertise", name = "Expertise (misiones de The Expert)", category = "mechanic", verification = "documented", source = {card = "The Expert"}, relations = {{"rewards", "mechanic.sam_compass", "wiki"}}, contradictions = {"EXP por misión: Easy 100 > Medium 30 > Hard 20 (al revés de lo esperable; tal cual en la wiki)."}, facts = {{"spawn", "He offers a quest every xx:00 UTC."}, {"cost", "You can upgrade this up to 2 times for a total of 3 stored quests • First upgrade: 500 Gems • Second upgrade: 1000"}, {"reward", "Quest exp (Normal/Elite): 100/140 Easy, 30/50 Medium, 20/40 Hard"}}},
-		{id = "mechanic.fishing_rod_progression", name = "Progresión de cañas (Tier 1 → 5)", category = "mechanic", verification = "documented", source = {card = "Fishing"}, relations = {{"part_of", "system.fishing", "wiki"}}},
-		{id = "mechanic.fruit_exchange", name = "Canje de frutas por recompensas", category = "mechanic", verification = "documented", source = {card = "Suspicious Man"}, relations = {{"part_of", "npc.suspicious_man", "wiki"}}, facts = {{"reward", "Common Fruits: 25K Beri; Uncommon Fruits: 100K Beri; Rare Fruits: 1M Beri/ 50 Gems/ 1 DFCoin; Ultra Rare Box: 15M Beri/ 500 Gems/ 10 DFCoins"}, {"cost", "Prices are halved on weekends (Friday, Saturday, and Sunday.)"}}},
-		{id = "mechanic.fruit_summon", name = "Invocación con frutas (Death Spire)", category = "mechanic", verification = "documented", source = {card = "Death Spire"}, relations = {{"part_of", "island.death_spire", "wiki"}}},
-		{id = "mechanic.haki_training", name = "Entrenamiento de haki (dojo)", category = "mechanic", verification = "confirmed", internal = {"HakiDojoService Start/Strike/Answer/Game"}, source = {evidence = "Auto Train"}, evidence = {level = "confirmed"}, relations = {{"related", "npc.silvers_rayleigh", "evidence"}}},
-		{id = "mechanic.quest_exp_allocation", name = "Reparto de EXP de misiones", category = "mechanic", verification = "documented", source = {card = "Quest Givers"}, relations = {{"related", "objective.board_quest", "wiki"}}},
-		{id = "mechanic.sam_compass", name = "Compass de Sam (cada 20 min)", category = "mechanic", verification = "confirmed", internal = {"player @CompassTokenAt", "Tool Compass @TreasureTarget"}, source = {evidence = "Auto Sam"}, evidence = {level = "confirmed"}, facts = {{"spawn", "Expertise quests reward Expertise exp and reduce Sam’s current quest timer by 5 minutes."}}},
-		{id = "mechanic.stat_juices", name = "Zumos de stats (barriles y exprimidor)", category = "mechanic", verification = "confirmed", internal = {"Map.Barrels", "Map.Other.Tent2.Model.JuicingBowl"}, source = {evidence = "Auto Stats"}, evidence = {level = "confirmed"}, relations = {{"rewards", "item.stat_juice", "evidence"}}},
-		{id = "npc.advanced_bartender_dance_club", name = "Advanced Bartender (Dance Club)", category = "npc", group = "other", verification = "documented", source = {list = "NPCs (Locations)", card = "Advanced Bartender (Dance Club)"}, unknown = {"internalName", "location"}, facts = {{"reward", "Gives Exp drinks for each stat that matches color."}}},
-		{id = "npc.bartender_sams", name = "Bartender (Sam's)", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Bartender (Sam's)"}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.beachcomber_lou", name = "Beachcomber Lou", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestCrabIsle"}, source = {list = "NPCs (Locations)", card = "Beachcomber Lou"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.boatmaster", name = "Boatmaster", category = "npc", group = "other", verification = "documented", roles = {"merchant"}, source = {list = "NPCs (Locations)", card = "Boatmaster"}, unknown = {"internalName", "location"}},
-		{id = "npc.calm_bob", name = "Calm Bob", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestTreea"}, source = {list = "NPCs (Locations)", card = "Calm Bob"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.candy_witch_hazel", name = "Candy Witch Hazel", category = "npc", group = "halloween", verification = "unknown", source = {list = "NPCs (Locations)", card = "Candy Witch Hazel"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, unknown = {"description", "internalName"}},
-		{id = "npc.captain_bram", name = "Captain Bram", aliases = {"Guard Captain Bram"}, category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestTown"}, source = {list = "NPCs (Locations)", card = "Captain Bram"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.chef", name = "Chef", category = "npc", verification = "documented", source = {card = "Fishing"}, unknown = {"internalName", "location", "name"}, facts = {{"requirement", "Fish can be cooked at campfires or the fryer next to the chef."}}},
-		{id = "npc.climber_edda", name = "Climber Edda", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestCliffs"}, source = {list = "NPCs (Locations)", card = "Climber Edda"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.dancer", name = "Dancer", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Dancer"}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.death_spire_mage", name = "Mago de Death Spire (sin nombre)", category = "npc", verification = "documented", source = {card = "Death Spire"}, relations = {{"located_at", "island.death_spire", "wiki"}}, unknown = {"internalName", "name"}, facts = {{"spawn", "There’s an old mage that rests somewhere on the lower circle, maybe he can tell you more?"}}},
-		{id = "npc.dockmaster_rolf", name = "Dockmaster Rolf", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestWindmill"}, source = {list = "NPCs (Locations)", card = "Dockmaster Rolf"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.elder_moray", name = "Elder Moray", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestDeepwake"}, source = {list = "NPCs (Locations)", card = "Elder Moray"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.fish_merchant", name = "Fish Merchant", category = "npc", group = "other", verification = "confirmed", roles = {"merchant"}, internal = {"Map.Merchants.FishMerchant"}, source = {list = "NPCs (Locations)", card = "Fish Merchant"}, evidence = {level = "confirmed", note = "venta sin grabar"}, relations = {{"located_at", "location.fisher_plaza", "wiki"}}, contradictions = {"La wiki lo sitúa en 'Fisher Plaza', que no aparece entre las islas (Points of Interest)."}},
-		{id = "npc.fortune_teller", name = "Fortune Teller", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Fortune Teller"}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.gravekeeper_mort", name = "Gravekeeper Mort", category = "npc", group = "halloween", verification = "unknown", source = {list = "NPCs (Locations)", card = "Gravekeeper Mort"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, unknown = {"description", "internalName"}},
-		{id = "npc.hal_the_deserter", name = "Hal the Deserter", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestMarine"}, source = {list = "NPCs (Locations)", card = "Hal the Deserter"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.hermit_oswin", name = "Hermit Oswin", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestPursuer"}, source = {list = "NPCs (Locations)", card = "Hermit Oswin"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.krusch", name = "Krusch", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Krusch"}, relations = {{"located_at", "island.caver_island", "wiki"}}, unknown = {"description", "internalName"}},
-		{id = "npc.little_boo", name = "Little Boo", category = "npc", group = "halloween", verification = "possibly_obsolete", source = {list = "NPCs (Locations)", card = "Little Boo"}, relations = {{"in_region", "region.halloween", "wiki-group"}}, unknown = {"internalName"}},
-		{id = "npc.lucy_affinity_diviner", name = "Lucy, Affinity Diviner", aliases = {"Lucy"}, category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Lucy, Affinity Diviner"}, relations = {{"related", "info.stats_and_affinity", "wiki"}}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.mama_fredda", name = "Mama Fredda", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestSandCastle"}, source = {list = "NPCs (Locations)", card = "Mama Fredda"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.merlin", name = "Merlin", category = "npc", group = "other", verification = "confirmed", roles = {"quest_giver", "merchant"}, internal = {"Map.Merchants.QuestFishMerchant"}, source = {list = "NPCs (Locations)", card = "Merlin"}, evidence = {level = "confirmed", note = "MerlinService TakePackage/Deliver grabados"}, relations = {{"located_at", "island.merlins_island", "wiki"}, {"gives_quest", "objective.deliver_package", "evidence"}, {"gives_quest", "objective.fish_count", "evidence"}, {"sells", "item.wood_rod", "wiki"}, {"sells", "item.super_rod", "wiki"}, {"sells", "item.blessed_rod", "wiki"}}},
-		{id = "npc.mirra_the_runaway", name = "Mirra the Runaway", category = "npc", verification = "archived", source = {list = "NPCs (Locations)", card = "Mirra the Runaway"}, unknown = {"internalName", "location"}},
-		{id = "npc.old_fishman", name = "Old Fishman", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Old Fishman"}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.old_miner_gus", name = "Old Miner Gus", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestMountain"}, source = {list = "NPCs (Locations)", card = "Old Miner Gus"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.old_pirate_gil", name = "Old Pirate Gil", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestPirate"}, source = {list = "NPCs (Locations)", card = "Old Pirate Gil"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.old_vasska", name = "Old Vasska", category = "npc", verification = "archived", source = {list = "NPCs (Locations)", card = "Old Vasska"}, unknown = {"internalName", "location"}},
-		{id = "npc.otto", name = "Otto", aliases = {"Farmer Otto"}, category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestFarm"}, source = {list = "NPCs (Locations)", card = "Otto"}, evidence = {level = "confirmed", note = "misión FarmBoars entregada"}, relations = {{"gives_quest", "objective.kill_enemies", "evidence"}}, unknown = {"location"}},
-		{id = "npc.sam", name = "Sam", aliases = {"Quest Man"}, category = "npc", group = "other", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestMerchant2"}, source = {list = "NPCs (Locations)", card = "Sam"}, evidence = {level = "confirmed", note = "'Quest Man'; CompassQuestService.RF.Claim"}, relations = {{"located_at", "island.sams_bar_and_pirates_land", "evidence"}, {"gives_quest", "objective.claim_compass", "evidence"}, {"rewards", "item.compass", "evidence"}}},
-		{id = "npc.sam_dance_club", name = "Sam (Dance Club)", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Sam (Dance Club)"}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.shanks", name = "Shanks", category = "npc", group = "other", verification = "confirmed", internal = {"Map.Merchants.HakiRankMerchant"}, source = {list = "NPCs (Locations)", card = "Shanks"}, evidence = {level = "confirmed"}, unknown = {"location"}},
-		{id = "npc.sheriff_dale", name = "Sheriff Dale", category = "npc", group = "quest_givers", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.QuestCaver"}, source = {list = "NPCs (Locations)", card = "Sheriff Dale"}, evidence = {level = "confirmed"}, unknown = {"location", "quests"}},
-		{id = "npc.silvers_rayleigh", name = "Silvers Rayleigh", aliases = {"Haki Master", "Silver Rayleigh"}, category = "npc", group = "other", verification = "confirmed", internal = {"Map.Merchants.QuestHakiMerchant"}, source = {list = "NPCs (Locations)", card = "Silvers Rayleigh"}, evidence = {level = "confirmed", note = "HakiDojoService grabado"}, relations = {{"located_at", "island.mountain_island", "wiki"}}},
-		{id = "npc.smith_hagan", name = "Smith Hagan", category = "npc", group = "other", verification = "documented", roles = {"crafter"}, source = {list = "NPCs (Locations)", card = "Smith Hagan"}, unknown = {"internalName", "location"}},
-		{id = "npc.sniper_dealer", name = "Sniper Dealer", category = "npc", group = "other", verification = "inferred", roles = {"merchant"}, internal = {"Map.Merchants.SniperMerchant"}, source = {list = "NPCs (Locations)", card = "Sniper Dealer"}, evidence = {level = "inferred", note = "correspondencia por nombre"}, unknown = {"location"}},
-		{id = "npc.suspicious_man", name = "Suspicious Man", category = "npc", group = "other", verification = "inferred", roles = {"merchant"}, internal = {"Map.Merchants.SellerMerchant"}, source = {list = "NPCs (Locations)", card = "Suspicious Man"}, evidence = {level = "inferred", note = "SellerMerchant compra frutas junto a Sam (FruitTradeService grabado); que sea Suspicious Man es deducción"}, relations = {{"sells", "item.golden_compass", "wiki"}, {"rewards", "item.df_coin", "wiki"}}, unknown = {"location"}, facts = {{"reward", "Talk to him to exchange your devil fruits into Rewards"}, {"cost", "Rare Fruits: 1M Beri/ 50 Gems/ 1 DFCoin"}, {"cost", "Ultra Rare Box: 15M Beri/ 500 Gems/ 10 DFCoins"}}},
-		{id = "npc.sword_dealer", name = "Sword Dealer", category = "npc", group = "other", verification = "inferred", roles = {"merchant"}, internal = {"Map.Merchants.SwordMerchant"}, source = {list = "NPCs (Locations)", card = "Sword Dealer"}, evidence = {level = "inferred", note = "correspondencia por nombre"}, unknown = {"location"}},
-		{id = "npc.the_expert", name = "The Expert", category = "npc", group = "other", verification = "confirmed", roles = {"quest_giver"}, internal = {"Map.Merchants.ExpertiseMerchant"}, source = {list = "NPCs (Locations)", card = "The Expert"}, evidence = {level = "confirmed", note = "misiones en PlayerGui.MissionGui"}, relations = {{"mentions", "enemy.gunslinger", "name"}, {"mentions", "enemy.vokun", "name"}, {"mentions", "enemy.marines", "name"}, {"mentions", "enemy.gunslinger_elites", "name"}, {"gives_quest", "objective.kill_enemies", "wiki"}, {"gives_quest", "objective.kill_players", "wiki"}, {"gives_quest", "objective.deal_damage", "wiki"}, {"gives_quest", "objective.earn_beri", "wiki"}, {"gives_quest", "objective.sell_fish_value", "wiki"}, {"gives_quest", "objective.fish_count", "wiki"}, {"gives_quest", "objective.mission_objectives", "wiki"}, {"gives_quest", "objective.elite_kill", "wiki"}}, unknown = {"location"}, facts = {{"reward", "Talking with The Expert gives you an expertise quest so you can gain exp for your Expertise(s)."}, {"spawn", "He offers a quest every xx:00 UTC."}, {"reward", "Expertise quests reward Expertise exp and reduce Sam’s current quest timer by 5 minutes."}, {"requirement", "Elite quests require killing tougher enemies and grant more exp."}}},
-		{id = "npc.the_marine_warden", name = "The Marine Warden", category = "npc", group = "other", verification = "documented", source = {list = "NPCs (Locations)", card = "The Marine Warden"}, unknown = {"internalName", "location"}},
-		{id = "npc.timmy", name = "Timmy", category = "npc", group = "other", verification = "unknown", source = {list = "NPCs (Locations)", card = "Timmy"}, unknown = {"description", "internalName", "location"}},
-		{id = "npc.trait_sage", name = "Trait Sage", category = "npc", group = "other", verification = "confirmed", roles = {"service"}, internal = {"Map.Merchants.TraitSage"}, source = {list = "NPCs (Locations)", card = "Trait Sage"}, evidence = {level = "confirmed"}, relations = {{"links_to", "system.character_traits", "wiki-link"}, {"requires", "item.essence", "wiki"}}, unknown = {"location"}},
-		{id = "objective.board_quest", name = "Misión de tablón (Quest Givers): tipos sin documentar", category = "objective", verification = "unknown", source = {card = "Quest Givers"}, unknown = {"description", "givers", "objectiveTypes", "rewards"}, facts = {{"reward", "At the bottom, you can select where the Exp of each completed quest goes to"}}},
-		{id = "objective.bring_item", name = "Llevar un objeto a un NPC", category = "objective", verification = "documented", source = {card = "Fishing"}, relations = {{"requires", "item.merlins_logbook", "wiki"}}, unknown = {"givers", "rewards"}, facts = {{"requirement", "bring Merlin his logbook (a rare drop of his)"}}},
-		{id = "objective.claim_compass", name = "Reclamar el tesoro del compass", category = "objective", verification = "confirmed", source = {evidence = "Auto Sam"}, unknown = {"rewards"}},
-		{id = "objective.deal_damage", name = "Hacer X de daño", category = "objective", verification = "documented", source = {card = "The Expert"}, unknown = {"rewards"}, facts = {{"requirement", "Deal a certain amount of damage."}}},
-		{id = "objective.defeat_boss_times", name = "Derrotar a un jefe N veces", category = "objective", verification = "documented", source = {card = "Fishing"}, relations = {{"targets", "enemy.captain_blacksurf", "wiki"}}, unknown = {"givers", "rewards"}, facts = {{"requirement", "beat Captain Blacksurf five times"}}},
-		{id = "objective.deliver_package", name = "Entregar un paquete", category = "objective", verification = "confirmed", internal = {"Tool Package @DeliveryTarget", "MerlinService.RF.Deliver"}, source = {card = "Merlin's Island"}, evidence = {level = "confirmed"}, unknown = {"rewards"}, facts = {{"requirement", "You’d come here to gather packages and chat while waiting for that old Fisherman over there to prepare another delivery for you."}}},
-		{id = "objective.difficult_catches", name = "Pescar N capturas Hard o Impossible", category = "objective", verification = "documented", source = {card = "Fishing"}, unknown = {"givers", "rewards"}, facts = {{"requirement", "land 25 Hard or Impossible catches with it"}}},
-		{id = "objective.earn_beri", name = "Ganar X Beri", category = "objective", verification = "documented", source = {card = "The Expert"}, unknown = {"rewards"}, facts = {{"requirement", "Earn a certain amount of beris."}}},
-		{id = "objective.elite_kill", name = "Élite: derrotar a un enemigo élite", category = "objective", verification = "documented", source = {card = "The Expert"}, relations = {{"targets", "enemy.vokun", "wiki"}, {"targets", "enemy.marines", "wiki"}, {"targets", "enemy.gunslinger_elites", "wiki"}}, facts = {{"reward", "Elite quests require killing tougher enemies and grant more exp."}}},
-		{id = "objective.fish_count", name = "Pescar N peces", category = "objective", verification = "confirmed", internal = {"MissionGui '[Hard] Catch 7 fish.'"}, source = {card = "The Expert"}, evidence = {level = "confirmed"}, unknown = {"rewards"}, facts = {{"requirement", "Fish a certain amount."}}},
-		{id = "objective.kill_enemies", name = "Derrotar N enemigos concretos", category = "objective", verification = "confirmed", internal = {"QuestTracker 'Defeat <enemigo> (Lv N+): a/b'"}, source = {card = "The Expert"}, evidence = {level = "confirmed"}, unknown = {"rewards"}, facts = {{"requirement", "Kill a set number of certain enemies."}}},
-		{id = "objective.kill_players", name = "Derrotar N jugadores", category = "objective", verification = "documented", roles = {"pvp"}, source = {card = "The Expert"}, unknown = {"rewards"}, facts = {{"requirement", "Kill a set number of players."}}},
-		{id = "objective.light_candles", name = "Encender velas (invocación)", category = "objective", verification = "possibly_obsolete", source = {card = "Perona, Ghost Princess"}, unknown = {"givers", "rewards"}, facts = {{"spawn", "If you light four candles near her house, she spawns in the center to haunt."}}},
-		{id = "objective.mission_objectives", name = "Completar N objetivos de misión (compasses de Sam, paquetes de Merlin)", category = "objective", verification = "documented", source = {card = "The Expert"}, relations = {{"requires", "mechanic.sam_compass", "wiki"}, {"requires", "objective.deliver_package", "wiki"}}, unknown = {"rewards"}, facts = {{"requirement", "Complete a certain number of mission objectives (Sam - compasses and Merlin packages)."}}},
-		{id = "objective.offer_fruits", name = "Ofrecer frutas del diablo (invocación)", category = "objective", verification = "documented", source = {card = "Death Spire"}, unknown = {"givers", "rewards"}, facts = {{"requirement", "bring 13 devil fruits for the lower circle, and 3 for what’s at the top"}}},
-		{id = "objective.open_caches", name = "Abrir N caches de un tipo", category = "objective", verification = "documented", source = {card = "Fishing"}, relations = {{"requires", "item.fishing_cache", "wiki"}}, unknown = {"givers", "rewards"}, facts = {{"requirement", "open 15 Emerald Caches"}}},
-		{id = "objective.sell_fish_value", name = "Vender peces por X Beri", category = "objective", verification = "documented", source = {card = "The Expert"}, unknown = {"rewards"}, facts = {{"requirement", "Sell fish worth a certain amount of beri."}}},
-		{id = "objective.sell_to_chef", name = "Vender N peces al Chef", category = "objective", verification = "documented", source = {card = "Fishing"}, relations = {{"targets", "npc.chef", "wiki"}}, unknown = {"givers", "rewards"}, facts = {{"requirement", "sell 500 to the Chef"}}},
-		{id = "region.halloween", name = "Halloween (temporada)", category = "region", verification = "possibly_obsolete", source = {card = "Halloween Island"}, unknown = {"returnDate"}, facts = {{"duration", "explore this island before it vanishes sometimes late Fall"}}},
-		{id = "system.bounties", name = "Bounties", category = "system", verification = "documented", source = {list = "Systems", card = "Bounties"}, facts = {{"spawn", "Players who are strong enough to be noted will appear here."}, {"reward", "Rewards vary on the player’s: Level, Haki, Bounty, and Kills"}}},
-		{id = "system.challenges", name = "Challenges", category = "system", verification = "documented", source = {list = "Systems", card = "Challenges"}},
-		{id = "system.character_traits", name = "Character Traits", category = "system", verification = "documented", source = {list = "Systems", card = "Character Traits"}, facts = {{"cost", "- Jeweler — +10–70% Gems Earned (3%)"}}},
-		{id = "system.fishing", name = "Fishing", category = "system", verification = "confirmed", internal = {"FishingService Cast/Reel/Hit", "PlayerGui.Fishing"}, source = {list = "Systems", card = "Fishing"}, evidence = {level = "confirmed", note = "minijuego Scatter grabado"}, relations = {{"mentions", "island.galley_isle", "name"}, {"mentions", "npc.fish_merchant", "name"}, {"mentions", "enemy.captain_blacksurf", "name"}, {"mentions", "enemy.abyss_crustacean", "name"}, {"rewards", "item.fish", "wiki"}, {"rewards", "item.fishing_cache", "wiki"}}, facts = {{"cost", "Small: 1,000 beri (5,000 cooked)"}, {"cost", "Medium: 5,000 beri (25,000 cooked)"}, {"cost", "Large: 10,000 beri (50,000 cooked)"}, {"cost", "Huge: 25,000 beri (125,000 cooked)"}, {"requirement", "Obtainment: Do a quest for Merlin, and he’ll give you this rod."}, {"duration", "Catch Rate: ~25 seconds per fish."}, {"requirement", "Obtainment: Keep fishing until you reach 200 Fish caught."}, {"duration", "Catch Rate: ~15 seconds per fish."}, {"requirement", "Obtainment: Owning the Sturdy Rod and 1 million Beri, then talking to Merlin will allow you to get the Super Rod."}, {"duration", "Catch Rate: ~10 seconds per fish."}, {"requirement", "Obtainment: Catch 2,000 fish, sell 500 to the Chef, open 15 Emerald Caches, beat Captain Blacksurf five times and bring Merlin his logbook (a rare drop of his)."}, {"duration", "Catch Rate: ~6.5 seconds per fish."}}},
-		{id = "system.gladiator_board", name = "Gladiator Board", category = "system", verification = "documented", source = {list = "Systems", card = "Gladiator Board"}},
-		{id = "weapon.aqua_staff", name = "Aqua Staff", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Aqua Staff"}, unknown = {"internalName"}, facts = {{"requirement", "Fish for a chance to obtain this magical wand of potent water energy."}}, abilities = {{"Obtainment", "move", nil}, {"Special", "move", nil}}},
-		{id = "weapon.bisento", name = "Bisento", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Bisento"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.blunderbuss", name = "Blunderbuss", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Blunderbuss"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.candy_cane_kogatana", name = "Candy Cane Kogatana", category = "weapon", verification = "archived", source = {list = "Talents", card = "Candy Cane Kogatana"}, unknown = {"internalName"}},
-		{id = "weapon.crossbow", name = "Crossbow", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Crossbow"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.dagger", name = "Dagger", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Dagger"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.divine_axe", name = "Divine Axe", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Divine Axe"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.flail", name = "Flail", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Flail"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.flintlock", name = "Flintlock", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Flintlock"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.golden_fish", name = "Golden Fish", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Golden Fish"}, unknown = {"internalName"}, facts = {{"requirement", "Obtained from catching a total of 1,000k Fish."}}, abilities = {{"Obtainment", "move", nil}}},
-		{id = "weapon.ice_dagger", name = "Ice Dagger", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Ice Dagger"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.ice_spear", name = "Ice Spear", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Ice Spear"}, unknown = {"internalName"}, facts = {{"spawn", "Summon a rain of spears at the player’s cursor, each landing with a small AOE and dealing 340 sword damage."}}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.kanshou_and_bakuya", name = "Kanshou & Bakuya", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Kanshou & Bakuya"}, unknown = {"internalName"}, facts = {{"reward", "Why give them to us?"}}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.katana", name = "Katana", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Katana"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.kogatana", name = "Kogatana", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Kogatana"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.krizma", name = "Krizma", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Krizma"}, unknown = {"internalName"}, facts = {{"requirement", "The creator of this sword must've known what he was going for with this serrated blade."}}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.lightning_sword", name = "Lightning Sword", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Lightning Sword"}, unknown = {"internalName"}, facts = {{"spawn", "Enhancing your every output of damage by 1.25x for 10 seconds."}}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.lollipop", name = "Lollipop", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Lollipop"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.magma_gun", name = "Magma Gun", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Magma Gun"}, unknown = {"internalName"}, facts = {{"reward", "M1: Shoots a small magma bullet in a straight line without drop."}}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.masamune", name = "Masamune", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Masamune"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.melee", name = "Melee", category = "weapon", group = "utility", verification = "documented", source = {list = "Talents", card = "Melee"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.meteorite_sword", name = "Meteorite Sword", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Meteorite Sword"}, unknown = {"internalName"}, facts = {{"duration", "Creates a protective shield over the user that negates damage for 3 seconds, providing 6.5k worth of overguard."}}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.old_miner_gus", name = "Old Miner Gus", category = "weapon", verification = "archived", source = {list = "Talents", card = "Old Miner Gus"}, unknown = {"internalName"}},
-		{id = "weapon.roger", name = "Roger", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Roger"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.ruby_anchor", name = "Ruby Anchor", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Ruby Anchor"}, relations = {{"mentions", "system.fishing", "name"}}, unknown = {"internalName"}, facts = {{"requirement", "Obtained through lots of fishing."}}, abilities = {{"Obtainment", "move", nil}, {"Special", "move", nil}}},
-		{id = "weapon.rusted_cutlass", name = "Rusted Cutlass", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Rusted Cutlass"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.scissors_blade", name = "Scissors Blade", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Scissors Blade"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.slingshot", name = "Slingshot", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Slingshot"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.special", name = "Special", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Special"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.stars", name = "Stars", category = "weapon", group = "sniper", verification = "documented", source = {list = "Talents", card = "Stars"}, unknown = {"abilities", "internalName"}},
-		{id = "weapon.swords__archived", name = "Swords", category = "weapon", verification = "archived", source = {list = "Talents", card = "Swords"}, unknown = {"internalName"}},
-		{id = "weapon.tachi", name = "Tachi", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Tachi"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.ultra_great_sword", name = "Ultra Great Sword", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Ultra Great Sword"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.wakizashi", name = "Wakizashi", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Wakizashi"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
-		{id = "weapon.yoru", name = "Yoru", category = "weapon", group = "sword", verification = "documented", source = {list = "Talents", card = "Yoru"}, unknown = {"internalName"}, abilities = {{"Special", "move", nil}}},
+		{id="enemy.abyss_crustacean",name="Abyss Crustacean",category="enemy",verification="documented",roles={"boss"},wiki=0,card="Fishing",relations={{"summoned_by","item.deep_reach_rod","wiki"}},unknown={"drops","internalName","level","location","respawnTime"},facts={{"spawn","Each fish caught with the Deep Reach Rod has a 1% chance to hook the Abyss Crustacean (Lv. 3000), which drags you and everyone nearby into its trench."},{"duration","It has 2,000,000 health and 10 minutes before it sinks back into the dark."}}},
+		{id="enemy.angry_bob",name="Angry Bob",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"},facts={{"reward","For now, just leave him alone, he doesn’t give much anyways."}}},
+		{id="enemy.bandits",name="Bandits",category="enemy",group="other",verification="documented",wiki=1,relations={{"located_at","island.windmill_and_town_island","wiki"}},unknown={"drops","internalName","level"}},
+		{id="enemy.blue_crab",name="Blue Crab",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.boar",name="Boar",category="enemy",group="other",verification="confirmed",internal={"Alive.NPCs 'Lv12 Boar'"},wiki=1,evidence={level="confirmed",note="Auto Quest (Defeat)"},unknown={"drops","level","location"}},
+		{id="enemy.captain_blacksurf",name="Captain Blacksurf",category="enemy",group="other",verification="documented",roles={"boss"},wiki=1,relations={{"links_to","island.deepwaken_trench","wiki-link"},{"mentions","island.deepwaken_trench","name"},{"located_at","island.deepwaken_trench","wiki"},{"drops","item.merlins_logbook","wiki"}},unknown={"internalName","level","respawnTime"}},
+		{id="enemy.cave_demons",name="Cave Demons",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.crab",name="Crab",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.death_spire_knight",name="Caballero de Death Spire (sin nombre)",category="enemy",verification="documented",roles={"boss","summoned"},wiki=0,card="Death Spire",relations={{"located_at","island.death_spire","wiki"},{"summoned_by","objective.offer_fruits","wiki"}},unknown={"drops","internalName","level","name","respawnTime"},facts={{"spawn","if you bring 13 devil fruits for the lower circle, and 3 for what’s at the top, you can summon a knight of steel, darkness, and evil."}}},
+		{id="enemy.fishman_pirates",name="Fishman Pirates",category="enemy",group="other",verification="documented",wiki=1,relations={{"links_to","enemy.captain_blacksurf","wiki-link"},{"mentions","enemy.captain_blacksurf","name"}},unknown={"drops","internalName","level","location"},facts={{"reward","Followers of Captain Blacksurf, not sure what he gives these subordinates of his in terms of payment for them to follow him so closely and blindly."}}},
+		{id="enemy.freddy",name="Freddy",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.gecko_moria",name="Gecko Moria",category="enemy",group="halloween",verification="possibly_obsolete",roles={"boss","seasonal"},wiki=1,relations={{"links_to","island.halloween_island","wiki-link"},{"mentions","island.halloween_island","name"},{"in_region","region.halloween","wiki-group"},{"located_at","island.halloween_island","wiki"}},unknown={"drops","internalName","level","respawnTime"}},
+		{id="enemy.ghost",name="Ghost",category="enemy",group="halloween",verification="possibly_obsolete",wiki=1,relations={{"in_region","region.halloween","wiki-group"}},unknown={"drops","internalName","level"}},
+		{id="enemy.gunner_captain",name="Gunner Captain",category="enemy",group="other",verification="documented",roles={"boss?"},wiki=1,unknown={"drops","internalName","level","location"},contradictions={"El hub lo busca en IslandCaver; la wiki no dice su isla (Caver Island es 'The Gunners Cave Island': relación probable, no confirmada)."}},
+		{id="enemy.gunslinger",name="Gunslinger",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.gunslinger_brothers",name="Gunslinger Brothers",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.gunslinger_elites",name="Gunslinger Elites",category="enemy",verification="documented",roles={"elite"},wiki=0,card="The Expert",unknown={"drops","internalName","level","location","members"},facts={{"requirement","Elite: kill one of the Gunslinger Elites."}}},
+		{id="enemy.marines",name="Marines",category="enemy",verification="documented",roles={"elite"},wiki=0,card="Marine Base",relations={{"located_at","island.marine_base","wiki"}},unknown={"drops","internalName","level"},facts={{"requirement","A logia won't serve you well since they all know how to use Buso Haki."}}},
+		{id="enemy.perona_ghost_princess",name="Perona, Ghost Princess",aliases={"Perona"},category="enemy",group="halloween",verification="possibly_obsolete",roles={"boss","seasonal","summoned"},wiki=1,relations={{"in_region","region.halloween","wiki-group"},{"summoned_by","objective.light_candles","wiki"},{"located_at","island.halloween_island","wiki"}},unknown={"drops","internalName","level","respawnTime"},facts={{"spawn","If you light four candles near her house, she spawns in the center to haunt."}}},
+		{id="enemy.purple_crab",name="Purple Crab",category="enemy",group="other",verification="documented",wiki=1,unknown={"drops","internalName","level","location"}},
+		{id="enemy.ryuma",name="Ryuma",category="enemy",group="halloween",verification="possibly_obsolete",roles={"boss?","seasonal"},wiki=1,relations={{"in_region","region.halloween","wiki-group"}},unknown={"drops","internalName","level"},contradictions={"El hub lo trata como jefe; la wiki no lo llama jefe."}},
+		{id="enemy.the_freds",name="The Freds",category="enemy",group="other",verification="documented",wiki=1,relations={{"links_to","enemy.freddy","wiki-link"},{"mentions","enemy.freddy","name"}},unknown={"drops","internalName","level","location"}},
+		{id="enemy.thieves",name="Thieves",category="enemy",group="other",verification="documented",wiki=1,relations={{"located_at","island.windmill_and_town_island","wiki"}},unknown={"drops","internalName","level"}},
+		{id="enemy.thug",name="Thug",category="enemy",group="other",verification="documented",wiki=1,relations={{"mentions","island.sams_bar_and_pirates_land","name"},{"located_at","island.sams_bar_and_pirates_land","wiki"}},unknown={"drops","internalName","level"}},
+		{id="enemy.vokun",name="Vokun",category="enemy",verification="documented",roles={"elite"},wiki=0,card="The Expert",unknown={"drops","internalName","level","location"},facts={{"requirement","Elite: kill Vokun."}}},
+		{id="enemy.zombie",name="Zombie",category="enemy",group="halloween",verification="possibly_obsolete",wiki=1,relations={{"in_region","region.halloween","wiki-group"}},unknown={"drops","internalName","level"}},
+		{id="event.crew_seige",name="Crew Seige",category="event",verification="documented",wiki=2,unknown={"duration","frequency","location","trigger"},facts={{"reward","Those who win and claim the flag get rewarded."}}},
+		{id="event.ghost_ship",name="Ghost Ship",category="event",verification="documented",wiki=2,relations={{"rewards","item.treasure_map","wiki"}},unknown={"duration","frequency","location","trigger"},facts={{"reward","Defeat them for rewards and a mysterious Treasure Map."}}},
+		{id="event.ghost_ship__archived",name="Ghost Ship",category="event",verification="archived",wiki=2},
+		{id="event.treasure_rain",name="Treasure Rain",category="event",verification="documented",wiki=2,relations={{"rewards","item.treasure_chest","wiki"}},unknown={"frequency","location","trigger"},facts={{"duration","This event last for a short time so find the chest quickly before others."},{"spawn","15 chests spawn total."},{"cost","Rare Chest (Blue Glow):~25,000 Beri, ~5 Gems"},{"cost","Epic Chest (Purple Glow): ~50,000 Beri, ~20 Gems, ~2 Compasses"},{"cost","Legendary (Gold glow): ~200,000 Beri, ~35 Gems, ~4 Compasses"}}},
+		{id="event.xp_boost",name="Evento de EXP (multiplicador)",category="event",verification="confirmed",internal={"workspace @XpEventEndsAt","workspace @XpEventMultiplier"},srcEvidence="fila 'xp' de Inicio",evidence={level="confirmed"},unknown={"duration","frequency","location","trigger"}},
+		{id="fruit.barrier",name="Barrier",aliases={"Bari Bari No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},abilities={{"Wall","move","25 Defense"},{"Slam","move","50 Melee"},{"Prison","move","300 Defense"},{"Room","move","100 Defense"},{"Barrier Bat","move","200 Melee"},{"Barrier Body","move","400 Defense"}}},
+		{id="fruit.bomb",name="Bomb",aliases={"Bomu Bomu No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"spawn","Every strike carries a hidden detonation."},{"requirement","(Requires a Bare-Handed Melee Fighting Style | Deals an additional instance of explosive damage on top of normal melee damage | Scales with Melee Stat & Melee Affinity)"}},abilities={{"Explosive Touch","passive",nil},{"Bomb Punch","move","50 Melee"},{"Bomb Boost","move","50 Melee"},{"Booger Bomb","move","200 Sniper"},{"Bomb Wave","move","300 Sniper"},{"Full Body","move","400 Defense"}}},
+		{id="fruit.candy",name="Candy",aliases={"Ame Ame No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"reward","Sweetness gives way to sharpness."},{"spawn","(Max Damage: 250 | Base Damage: 150 | Additional 10 Damage for every 0.1 Defense Affinity with Haki | Damage scales with Defense Affinity | Increases user's damage resistance by 15% × Defense Affinity)"},{"duration","(Max Damage: 6,000 | Projectile Size scales with Sniper Affinity and Charge | Slow duration: 2–4 seconds, scales with Affinity)"},{"duration","(Stun duration: 2–4 seconds, scales with Affinity)"}},abilities={{"Logia Reflex","passive",nil},{"Candy Blades","move","50 Sword"},{"Spike Body","move","75 Defense"},{"Jawbreaker","move","100 Sniper"},{"Syrup Trap","move","125 Defense"},{"Syrup Wave","move","150 Melee"},{"Syrup Hook","move","175 Sniper"}}},
+		{id="fruit.chilly",name="Chilly",aliases={"Hie Hie No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"reward","Additionally, their mastery over freezing temperatures grants immunity to the hypothermic effects of Snow."},{"duration","(Max Damage: 2,000 | Maximum Freeze duration: 6 seconds | Can freeze Tsunamis created by Quake)"}},abilities={{"Logia Reflex","passive",nil},{"Freezing Punch","move","100 Melee"},{"Chilly Sword","move","50 Sword"},{"Ice Path","move","70 Melee"},{"Ice Wave","move","400 Sniper"}}},
+		{id="fruit.chop",name="Chop",aliases={"Bara Bara No Mi"},category="fruit",verification="documented",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"internalName"},facts={{"duration","Once reaching the target, the arm will slash away repeatedly for ~10 seconds."}},abilities={{"Chop Choke","move","100 Melee"},{"Chop Pursuit","move","150 Sword"},{"Chop Car","move","200 Melee"},{"Chop Buzzsaw","move","250 Sword"},{"Chop Festival","move","300 Melee"}}},
+		{id="fruit.clear",name="Clear",category="fruit",verification="archived",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"internalName"}},
+		{id="fruit.clone",name="Clone",aliases={"Mane Mane No Mi"},category="fruit",verification="archived",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"internalName"}},
+		{id="fruit.dark",name="Dark",aliases={"Yami Yami No Mi"},category="fruit",verification="documented",rarity="Ultra Rare",fruitType="Special Paramecia",wiki=6,unknown={"internalName"},facts={{"requirement","You may be one with the darkness, but you now carry the burden of the supernatural, having a body that must bear its costs."}},abilities={{"Inexorable Touch","passive",nil},{"Dark Body","passive",nil},{"Cursed","passive",nil},{"Dark Charge","move",nil},{"Dark Vortex","move",nil},{"Black Hole","move",nil}}},
+		{id="fruit.diamond",name="Diamond",aliases={"Kira Kira No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"spawn","(Damage Reduction starts at 35% w/ maxed Defense Stat | Increases by 2.5% for every 0.1 Defense Affinity | Knockback Resistance scales with Affinity | Cannot be disabled by stuns | Weighs down and sinks small boats while active)"}},abilities={{"Diamond Bar","passive",nil},{"Diamond Capacity","passive",nil},{"Recharge","passive",nil},{"Activation Cooldown","passive",nil},{"Break Cooldown","passive",nil},{"Diamond Body","move","20 Defense"},{"Diamond Sword","move","50 Sword"},{"Diamond Cluster","move","80 Defense"}}},
+		{id="fruit.dough",name="Dough",aliases={"Mochi Mochi No Mi"},category="fruit",verification="documented",rarity="Ultra Rare",fruitType="Special Paramecia",wiki=6,unknown={"internalName"},abilities={{"Burning Mochi","move","300 Sniper"},{"Dough Bazooka","move","250 Melee"},{"Mochi Gatling","move","500 Melee"},{"Donut Roll","move","300 Melee"},{"Mochi Wasteland","move","450 Defense"},{"Torque Mochi","move","500 Defense"}}},
+		{id="fruit.flare",name="Flare",aliases={"Mera Mera No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"requirement","(Immune to Melee, Sword, and Gun attacks without Haki | Burn deals up to 350 damage per tick at maximum Affinity | Burn damage scales with the required stat of each ability | Burn can be removed by entering water)"},{"spawn","The user releases a tremendous wave of fire that expands horizontally in every direction, creating a 360-degree explosion of flames capable of striking opponents surrounding them."},{"duration","Charging takes approximately 15 seconds."}},abilities={{"Logia Reflex","passive",nil},{"Jet","move","100 Melee"},{"Fire Fist","move","50 Sniper"},{"Fire Wave","move","200 Defense"},{"Flame Pillar","move","250 Defense"},{"Flame Emperor","move","400 Sniper"}}},
+		{id="fruit.float",name="Float",aliases={"Fuwa Fuwa No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"duration","(Increased Dash Distance | Reduced Dash Cooldown | Holding Spacebar/Jump activates Floating | Float Duration scales with Haki, ranging from 5–10 seconds | Flight Disabled | Stuns interrupt Floating)"},{"spawn","The user summons six small rocks that begin floating and orbiting around their body while the ability is being charged."},{"duration","(Charge Time: 6 seconds | Cooldown: 6 seconds | Six projectiles | 1,500 Damage per Rock × Affinity | Decent-sized projectile hitboxes | Rocks visually orbit the user similarly to Vampire's Necromancy)"},{"spawn","The user summons two enormous stone slabs on opposite sides of a targeted location before forcefully bringing them together."},{"requirement","Its broad area of effect makes it particularly effective against groups of opponents, although its relatively short range requires careful positioning."},{"spawn","The summoned construct uses the same environmental material manipulation mechanic as Gravity Assault."},{"spawn","The user summons six enormous lions around their position, commanding them to charge toward a central location."},{"duration","(Six Giant Lions | 5,000 Damage × Affinity per Lion | Ground Spike deals an additional 5,000 Damage × Affinity | Applies Slow similar to Tsunami | Charge Time: 20 seconds | Cooldown: 2 minutes | Uses the same charge and cooldown system as Meteor)"}},abilities={{"Weightless","passive",nil},{"Rock Rush","move","50 Sniper"},{"Crushing Pillars","move","100 Defense"},{"Float Prison","move","150 Defense"},{"Lion's Mane","move","200 Melee"},{"Float Slab","move","250 Defense"},{"Lion's Cage","move","400 Sniper"}}},
+		{id="fruit.gas",name="Gas",aliases={"Gasu Gasu No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},abilities={{"Logia Reflex","passive",nil},{"Gas Form","move","200 Melee"},{"Blue Sword","move","50 Sword"},{"Airless World","move","100 Defense"},{"Gastille","move","200 Sniper"},{"Flammable","move","250 Defense"},{"Gas Robe","move","300 Defense"}}},
+		{id="fruit.gravity",name="Gravity",aliases={"Zushi Zushi No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Paramecia",wiki=4,unknown={"internalName"},facts={{"spawn","By altering the gravity surrounding themselves and their opponents, the user can levitate, repel enemies, crush targets beneath immense pressure, and summon devastating celestial objects from the heavens."},{"reward","Even the strongest will eventually yield to gravity."},{"spawn","The user manipulates gravitational forces to summon a barrage of meteors from above, raining them down across the surrounding area."},{"spawn","After being summoned, the meteor begins its descent, eventually crashing into the battlefield with tremendous destructive force and destroying everything caught within its impact."}},abilities={{"Gravity Flying","move","200 Defense"},{"Gravity Repel","move","75 Sniper"},{"Gravity Assault","move","100 Sniper"},{"Crushing Force","move","300 Defense"},{"Meteor Shower","move","300 Sniper"},{"Meteor Crash","move","400 Sniper"}}},
+		{id="fruit.gum",name="Gum",aliases={"Gomu Gomu No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"reward","Gum is a Paramecia-type Devil Fruit that grants the user's body the properties of rubber, allowing them to stretch, extend, and propel their limbs with tremendous force."},{"reward","The user's rubber composition grants immunity to melee and gun attacks, as well as Rumble abilities, provided the attacker does not have Haki."},{"requirement","This transformation unlocks an entirely new set of Jet-based techniques."},{"requirement","Upon unlocking Second Gear at 100 Melee, the user gains access to the Jet ability moveset while transformed."},{"requirement","Even the greatest engines must eventually slow down."}},abilities={{"Rubber Body","passive",nil},{"Normal Mode","move",nil},{"Pistol","move","25 Melee"},{"Bazooka","move","50 Melee"},{"Gatling","move","75 Melee"},{"Gum Rocket","move","100 Melee"},{"2nd Gear","move","100 Melee"},{"Jet Pistol","move","125 Melee"},{"Jet Bazooka","move","150 Melee"},{"Jet Gatling","move","175 Melee"},{"Jet Rocket","move","200 Melee"},{"Gear Down","move","100 Melee"},{"Smelt & Hot","move",nil},{"Vampire","move",nil},{"Venom","move",nil},{"Magma","move",nil},{"Candy & Snow","move",nil},{"Dark","move",nil}}},
+		{id="fruit.hobby",name="Hobby",aliases={"Hobi Hobi No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"requirement","Those under the effect of your transformation skill cannot willingly end themselves and must wait for their time to be their self again by the grace of your mercy."},{"requirement","(Requires the target to be transformed)"}},abilities={{"Transform","move","50 Melee"},{"Revert","move","50 Melee"},{"Target","move","150 Melee"}}},
+		{id="fruit.hollow",name="Hollow",aliases={"Horo Horo No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Paramecia",wiki=4,unknown={"internalName"},facts={{"requirement","(Float-type flight | Momentum affects movement speed | Projection is immune to damage | Physical body remains vulnerable | Required for Possession)"},{"spawn","The user summons a multitude of miniature Hollows that seek out nearby enemies, relentlessly pursuing and damaging their targets."},{"spawn","(75 Base Damage per Hollow | Haki Supported & Damage and number of mini-hollows spawned scales w/ Sniper Affinity)"}},abilities={{"Projection","move","100 Defense"},{"Fade","move","100 Defense"},{"Negative Hollow","move","100 Sniper"},{"Special Hollow","move","300 Sniper"},{"Mini-Hollow","move","200 Sniper"}}},
+		{id="fruit.hot",name="Hot",aliases={"Atsu Atsu No Mi"},category="fruit",verification="documented",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"internalName"},facts={{"reward","Hot is a paramecia-type that give the user the ability to produce and control an unprecedented amount of heat."},{"spawn","Unleash every ounce of accumulated heat in a devastating burst."}},abilities={{"Nose Jet","move","200 Defense"},{"Hot Body","move","50 Defense"},{"Overheat","move","250 Defense"},{"Overheat","move","C"},{"Damage Formula","move",nil},{"Heatwave","move","300 Defense"},{"Damage Formula","move",nil}}},
+		{id="fruit.light",name="Light",aliases={"Pika Pika No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"spawn","A continuous stream of concentrated light, growing increasingly destructive with every passing moment."},{"spawn","(Duration: 5 seconds | 20 Hits | Hits every 0.25 seconds | Starting Damage: 10, scaling up to 20 with Affinity | Damage progressively increases with each hit | Starting Damage scales with Affinity)"}},abilities={{"Logia Reflex","passive",nil},{"Light Sword","move","100 Sword"},{"Light Blast","move","20 Sniper"},{"Yata Mirror","move","300 Melee"},{"Light Beam","move","250 Sniper"},{"Sacred Jewels","move","300 Defense"}}},
+		{id="fruit.love",name="Love",aliases={"Mero Mero No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},abilities={{"Petrified Vulnerability","passive",nil},{"Petrify","move","25 Defense"},{"Glare","move","100 Sniper"},{"Pistol Kiss","move","150 Sniper"},{"Beam","move","200 Sniper"},{"Slave Arrow","move","250 Sniper"},{"Arrow Storm","move","300 Sniper"}}},
+		{id="fruit.luck",name="Luck",aliases={"Raki Raki No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"reward","Its unique mechanics revolve around a Luck Bar, rewarding fortunate outcomes while allowing the user to gradually improve the effectiveness of their abilities."},{"duration","(Removes current stun | Increased Luck for 5 seconds)"},{"reward","The user activates a roulette-style slot machine, rolling for a variety of potential rewards."},{"reward","However, matching three identical symbols grants a special reward depending on the result."},{"duration","- 3 Skulls: The user is stunned for 1 second but receives additional Luck Bar."},{"reward","- 3 Sevens: Increases the user's health regeneration and significantly enhances the luck effectiveness of other abilities, preventing them from producing unfavorable rewards."},{"cost","There is a 1-in-6 chance of the coin landing on its damaging outcome, dealing damage equivalent to 25% of the target's health multiplied by the user's Sniper Affinity."},{"reward","Any other result grants the user additional Luck Bar based on their Sniper Affinity."},{"requirement","When the user is already benefiting from luck-enhancing effects granted by other abilities, the probability of obtaining the damaging outcome increases to 1-in-3."},{"spawn","The user summons a golden skull that radiates an aura of luck, temporarily enhancing their fortune and draining the health of nearby opponents."},{"duration","(Luck enhancement lasts 5 seconds × Defense Affinity | Nearby opponents lose 2.5–5% of their health per second | Fortune's Purge detonates the skull for additional damage)"}},abilities={{"Fortune's Favor","passive",nil},{"Fortune's Purge","move",nil},{"Slot Machine","move",nil},{"Dice Roll","move",nil},{"Coin Throw","move",nil},{"Golden Casino","move",nil}}},
+		{id="fruit.magma",name="Magma",aliases={"Magu Magu No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"reward","Their elemental nature also grants natural resistance against other forms of heat and elemental attacks."},{"reward","While Magma Body is active, the user's intense temperature grants immunity to the slowing effects of Snow."},{"reward","(Max Damage: 400 | Applies Burn | Burn damage scales with Defense Affinity | Grants immunity to Snow's Slow while active)"},{"duration","(Max Damage: 6,000 | Chargeable | Magma Burn deals up to 200 damage over time | Burn duration: 20 seconds)"},{"spawn","The longer the ability is charged, the higher the magma fists spawn, allowing them to descend from greater heights and gradually grow larger as they fall."}},abilities={{"Logia Reflex","passive",nil},{"Magma's Dominance","passive",nil},{"Magma Body","move","200 Defense"},{"Magma Pool","move","20 Defense"},{"Great Eruption","move","50 Melee"},{"Magma Flow","move","200 Sniper"},{"Volcanic Leap","move","150 Melee"},{"Magma Rain","move","400 Melee"}}},
+		{id="fruit.ope",name="Ope",aliases={"Ope Ope No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Paramecia",wiki=4,unknown={"internalName"},facts={{"reward","Unlike most Devil Fruits, its abilities rely heavily on stamina management, rewarding users who carefully manage their resources and control the battlefield."},{"spawn","Every operation comes at a cost."},{"requirement","- Stamina Consumption: All Ope abilities require stamina to activate."},{"reward","- Kill Reward: Killing another player restores 50% of the user's stamina."},{"requirement","(Size scales with Defense and Defense Affinity | Required to use all other Ope abilities | Stamina regeneration is reduced while active )"},{"duration","(150 Stamina per use | Maximum Damage: 50% of target's maximum HP | Disables the target's Devil Fruit abilities for 2 seconds upon crushing the heart | Does not award Bounty or Beri upon killing the target)"},{"duration","(Maximum HP Reduction: 25% × Sword Affinity | Duration: 5 seconds × Sword Affinity | Uses Sword Affinity | Maximum HP reduction is not direct damage | Healing is capped at the temporarily reduced maximum HP)"}},abilities={{"Stamina Bar","passive",nil},{"Room","move","40 Defense"},{"Shambles","move","100 Defense"},{"Severance","move","200 Sword"},{"Scalpel","move","400 Sword"},{"Gamma Knife","move","300 Sword"}}},
+		{id="fruit.phoenix",name="Phoenix",aliases={"Tori Tori No Mi"},category="fruit",verification="documented",rarity="Ultra Rare",fruitType="Mythical Zoan",wiki=6,unknown={"internalName"},facts={{"reward","Phoenix is a Zoan-type devil fruit that grants the user the ability to turn into a phoenix and phoenix hybrid at will, as well as granting immense healing power to themselves and those around the user."}},abilities={{"Phoenix Flames","passive",nil}}},
+		{id="fruit.plasma",name="Plasma",aliases={"Zuma Zuma No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Paramecia",wiki=4,unknown={"internalName"},facts={{"requirement","The sphere automatically attacks any opponents who venture sufficiently close, dealing continuous damage without requiring the user to manually target them."},{"spawn","The user releases a tremendous burst of plasma in every direction, damaging nearby opponents caught within its radius."},{"spawn","(Maximum Damage: 7,200 | Damage starts at 4,200 with maximum Defense and increases by 300 for every 0.1 Defense Affinity with Haki)"}},abilities={{"Logia Reflex","passive",nil},{"Energize","move","80 Melee"},{"Plasma Coil","move","180 Sniper"},{"Plasma Burst","move","240 Defense"},{"Plasma Cannon","move","360 Sniper"}}},
+		{id="fruit.pumpkin",name="Pumpkin",aliases={"Kabo Kabo No Mi"},category="fruit",verification="documented",rarity="Rare",wiki=4,unknown={"internalName"},facts={{"spawn","Pumpkin is a non-cannon seaonsal-born paramecia-type Devil Fruit that allows the user to summon and manipulate pumpkins, vines, and supernatural plant-based constructs."},{"spawn","The user summons a collection of vines that erupt from the ground at a targeted location, ensnaring anyone caught within their reach."},{"duration","(Max Range: 120 studs | Damage: 900 | Area Radius: 11–16 studs | Root Duration: 1.6 seconds | Rooted opponents can still attack | 9-second cooldown)"},{"duration","(Damage Reduction: 80–88% | Duration: 3.5–4.5 seconds | Burst Damage: 700 | Explosion Radius: 13–17 studs | Cooldown: 15 seconds after the ability ends | Stuns break the shell without triggering its explosion)"},{"spawn","Additional lanterns are gathered every 0.4 seconds, allowing the user to build up a devastating volley of explosive projectiles."},{"spawn","(Duration: 7 seconds | Area Width: 22–30 studs | Reduces enemy movement speed by 50% | Pumpkin eruption every 0.5–0.7 seconds | 160 Damage per tick| Damage cannot be dodged | Stuns do not terminate the ability | 20-second cooldown)"},{"duration","- Duration: 20–30 seconds."},{"duration","- Vine Snare: Root duration increases from 1.6 to 2.2 seconds."},{"duration","(Cooldown: 60 seconds after the transformation ends)"}},abilities={{"Pumpkin Bomb","move","50 Sniper"},{"Vine Snare","move","100 Defense"},{"Pumpkin Shield","move","150 Defense"},{"Lantern Barrage","move","250 Sniper"},{"Patch Field","move","350 Defense"},{"Pumpking Form","move","450 Defense"},{"Transformation Effects","move",nil},{"Enhanced Ability Interactions","move",nil}}},
+		{id="fruit.quake",name="Quake",aliases={"Gura Gura No Mi"},category="fruit",verification="documented",rarity="Ultra Rare",fruitType="Paramecia",wiki=6,unknown={"internalName"},facts={{"spawn","Summon two tsunamis from both the left and right of the user."},{"spawn","The ground beneath your foes will be their downfall, every tremor comes unseen."},{"spawn","The user summons pillars of earth that deal damage."}},abilities={{"Seismic Wave","move",nil}}},
+		{id="fruit.rumble",name="Rumble",aliases={"Goro Goro No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"spawn","By harnessing tremendous electrical energy, the user can summon lightning strikes, unleash devastating electrical bursts, and travel across the battlefield through instantaneous lightning teleports."},{"spawn","However, with sufficient charge, the technique changes entirely: instead of firing a beam, the user summons a darkened cloud above the targeted location, calling down a devastating lightning strike upon the area."},{"spawn","(Damage: 600 in beam form or up to 12,000 in charged form | Range and Damage scale with Affinity | Charged form summons a lightning cloud above the target location)"},{"spawn","Zeus heeds your call, summon a giant storm cloud overhead, unleashing a relentless barrage of lightning bolts upon the battlefield."}},abilities={{"Logia Reflex","passive",nil},{"Lightning Teleport","passive",nil},{"Rumble Staff","move","100 Sword"},{"El Thor","move","200 Sniper"},{"Lightning Blitz","move","50 Melee"},{"Overload","move","100 Defense"},{"Thunderstorm","move","400 Defense"}}},
+		{id="fruit.sand",name="Sand",aliases={"Suna Suna No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"spawn","By controlling the shifting sands, the user can summon devastating sand formations, create bladed weapons, and unleash powerful sandstorms capable of trapping opponents."}},abilities={{"Logia Reflex","passive",nil},{"Sand Flying","move","100 Melee"},{"Sand Spike","move","50 Sniper"},{"Desert Spada","move","150 Sword"},{"Sandstorm","move","100 Defense"}}},
+		{id="fruit.shadow",name="Shadow",aliases={"Kage Kage No Mi"},category="fruit",verification="possibly_obsolete",rarity="Rare",fruitType="Paramecia",wiki=4,unknown={"internalName"},facts={{"spawn","(3,200 Damage per Hit | Attacks every 4 seconds | Pursuit Duration: 10 seconds | Maximum Tracking Range: 200 studs)"},{"spawn","(Punches every 0.75 seconds | Shadow Wave every 3.5 seconds | Shadow Wave Damage: 1,200 | Shadow Wave can hit airborne targets)"},{"spawn","The user gathers shadows to unleash an enormous explosion of destructive energy, with its initial blast becoming stronger for every shadow consumed."},{"spawn","(Initial Explosion: 4,000 Damage + 1,000 per Shadow | Increased Explosion Radius | Continuous Aura: 700 Damage every 2 seconds | 40% Damage Reduction | 40-second cooldown)"}},abilities={{"Brick Bat","move",nil},{"Kage Kiri","move",nil},{"Doppelman","move",nil},{"Kagemusha","move",nil},{"Shadow Zombie","move",nil},{"Shadow's Asgard","move",nil}}},
+		{id="fruit.slip",name="Slip",aliases={"Sube Sube No Mi"},category="fruit",verification="documented",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"abilities","internalName"}},
+		{id="fruit.smelt",name="Smelt",aliases={"Gutsu Gutsu No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"reward","The user's molten composition grants immunity to Flare and Magma attacks, allowing them to withstand the intense heat of these elements without suffering damage."},{"requirement","(Speed scales with Defense Affinity | Haki must remain active to retain the increased damage after activation)"}},abilities={{"Molten Body","passive",nil},{"Molten Sword","move","50 Sword"},{"Silver Body","move","20 Defense"},{"Spew","move","50 Defense"},{"Ore Feast","move","100 Defense"}}},
+		{id="fruit.smoke",name="Smoke",aliases={"Moku Moku No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},abilities={{"Fly","move","100 Melee"},{"White Out","move","100 Melee"},{"White Fist","move","50 Melee"},{"Whiteout Burst","move","300 Defense"},{"Smoke Screen","move","350 Defense"}}},
+		{id="fruit.snow",name="Snow",aliases={"Yuki Yuki No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Logia",wiki=4,unknown={"internalName"},facts={{"requirement","(Requires contact with another player to apply Hypothermia | Hypothermia deals 395 damage per tick for 15 ticks at 2.0 Defense Affinity and maximum Defense)"},{"duration","(Hypothermia deals 500 damage per tick | Size scales with Defense and Affinity | Both variants disappear after 10 seconds)"}},abilities={{"Logia Reflex","passive",nil},{"Snow Globe","move","100 Defense"},{"Snow Body","move","100 Defense"},{"Snow Pellet","move","150 Sniper"},{"Snow Angel","move","200 Defense"},{"Snow Boulder","move","100 Sniper"},{"Snow Ring","move","200 Defense"}}},
+		{id="fruit.spin",name="Spin",aliases={"Fruit Fruit No Mi"},category="fruit",verification="documented",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"abilities","internalName"}},
+		{id="fruit.spring",name="Spring",aliases={"Bane Bane No Mi"},category="fruit",verification="confirmed",rarity="Common",fruitType="Paramecia",internal={"Workspace.Instances.Drops 'Spring Fruit' (FruitItem = Spring)"},wiki=5,evidence={level="confirmed"},abilities={{"Jump","move","20 Melee"}}},
+		{id="fruit.string",name="String",aliases={"Ito Ito No Mi"},category="fruit",verification="documented",rarity="Uncommon",fruitType="Paramecia",wiki=3,unknown={"internalName"},facts={{"duration","The web stays up for around 5 seconds."}},abilities={{"Release","move","10 Sniper"},{"Tether","move","50 Sniper"},{"Sky String","move","50 Sniper"},{"Flapping Thread","move","250 Sniper"},{"Bird Cage","move","300 Defense"},{"God Thread","move","400 Sniper"}}},
+		{id="fruit.swim",name="Swim",aliases={"Sui Sui No Mi"},category="fruit",verification="documented",rarity="Common",fruitType="Paramecia",wiki=5,unknown={"internalName"},abilities={{"Swim","move","80 Melee"},{"Dive","move","100 Melee"}}},
+		{id="fruit.vampire",name="Vampire",aliases={"Batto Batto No Mi"},category="fruit",verification="documented",rarity="Ultra Rare",fruitType="Mythical Zoan",wiki=6,unknown={"internalName"},facts={{"spawn","Every soul taken is another servant waiting to be awakened."},{"reward","Soul Collection: Killing an NPC or player through any means causes them to drop a soul, which can be collected and used for Necromancy."},{"reward","This ability grants increased movement speed and provides 50% damage reduction while active."},{"spawn","The user summons a swarm of bats that relentlessly pursue an individual target, rapidly dealing special damage."}},abilities={{"Soul Reaper","passive",nil},{"Sanguine Vampiris","move","50 Sword"},{"Hypnosis","move","300 Sniper"},{"Shadow Step","move","100 Melee"},{"Necromancy","move","100 Defence"},{"Bat Swarm","move","200 Sniper"},{"Transform","move","400 Melee"}}},
+		{id="fruit.venom",name="Venom",aliases={"Doku Doku No Mi"},category="fruit",verification="documented",rarity="Rare",fruitType="Paramecia",wiki=4,unknown={"internalName"},facts={{"spawn","- Fast Venom: Deals damage every 0.1 seconds."},{"spawn","- Normal/Medium Venom: Deals damage every 0.4 seconds."},{"spawn","- Slow Venom: Deals damage every 0.6 seconds."},{"requirement","Requires Poison Coat to be active and will deactivate it upon use."},{"spawn","Travel through your summoned Venom Hydra, entering its body and emerging from its mouth, allowing long-distance movement similar to Light's Yata Mirror."}},abilities={{"Venom Immunity","passive",nil},{"Venom Composition","passive",nil},{"Damage Over Time","passive",nil},{"Venom Road","passive",nil},{"Venom Demon Interaction","passive",nil},{"Poison Breath","move","50 Sniper"},{"Poison Coat","move","200 Defense"},{"Venom Hydra","move","400 Sniper"},{"Chloro Ball","move","400 Sniper"},{"Venom Demon Interaction","move",nil},{"Venom Demon","move","500 Defense"}}},
+		{id="info.credits",name="Credits",category="info",verification="documented",wiki=7},
+		{id="info.credits__archived",name="Credits",category="info",verification="archived",wiki=7,facts={{"requirement","The simplicity of the game kept many players hooked, and albeit a rather addictive, unique, and fun fruit obtainment method."}}},
+		{id="info.info",name="Info",category="info",verification="archived",wiki=7},
+		{id="info.legendary_mode",name="Legendary Mode",category="info",verification="documented",wiki=7,relations={{"links_to","island.mountain_island","wiki-link"},{"mentions","island.mountain_island","name"}},facts={{"requirement","To obtain Legendary Mode, players must max out every stat except buso and/or ken haki, achieve a bounty of 10 million, and have eaten a devil fruit."},{"requirement","### “_TO KNOW EVERYTHING, YOU MUST GIVE… EVERYTHING._”"}}},
+		{id="info.primordial",name="Primordial",category="info",verification="documented",wiki=7,facts={{"requirement","The simplicity of the game kept many players hooked, and albeit a rather addictive, unique, and fun fruit obtainment method was one the greatest things to look forward to, alongside it’s unique and primary devil fruit mechanic: Legendary Mode."}}},
+		{id="info.rarity_boxes",name="Rarity Boxes",category="info",verification="unknown",wiki=7,unknown={"description"}},
+		{id="info.stats_and_affinity",name="Stats & Affinity",category="info",verification="documented",wiki=7,facts={{"requirement","You level these up to increase devil fruit damage, weapon damage, effects, and unlock skills attuned to that specific stat."}}},
+		{id="island.abandoned_base",name="Abandoned Base",category="island",group="other",verification="documented",wiki=8,unknown={"internalName"},facts={{"requirement","There must’ve been a reason for it long ago considering the watch towers placement."}}},
+		{id="island.big_snow",name="Big Snow",category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.caver_island",name="Caver Island",aliases={"The Gunners Cave Island"},category="island",group="other",verification="inferred",internal={"Map.Islands.IslandCaver"},wiki=8,evidence={level="inferred",note="QuestCaver (Sheriff Dale) en ella"},relations={{"mentions","npc.krusch","name"}}},
+		{id="island.cliff_tops",name="Cliff Tops",category="island",group="other",verification="inferred",internal={"Map.Islands.IslandCliffs"},wiki=8,evidence={level="inferred"}},
+		{id="island.clover_isle",name="Clover Isle",aliases={"Expertise Island"},category="island",group="other",verification="documented",wiki=8,relations={{"links_to","npc.the_expert","wiki-link"},{"mentions","npc.the_expert","name"}},unknown={"internalName"}},
+		{id="island.crab_isle",name="Crab Isle",category="island",group="other",verification="inferred",internal={"Map.Islands.Island15"},wiki=8,evidence={level="inferred",note="tiene QuestCrabIsle al lado"}},
+		{id="island.crescent",name="Crescent",category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.death_spire",name="Death Spire",category="island",group="other",verification="documented",wiki=8,unknown={"internalName"},facts={{"spawn","They say if you bring 13 devil fruits for the lower circle, and 3 for what’s at the top, you can summon a knight of steel, darkness, and evil."}}},
+		{id="island.deepwaken_trench",name="Deepwaken Trench",category="island",group="other",verification="inferred",internal={"Map.Islands.IslandDeepwake"},wiki=8,evidence={level="inferred",note="nombre interno visto; correspondencia por nombre"},relations={{"mentions","enemy.captain_blacksurf","name"}},facts={{"spawn","Every once in a while, the town’s champion swims by to challenge any of powerful locals."},{"reward","Be wary, he’s not an easy foe, and if by some miracle you do win, he may be humble enough to give you his surfboard."}}},
+		{id="island.galley_isle",name="Galley Isle",aliases={"Plaza"},category="island",group="other",verification="documented",wiki=8,relations={{"mentions","npc.fish_merchant","name"}},unknown={"internalName"}},
+		{id="island.gull_rock",name="Gull Rock",aliases={"Not much is on this rock"},category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.halloween_island",name="Halloween Island",aliases={"Moria’s Land","Shadow Island","Spooky Island"},category="island",group="halloween",verification="inferred",internal={"Map.Islands.IslandHalloween"},wiki=8,evidence={level="inferred",note="nombre interno visto en 1.3.0"},relations={{"in_region","region.halloween","wiki-group"}},facts={{"reward","Or Shadow Island, considering the creepy vibes this place gives off, is a seasonal island that’s appeared from the fog this Halloween to grant several tricks… and a new treat."},{"spawn","Do not fear though, explore this island before it vanishes sometimes late Fall."}}},
+		{id="island.jungle_island",name="Jungle Island",aliases={"The Jungle"},category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.marine_base",name="Marine Base",aliases={"Marine Fort"},category="island",group="other",verification="inferred",internal={"Map.Islands.Island4"},wiki=8,evidence={level="inferred",note="tiene QuestMarine al lado"},relations={{"mentions","enemy.marines","name"}}},
+		{id="island.merlins_island",name="Merlin's Island",aliases={"Merlin’s Island"},category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.mountain_island",name="Mountain Island",category="island",group="other",verification="inferred",internal={"Map.Islands.IslandMountain"},wiki=8,evidence={level="inferred"}},
+		{id="island.pyramid",name="Pyramid",aliases={"Pyramid Island"},category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.race_track_island",name="Race Track Island",category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.rasputins_tower",name="Rasputin's Tower",category="island",verification="archived",wiki=8,unknown={"internalName"}},
+		{id="island.revelry_island",name="Revelry Island",category="island",group="other",verification="documented",wiki=8,unknown={"internalName"},facts={{"reward","The drinks are a life saver, and provide a boost far greater than what Sam’s bartender might give."}}},
+		{id="island.rot_island",name="Rot Island",aliases={"Rotted Island"},category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.sams_bar_and_pirates_land",name="Sam's Bar & Pirate's Land",aliases={"Sam’s Bar","Pirate's Land","Sam's Bar"},category="island",group="other",verification="confirmed",internal={"Map.Islands.IslandPirate"},wiki=8,evidence={level="confirmed",note="QuestMerchant2 'Quest Man' (~ -1305, 217, -1352); compass reclamado"}},
+		{id="island.sand_dunes",name="Sand Dunes",aliases={"The Dunes"},category="island",group="other",verification="inferred",internal={"Map.Islands.IslandSandCastle"},wiki=8,evidence={level="inferred",note="los Fred y su NPC están ahí"},relations={{"mentions","npc.fortune_teller","name"},{"mentions","enemy.the_freds","name"}},facts={{"reward","There’s a fortune teller in the back who gives strange compasses… nothing likes Sam’s."}}},
+		{id="island.smith_island",name="Smith Island",category="island",group="other",verification="unknown",wiki=8,unknown={"description","internalName"}},
+		{id="island.snowy_island",name="Snowy Island",aliases={"Little Snow"},category="island",group="other",verification="documented",wiki=8,unknown={"internalName"}},
+		{id="island.tree_island",name="Tree Island",aliases={"Bob Land"},category="island",group="other",verification="inferred",internal={"Map.Islands.IslandTREEA"},wiki=8,evidence={level="inferred"},relations={{"mentions","npc.calm_bob","name"}}},
+		{id="island.windmill_and_town_island",name="Windmill & Town Island",aliases={"Spawn Islands","Windmill Island","Town Island"},category="island",group="other",verification="inferred",internal={"Map.Islands.IslandWindmill","Map.Islands.IslandTown"},wiki=8,evidence={level="inferred",note="la wiki junta dos islas del juego"},contradictions={"La wiki junta en una tarjeta dos islas que en el juego son modelos distintos (IslandWindmill, IslandTown)."},facts={{"spawn","Spawn Islands,"}}},
+		{id="item.black_abyss_crab_toy",name="Black Abyss Crab Toy",category="item",verification="documented",wiki=0,card="Fishing"},
+		{id="item.blessed_rod",name="Blessed Rod (Tier 4)",category="item",verification="documented",wiki=0,card="Fishing",relations={{"requires","item.super_rod","wiki"},{"requires","objective.sell_to_chef","wiki"},{"requires","objective.open_caches","wiki"},{"requires","objective.defeat_boss_times","wiki"},{"requires","objective.bring_item","wiki"}},facts={{"requirement","Catch 2,000 fish, sell 500 to the Chef, open 15 Emerald Caches, beat Captain Blacksurf five times and bring Merlin his logbook (a rare drop of his). Then he blesses your Super Rod for 10,000,000 Beri."}}},
+		{id="item.compass",name="Compass",category="item",verification="confirmed",internal={"Tool Compass"},srcEvidence="Auto Sam",evidence={level="confirmed"}},
+		{id="item.deep_reach_rod",name="Deep Reach Rod (Tier 5)",category="item",verification="documented",wiki=0,card="Fishing",relations={{"requires","item.blessed_rod","wiki"},{"requires","objective.difficult_catches","wiki"},{"rewards","item.black_abyss_crab_toy","wiki"}},facts={{"requirement","Catch 2,000 fish with a Blessed Rod in your bag and he tells you about the deep; land 25 Hard or Impossible catches with it and he hands you the Deep Cache"}}},
+		{id="item.df_coin",name="DFCoin",category="item",verification="documented",wiki=0,card="Suspicious Man"},
+		{id="item.essence",name="Essence",category="item",verification="documented",wiki=0,card="Trait Sage",unknown={"obtainment"},facts={{"cost","Exchange two essences to gain a trait roll."}}},
+		{id="item.fish",name="Pez (Small / Medium / Large / Huge)",category="item",verification="confirmed",wiki=0,card="Fishing",facts={{"reward","Sell Value at 10/10: Small 1,000; Medium 5,000; Large 10,000; Huge 25,000 beri (x5 cooked)"}}},
+		{id="item.fishing_cache",name="Cache de pesca (Copper T1 … Ruby T7, Deep Reach)",category="item",verification="documented",wiki=0,card="Fishing",unknown={"rewards"},contradictions={"La wiki dice 'Ruby requires at least Rod Tier 4', pero la tabla pone la Blessed Rod (Tier 4) como Unavailable en todas las dificultades."},facts={{"reward","Caches can yield different rewards depending on the Tier, Copper is Tier 1, and Ruby is Tier 7."}}},
+		{id="item.fruit_box",name="Caja de fruta (Common Box…)",category="item",verification="confirmed",internal={"Tool '<Rareza> Box'","FruitBoxService.RE.Open"},srcEvidence="Auto abrir cajas",evidence={level="confirmed"},unknown={"dropRates","obtainment"}},
+		{id="item.golden_compass",name="Golden Compass",category="item",verification="documented",wiki=0,card="Suspicious Man",facts={{"cost","Golden Compass: 14 DFCoins"}}},
+		{id="item.haki_book",name="Haki Book (Ken / Buso)",category="item",verification="confirmed",srcEvidence="inventario",unknown={"obtainment","use"}},
+		{id="item.merlins_logbook",name="Logbook (drop de Captain Blacksurf)",category="item",verification="documented",wiki=0,card="Fishing"},
+		{id="item.package",name="Package (Merlin)",category="item",verification="confirmed",internal={"Tool Package"},srcEvidence="Auto Merlin",evidence={level="confirmed"},unknown={"obtainment"}},
+		{id="item.stat_juice",name="Zumo de fruta normal",category="item",verification="confirmed",srcEvidence="Auto Stats"},
+		{id="item.sturdy_rod",name="Sturdy Rod (Tier 2)",category="item",verification="documented",wiki=0,card="Fishing",relations={{"requires","objective.fish_count","wiki"}},facts={{"requirement","Obtainment: Keep fishing until you reach 200 Fish caught."},{"duration","Catch Rate: ~15 seconds per fish."}}},
+		{id="item.super_rod",name="Super Rod (Tier 3)",category="item",verification="documented",wiki=0,card="Fishing",relations={{"requires","item.sturdy_rod","wiki"}},facts={{"requirement","Owning the Sturdy Rod and 1 million Beri, then talking to Merlin will allow you to get the Super Rod."},{"duration","Catch Rate: ~10 seconds per fish."}}},
+		{id="item.treasure_chest",name="Cofre (Common / Rare / Epic / Legendary)",category="item",verification="confirmed",wiki=0,card="Treasure Rain",relations={{"rewards","item.compass","wiki"}},contradictions={"Common Chest '~5,00 Beri' (errata en la wiki: ¿5.000?)."},facts={{"reward","Epic Chest (Purple Glow): ~50,000 Beri, ~20 Gems, ~2 Compasses; Legendary (Gold glow): ~200,000 Beri, ~35 Gems, ~4 Compasses"}}},
+		{id="item.treasure_map",name="Treasure Map",category="item",verification="documented",wiki=0,card="Ghost Ship",unknown={"use"}},
+		{id="item.wood_rod",name="Wood Rod (Tier 1)",category="item",verification="documented",wiki=0,card="Fishing",facts={{"requirement","Obtainment: Do a quest for Merlin, and he’ll give you this rod."},{"duration","Catch Rate: ~25 seconds per fish."}}},
+		{id="location.fisher_plaza",name="Fisher Plaza",category="location",verification="documented",wiki=0,card="Fishing",unknown={"island"}},
+		{id="mechanic.cooking",name="Cocinar pescado (x5 de valor)",category="mechanic",verification="documented",wiki=0,card="Fishing",relations={{"part_of","system.fishing","wiki"},{"related","npc.chef","wiki"}},unknown={"location","remotes"}},
+		{id="mechanic.expertise",name="Expertise (misiones de The Expert)",category="mechanic",verification="documented",wiki=0,card="The Expert",relations={{"rewards","mechanic.sam_compass","wiki"}},contradictions={"EXP por misión: Easy 100 > Medium 30 > Hard 20 (al revés de lo esperable; tal cual en la wiki)."},facts={{"spawn","He offers a quest every xx:00 UTC."},{"cost","You can upgrade this up to 2 times for a total of 3 stored quests • First upgrade: 500 Gems • Second upgrade: 1000"},{"reward","Quest exp (Normal/Elite): 100/140 Easy, 30/50 Medium, 20/40 Hard"}}},
+		{id="mechanic.fishing_rod_progression",name="Progresión de cañas (Tier 1 → 5)",category="mechanic",verification="documented",wiki=0,card="Fishing",relations={{"part_of","system.fishing","wiki"}}},
+		{id="mechanic.fruit_exchange",name="Canje de frutas por recompensas",category="mechanic",verification="documented",wiki=0,card="Suspicious Man",relations={{"part_of","npc.suspicious_man","wiki"}},facts={{"reward","Common Fruits: 25K Beri; Uncommon Fruits: 100K Beri; Rare Fruits: 1M Beri/ 50 Gems/ 1 DFCoin; Ultra Rare Box: 15M Beri/ 500 Gems/ 10 DFCoins"},{"cost","Prices are halved on weekends (Friday, Saturday, and Sunday.)"}}},
+		{id="mechanic.fruit_summon",name="Invocación con frutas (Death Spire)",category="mechanic",verification="documented",wiki=0,card="Death Spire",relations={{"part_of","island.death_spire","wiki"}}},
+		{id="mechanic.haki_training",name="Entrenamiento de haki (dojo)",category="mechanic",verification="confirmed",internal={"HakiDojoService Start/Strike/Answer/Game"},srcEvidence="Auto Train",evidence={level="confirmed"},relations={{"related","npc.silvers_rayleigh","evidence"}}},
+		{id="mechanic.quest_exp_allocation",name="Reparto de EXP de misiones",category="mechanic",verification="documented",wiki=0,card="Quest Givers",relations={{"related","objective.board_quest","wiki"}}},
+		{id="mechanic.sam_compass",name="Compass de Sam (cada 20 min)",category="mechanic",verification="confirmed",internal={"player @CompassTokenAt","Tool Compass @TreasureTarget"},srcEvidence="Auto Sam",evidence={level="confirmed"},facts={{"spawn","Expertise quests reward Expertise exp and reduce Sam’s current quest timer by 5 minutes."}}},
+		{id="mechanic.stat_juices",name="Zumos de stats (barriles y exprimidor)",category="mechanic",verification="confirmed",internal={"Map.Barrels","Map.Other.Tent2.Model.JuicingBowl"},srcEvidence="Auto Stats",evidence={level="confirmed"},relations={{"rewards","item.stat_juice","evidence"}}},
+		{id="npc.advanced_bartender_dance_club",name="Advanced Bartender (Dance Club)",category="npc",group="other",verification="documented",wiki=9,unknown={"internalName","location"},facts={{"reward","Gives Exp drinks for each stat that matches color."}}},
+		{id="npc.bartender_sams",name="Bartender (Sam's)",category="npc",group="other",verification="unknown",wiki=9,unknown={"description","internalName","location"}},
+		{id="npc.beachcomber_lou",name="Beachcomber Lou",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestCrabIsle"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.boatmaster",name="Boatmaster",category="npc",group="other",verification="documented",roles={"merchant"},wiki=9,unknown={"internalName","location"}},
+		{id="npc.calm_bob",name="Calm Bob",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestTreea"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.candy_witch_hazel",name="Candy Witch Hazel",category="npc",group="halloween",verification="unknown",wiki=9,relations={{"in_region","region.halloween","wiki-group"}},unknown={"description","internalName"}},
+		{id="npc.captain_bram",name="Captain Bram",aliases={"Guard Captain Bram"},category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestTown"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.chef",name="Chef",category="npc",verification="documented",wiki=0,card="Fishing",unknown={"internalName","location","name"},facts={{"requirement","Fish can be cooked at campfires or the fryer next to the chef."}}},
+		{id="npc.climber_edda",name="Climber Edda",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestCliffs"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.dancer",name="Dancer",category="npc",group="other",verification="unknown",wiki=9,unknown={"description","internalName","location"}},
+		{id="npc.death_spire_mage",name="Mago de Death Spire (sin nombre)",category="npc",verification="documented",wiki=0,card="Death Spire",relations={{"located_at","island.death_spire","wiki"}},unknown={"internalName","name"},facts={{"spawn","There’s an old mage that rests somewhere on the lower circle, maybe he can tell you more?"}}},
+		{id="npc.dockmaster_rolf",name="Dockmaster Rolf",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestWindmill"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.elder_moray",name="Elder Moray",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestDeepwake"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.fish_merchant",name="Fish Merchant",category="npc",group="other",verification="confirmed",roles={"merchant"},internal={"Map.Merchants.FishMerchant"},wiki=9,evidence={level="confirmed",note="venta sin grabar"},relations={{"located_at","location.fisher_plaza","wiki"}},contradictions={"La wiki lo sitúa en 'Fisher Plaza', que no aparece entre las islas (Points of Interest)."}},
+		{id="npc.fortune_teller",name="Fortune Teller",category="npc",group="other",verification="unknown",wiki=9,unknown={"description","internalName","location"}},
+		{id="npc.gravekeeper_mort",name="Gravekeeper Mort",category="npc",group="halloween",verification="unknown",wiki=9,relations={{"in_region","region.halloween","wiki-group"}},unknown={"description","internalName"}},
+		{id="npc.hal_the_deserter",name="Hal the Deserter",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestMarine"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.hermit_oswin",name="Hermit Oswin",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestPursuer"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.krusch",name="Krusch",category="npc",group="other",verification="unknown",wiki=9,relations={{"located_at","island.caver_island","wiki"}},unknown={"description","internalName"}},
+		{id="npc.little_boo",name="Little Boo",category="npc",group="halloween",verification="possibly_obsolete",wiki=9,relations={{"in_region","region.halloween","wiki-group"}},unknown={"internalName"}},
+		{id="npc.lucy_affinity_diviner",name="Lucy, Affinity Diviner",aliases={"Lucy"},category="npc",group="other",verification="unknown",wiki=9,relations={{"related","info.stats_and_affinity","wiki"}},unknown={"description","internalName","location"}},
+		{id="npc.mama_fredda",name="Mama Fredda",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestSandCastle"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.merlin",name="Merlin",category="npc",group="other",verification="confirmed",roles={"quest_giver","merchant"},internal={"Map.Merchants.QuestFishMerchant"},wiki=9,evidence={level="confirmed",note="MerlinService TakePackage/Deliver grabados"},relations={{"located_at","island.merlins_island","wiki"},{"gives_quest","objective.deliver_package","evidence"},{"gives_quest","objective.fish_count","evidence"},{"sells","item.wood_rod","wiki"},{"sells","item.super_rod","wiki"},{"sells","item.blessed_rod","wiki"}}},
+		{id="npc.mirra_the_runaway",name="Mirra the Runaway",category="npc",verification="archived",wiki=9,unknown={"internalName","location"}},
+		{id="npc.old_fishman",name="Old Fishman",category="npc",group="other",verification="unknown",wiki=9,unknown={"description","internalName","location"}},
+		{id="npc.old_miner_gus",name="Old Miner Gus",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestMountain"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.old_pirate_gil",name="Old Pirate Gil",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestPirate"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.old_vasska",name="Old Vasska",category="npc",verification="archived",wiki=9,unknown={"internalName","location"}},
+		{id="npc.otto",name="Otto",aliases={"Farmer Otto"},category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestFarm"},wiki=9,evidence={level="confirmed",note="misión FarmBoars entregada"},relations={{"gives_quest","objective.kill_enemies","evidence"}},unknown={"location"}},
+		{id="npc.sam",name="Sam",aliases={"Quest Man"},category="npc",group="other",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestMerchant2"},wiki=9,evidence={level="confirmed",note="'Quest Man'; CompassQuestService.RF.Claim"},relations={{"located_at","island.sams_bar_and_pirates_land","evidence"},{"gives_quest","objective.claim_compass","evidence"},{"rewards","item.compass","evidence"}}},
+		{id="npc.sam_dance_club",name="Sam (Dance Club)",category="npc",group="other",verification="unknown",wiki=9,unknown={"description","internalName","location"}},
+		{id="npc.shanks",name="Shanks",category="npc",group="other",verification="confirmed",internal={"Map.Merchants.HakiRankMerchant"},wiki=9,evidence={level="confirmed"},unknown={"location"}},
+		{id="npc.sheriff_dale",name="Sheriff Dale",category="npc",group="quest_givers",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.QuestCaver"},wiki=9,evidence={level="confirmed"},unknown={"location","quests"}},
+		{id="npc.silvers_rayleigh",name="Silvers Rayleigh",aliases={"Haki Master","Silver Rayleigh"},category="npc",group="other",verification="confirmed",internal={"Map.Merchants.QuestHakiMerchant"},wiki=9,evidence={level="confirmed",note="HakiDojoService grabado"},relations={{"located_at","island.mountain_island","wiki"}}},
+		{id="npc.smith_hagan",name="Smith Hagan",category="npc",group="other",verification="documented",roles={"crafter"},wiki=9,unknown={"internalName","location"}},
+		{id="npc.sniper_dealer",name="Sniper Dealer",category="npc",group="other",verification="inferred",roles={"merchant"},internal={"Map.Merchants.SniperMerchant"},wiki=9,evidence={level="inferred",note="correspondencia por nombre"},unknown={"location"}},
+		{id="npc.suspicious_man",name="Suspicious Man",category="npc",group="other",verification="inferred",roles={"merchant"},internal={"Map.Merchants.SellerMerchant"},wiki=9,evidence={level="inferred",note="SellerMerchant compra frutas junto a Sam (FruitTradeService grabado); que sea Suspicious Man es deducción"},relations={{"sells","item.golden_compass","wiki"},{"rewards","item.df_coin","wiki"}},unknown={"location"},facts={{"reward","Talk to him to exchange your devil fruits into Rewards"},{"cost","Rare Fruits: 1M Beri/ 50 Gems/ 1 DFCoin"},{"cost","Ultra Rare Box: 15M Beri/ 500 Gems/ 10 DFCoins"}}},
+		{id="npc.sword_dealer",name="Sword Dealer",category="npc",group="other",verification="inferred",roles={"merchant"},internal={"Map.Merchants.SwordMerchant"},wiki=9,evidence={level="inferred",note="correspondencia por nombre"},unknown={"location"}},
+		{id="npc.the_expert",name="The Expert",category="npc",group="other",verification="confirmed",roles={"quest_giver"},internal={"Map.Merchants.ExpertiseMerchant"},wiki=9,evidence={level="confirmed",note="misiones en PlayerGui.MissionGui"},relations={{"mentions","enemy.gunslinger","name"},{"mentions","enemy.vokun","name"},{"mentions","enemy.marines","name"},{"mentions","enemy.gunslinger_elites","name"},{"gives_quest","objective.kill_enemies","wiki"},{"gives_quest","objective.kill_players","wiki"},{"gives_quest","objective.deal_damage","wiki"},{"gives_quest","objective.earn_beri","wiki"},{"gives_quest","objective.sell_fish_value","wiki"},{"gives_quest","objective.fish_count","wiki"},{"gives_quest","objective.mission_objectives","wiki"},{"gives_quest","objective.elite_kill","wiki"}},unknown={"location"},facts={{"reward","Talking with The Expert gives you an expertise quest so you can gain exp for your Expertise(s)."},{"spawn","He offers a quest every xx:00 UTC."},{"reward","Expertise quests reward Expertise exp and reduce Sam’s current quest timer by 5 minutes."},{"requirement","Elite quests require killing tougher enemies and grant more exp."}}},
+		{id="npc.the_marine_warden",name="The Marine Warden",category="npc",group="other",verification="documented",wiki=9,unknown={"internalName","location"}},
+		{id="npc.timmy",name="Timmy",category="npc",group="other",verification="unknown",wiki=9,unknown={"description","internalName","location"}},
+		{id="npc.trait_sage",name="Trait Sage",category="npc",group="other",verification="confirmed",roles={"service"},internal={"Map.Merchants.TraitSage"},wiki=9,evidence={level="confirmed"},relations={{"links_to","system.character_traits","wiki-link"},{"requires","item.essence","wiki"}},unknown={"location"}},
+		{id="objective.board_quest",name="Misión de tablón (Quest Givers): tipos sin documentar",category="objective",verification="unknown",wiki=0,card="Quest Givers",unknown={"description","givers","objectiveTypes","rewards"},facts={{"reward","At the bottom, you can select where the Exp of each completed quest goes to"}}},
+		{id="objective.bring_item",name="Llevar un objeto a un NPC",category="objective",verification="documented",wiki=0,card="Fishing",relations={{"requires","item.merlins_logbook","wiki"}},unknown={"givers","rewards"},facts={{"requirement","bring Merlin his logbook (a rare drop of his)"}}},
+		{id="objective.claim_compass",name="Reclamar el tesoro del compass",category="objective",verification="confirmed",srcEvidence="Auto Sam",unknown={"rewards"}},
+		{id="objective.deal_damage",name="Hacer X de daño",category="objective",verification="documented",wiki=0,card="The Expert",unknown={"rewards"},facts={{"requirement","Deal a certain amount of damage."}}},
+		{id="objective.defeat_boss_times",name="Derrotar a un jefe N veces",category="objective",verification="documented",wiki=0,card="Fishing",relations={{"targets","enemy.captain_blacksurf","wiki"}},unknown={"givers","rewards"},facts={{"requirement","beat Captain Blacksurf five times"}}},
+		{id="objective.deliver_package",name="Entregar un paquete",category="objective",verification="confirmed",internal={"Tool Package @DeliveryTarget","MerlinService.RF.Deliver"},wiki=0,card="Merlin's Island",evidence={level="confirmed"},unknown={"rewards"},facts={{"requirement","You’d come here to gather packages and chat while waiting for that old Fisherman over there to prepare another delivery for you."}}},
+		{id="objective.difficult_catches",name="Pescar N capturas Hard o Impossible",category="objective",verification="documented",wiki=0,card="Fishing",unknown={"givers","rewards"},facts={{"requirement","land 25 Hard or Impossible catches with it"}}},
+		{id="objective.earn_beri",name="Ganar X Beri",category="objective",verification="documented",wiki=0,card="The Expert",unknown={"rewards"},facts={{"requirement","Earn a certain amount of beris."}}},
+		{id="objective.elite_kill",name="Élite: derrotar a un enemigo élite",category="objective",verification="documented",wiki=0,card="The Expert",relations={{"targets","enemy.vokun","wiki"},{"targets","enemy.marines","wiki"},{"targets","enemy.gunslinger_elites","wiki"}},facts={{"reward","Elite quests require killing tougher enemies and grant more exp."}}},
+		{id="objective.fish_count",name="Pescar N peces",category="objective",verification="confirmed",internal={"MissionGui '[Hard] Catch 7 fish.'"},wiki=0,card="The Expert",evidence={level="confirmed"},unknown={"rewards"},facts={{"requirement","Fish a certain amount."}}},
+		{id="objective.kill_enemies",name="Derrotar N enemigos concretos",category="objective",verification="confirmed",internal={"QuestTracker 'Defeat <enemigo> (Lv N+): a/b'"},wiki=0,card="The Expert",evidence={level="confirmed"},unknown={"rewards"},facts={{"requirement","Kill a set number of certain enemies."}}},
+		{id="objective.kill_players",name="Derrotar N jugadores",category="objective",verification="documented",roles={"pvp"},wiki=0,card="The Expert",unknown={"rewards"},facts={{"requirement","Kill a set number of players."}}},
+		{id="objective.light_candles",name="Encender velas (invocación)",category="objective",verification="possibly_obsolete",wiki=0,card="Perona, Ghost Princess",unknown={"givers","rewards"},facts={{"spawn","If you light four candles near her house, she spawns in the center to haunt."}}},
+		{id="objective.mission_objectives",name="Completar N objetivos de misión (compasses de Sam, paquetes de Merlin)",category="objective",verification="documented",wiki=0,card="The Expert",relations={{"requires","mechanic.sam_compass","wiki"},{"requires","objective.deliver_package","wiki"}},unknown={"rewards"},facts={{"requirement","Complete a certain number of mission objectives (Sam - compasses and Merlin packages)."}}},
+		{id="objective.offer_fruits",name="Ofrecer frutas del diablo (invocación)",category="objective",verification="documented",wiki=0,card="Death Spire",unknown={"givers","rewards"},facts={{"requirement","bring 13 devil fruits for the lower circle, and 3 for what’s at the top"}}},
+		{id="objective.open_caches",name="Abrir N caches de un tipo",category="objective",verification="documented",wiki=0,card="Fishing",relations={{"requires","item.fishing_cache","wiki"}},unknown={"givers","rewards"},facts={{"requirement","open 15 Emerald Caches"}}},
+		{id="objective.sell_fish_value",name="Vender peces por X Beri",category="objective",verification="documented",wiki=0,card="The Expert",unknown={"rewards"},facts={{"requirement","Sell fish worth a certain amount of beri."}}},
+		{id="objective.sell_to_chef",name="Vender N peces al Chef",category="objective",verification="documented",wiki=0,card="Fishing",relations={{"targets","npc.chef","wiki"}},unknown={"givers","rewards"},facts={{"requirement","sell 500 to the Chef"}}},
+		{id="region.halloween",name="Halloween (temporada)",category="region",verification="possibly_obsolete",wiki=0,card="Halloween Island",unknown={"returnDate"},facts={{"duration","explore this island before it vanishes sometimes late Fall"}}},
+		{id="system.bounties",name="Bounties",category="system",verification="documented",wiki=10,facts={{"spawn","Players who are strong enough to be noted will appear here."},{"reward","Rewards vary on the player’s: Level, Haki, Bounty, and Kills"}}},
+		{id="system.challenges",name="Challenges",category="system",verification="documented",wiki=10},
+		{id="system.character_traits",name="Character Traits",category="system",verification="documented",wiki=10,facts={{"cost","- Jeweler — +10–70% Gems Earned (3%)"}}},
+		{id="system.fishing",name="Fishing",category="system",verification="confirmed",internal={"FishingService Cast/Reel/Hit","PlayerGui.Fishing"},wiki=10,evidence={level="confirmed",note="minijuego Scatter grabado"},relations={{"mentions","island.galley_isle","name"},{"mentions","npc.fish_merchant","name"},{"mentions","enemy.captain_blacksurf","name"},{"mentions","enemy.abyss_crustacean","name"},{"rewards","item.fish","wiki"},{"rewards","item.fishing_cache","wiki"}},facts={{"cost","Small: 1,000 beri (5,000 cooked)"},{"cost","Medium: 5,000 beri (25,000 cooked)"},{"cost","Large: 10,000 beri (50,000 cooked)"},{"cost","Huge: 25,000 beri (125,000 cooked)"},{"requirement","Obtainment: Do a quest for Merlin, and he’ll give you this rod."},{"duration","Catch Rate: ~25 seconds per fish."},{"requirement","Obtainment: Keep fishing until you reach 200 Fish caught."},{"duration","Catch Rate: ~15 seconds per fish."},{"requirement","Obtainment: Owning the Sturdy Rod and 1 million Beri, then talking to Merlin will allow you to get the Super Rod."},{"duration","Catch Rate: ~10 seconds per fish."},{"requirement","Obtainment: Catch 2,000 fish, sell 500 to the Chef, open 15 Emerald Caches, beat Captain Blacksurf five times and bring Merlin his logbook (a rare drop of his)."},{"duration","Catch Rate: ~6.5 seconds per fish."}}},
+		{id="system.gladiator_board",name="Gladiator Board",category="system",verification="documented",wiki=10},
+		{id="weapon.aqua_staff",name="Aqua Staff",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"requirement","Fish for a chance to obtain this magical wand of potent water energy."}},abilities={{"Obtainment","move",nil},{"Special","move",nil}}},
+		{id="weapon.bisento",name="Bisento",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.blunderbuss",name="Blunderbuss",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.candy_cane_kogatana",name="Candy Cane Kogatana",category="weapon",verification="archived",wiki=11,unknown={"internalName"}},
+		{id="weapon.crossbow",name="Crossbow",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.dagger",name="Dagger",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.divine_axe",name="Divine Axe",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.flail",name="Flail",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.flintlock",name="Flintlock",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.golden_fish",name="Golden Fish",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"requirement","Obtained from catching a total of 1,000k Fish."}},abilities={{"Obtainment","move",nil}}},
+		{id="weapon.ice_dagger",name="Ice Dagger",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.ice_spear",name="Ice Spear",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"spawn","Summon a rain of spears at the player’s cursor, each landing with a small AOE and dealing 340 sword damage."}},abilities={{"Special","move",nil}}},
+		{id="weapon.kanshou_and_bakuya",name="Kanshou & Bakuya",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"reward","Why give them to us?"}},abilities={{"Special","move",nil}}},
+		{id="weapon.katana",name="Katana",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.kogatana",name="Kogatana",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.krizma",name="Krizma",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"requirement","The creator of this sword must've known what he was going for with this serrated blade."}},abilities={{"Special","move",nil}}},
+		{id="weapon.lightning_sword",name="Lightning Sword",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"spawn","Enhancing your every output of damage by 1.25x for 10 seconds."}},abilities={{"Special","move",nil}}},
+		{id="weapon.lollipop",name="Lollipop",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.magma_gun",name="Magma Gun",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"internalName"},facts={{"reward","M1: Shoots a small magma bullet in a straight line without drop."}},abilities={{"Special","move",nil}}},
+		{id="weapon.masamune",name="Masamune",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.melee",name="Melee",category="weapon",group="utility",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.meteorite_sword",name="Meteorite Sword",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},facts={{"duration","Creates a protective shield over the user that negates damage for 3 seconds, providing 6.5k worth of overguard."}},abilities={{"Special","move",nil}}},
+		{id="weapon.old_miner_gus",name="Old Miner Gus",category="weapon",verification="archived",wiki=11,unknown={"internalName"}},
+		{id="weapon.roger",name="Roger",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.ruby_anchor",name="Ruby Anchor",category="weapon",group="sword",verification="documented",wiki=11,relations={{"mentions","system.fishing","name"}},unknown={"internalName"},facts={{"requirement","Obtained through lots of fishing."}},abilities={{"Obtainment","move",nil},{"Special","move",nil}}},
+		{id="weapon.rusted_cutlass",name="Rusted Cutlass",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.scissors_blade",name="Scissors Blade",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.slingshot",name="Slingshot",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.special",name="Special",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.stars",name="Stars",category="weapon",group="sniper",verification="documented",wiki=11,unknown={"abilities","internalName"}},
+		{id="weapon.swords__archived",name="Swords",category="weapon",verification="archived",wiki=11,unknown={"internalName"}},
+		{id="weapon.tachi",name="Tachi",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.ultra_great_sword",name="Ultra Great Sword",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.wakizashi",name="Wakizashi",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
+		{id="weapon.yoru",name="Yoru",category="weapon",group="sword",verification="documented",wiki=11,unknown={"internalName"},abilities={{"Special","move",nil}}},
 	},
 }
+end
+__modules["Profiles"] = function(...)
+-- Profiles: reglas de los perfiles de la librería (ElHoyoHub/configs/*.json = { name, created, modified, values,
+-- profileVersion }). values[ruta "Pestaña/Caja/Nombre"] = valor del control. Sin Roblox ni archivos: la librería
+-- guarda y aplica; aquí se valida, se compara, se limpia de secretos y se decide si una aplicación es segura.
+-- Aplicar un perfil es atómico: o se aplica entero o no se toca nada (Profiles.apply con vuelta atrás).
+local Profiles = {}
+
+Profiles.VERSION = 1 -- formato de archivo de perfil (1.4.1). Los de antes no llevan profileVersion: valen como 0.
+Profiles.MAX_VALUES = 2000
+Profiles.MAX_TEXT = 200000
+
+-- Ids que cambiaron de sitio (1.5.0): ruta vieja -> ruta nueva. Se aplican al leer un perfil (migración explícita).
+Profiles.ALIASES = {}
+
+-- Copia de values con las rutas viejas cambiadas por las nuevas (si la nueva ya tiene valor, gana la nueva)
+function Profiles.migrateIds(values, aliases)
+	aliases = aliases or Profiles.ALIASES
+	local out, moved = {}, 0
+	for id, v in values do
+		local new = aliases[id]
+		if new then moved += 1 else out[id] = v end
+	end
+	for id, v in values do
+		local new = aliases[id]
+		if new and out[new] == nil then out[new] = v end
+	end
+	return out, moved
+end
+
+local WEBHOOK = "discord[%w%.%-]*%.com/api/webhooks/"
+
+-- ¿Es un secreto? Rutas de controles secretos (el webhook) o cualquier texto con una URL de webhook.
+function Profiles.isSecret(id, value)
+	if type(id) == "string" and (id:sub(-8) == "/Webhook" or id:lower():find("webhook", 1, true)) then return true end
+	if type(value) == "string" and value:find(WEBHOOK) then return true end
+	return false
+end
+
+-- Valores que puede tener un control: booleano, número, texto, o lista/mapa plano de esos (Multi, colores)
+local function plainValue(v, depth)
+	local t = type(v)
+	if t == "boolean" or t == "string" then return true end
+	if t == "number" then return v == v and v ~= math.huge and v ~= -math.huge end
+	if t == "table" and (depth or 0) < 2 then
+		local n = 0
+		for k, x in v do
+			n += 1
+			if n > 200 or (type(k) ~= "string" and type(k) ~= "number") or not plainValue(x, (depth or 0) + 1) then return false end
+		end
+		return true
+	end
+	return false
+end
+
+-- Comprueba un perfil (la tabla del archivo, o solo sus values). known[id] = valor actual del control (para el tipo).
+-- Devuelve ok, problemas (lista de textos), avisos, values limpios (sin secretos ni entradas rotas).
+function Profiles.validate(data, known)
+	local problems, warnings, clean = {}, {}, {}
+	if type(data) ~= "table" then return false, { "el perfil no es una tabla" }, warnings, clean end
+	local values = data.values ~= nil and data.values or data
+	if type(values) ~= "table" then return false, { "values no es una tabla" }, warnings, clean end
+	values = Profiles.migrateIds(values)
+	local version = tonumber(data.profileVersion) or 0
+	if version > Profiles.VERSION then
+		table.insert(problems, "perfil de una versión más nueva (" .. version .. " > " .. Profiles.VERSION .. ")")
+	end
+	local n = 0
+	for id, value in values do
+		n += 1
+		if type(id) ~= "string" or id == "" then
+			table.insert(problems, "ruta no válida: " .. tostring(id))
+		elseif Profiles.isSecret(id, value) then
+			table.insert(warnings, "secreto quitado: " .. id)
+		elseif not plainValue(value) then
+			table.insert(problems, id .. ": valor no válido (" .. type(value) .. ")")
+		elseif known and known[id] ~= nil and type(known[id]) ~= type(value) then
+			table.insert(problems, id .. ": tipo " .. type(value) .. ", el control es " .. type(known[id]))
+		else
+			if known and known[id] == nil then table.insert(warnings, "control que no existe ahora (se guarda para luego): " .. id) end
+			clean[id] = value
+		end
+	end
+	if n > Profiles.MAX_VALUES then table.insert(problems, "demasiados valores (" .. n .. ")") end
+	return #problems == 0, problems, warnings, clean
+end
+
+local function same(a, b)
+	if type(a) ~= type(b) then return false end
+	if type(a) ~= "table" then return a == b end
+	for k, v in a do if not same(v, b[k]) then return false end end
+	for k in b do if a[k] == nil then return false end end
+	return true
+end
+Profiles.same = same
+
+-- Vista previa: qué cambiaría al aplicar `values` sobre `current`. { changes = {{id, from, to}}, unchanged, unknown }
+function Profiles.diff(current, values)
+	local out = { changes = {}, unchanged = 0, unknown = {} }
+	for id, to in values or {} do
+		local from = current and current[id]
+		if from == nil then
+			table.insert(out.unknown, id)
+		elseif same(from, to) then
+			out.unchanged += 1
+		else
+			table.insert(out.changes, { id = id, from = from, to = to })
+		end
+	end
+	table.sort(out.changes, function(a, b) return a.id < b.id end)
+	table.sort(out.unknown)
+	return out
+end
+
+-- ¿Hay cambios sin guardar? Compara lo guardado con lo actual (solo controles que existen en los dos)
+function Profiles.dirty(saved, current)
+	local n = 0
+	for id, now in current or {} do
+		local was = saved and saved[id]
+		if was ~= nil and not same(was, now) then n += 1 end
+	end
+	return n > 0, n
+end
+
+-- Aplicación controlada. controls[id] = { get(), set(v) }. Valida TODO antes de tocar nada; si un set falla a
+-- mitad, deja todos como estaban. Devuelve ok, problemas, avisos, cuántos aplicó.
+function Profiles.apply(values, controls, pending)
+	local known = {}
+	for id, c in controls do
+		local ok, v = pcall(c.get)
+		if ok then known[id] = v end
+	end
+	local ok, problems, warnings, clean = Profiles.validate(values, known)
+	if not ok then return false, problems, warnings, 0 end
+	local before, done = {}, {}
+	for id in clean do if controls[id] then before[id] = known[id] end end
+	local applied = 0
+	for id, value in clean do
+		local c = controls[id]
+		if c then
+			local okSet, err = pcall(c.set, value)
+			if not okSet then
+				for _, back in done do pcall(controls[back].set, before[back]) end -- vuelta atrás
+				return false, { id .. ": " .. tostring(err) }, warnings, 0
+			end
+			table.insert(done, id)
+			applied += 1
+		elseif pending then
+			pending[id] = value -- control que se crea más tarde (lo recoge al nacer)
+		end
+	end
+	return true, {}, warnings, applied
+end
+
+-- Exportación segura: sin secretos, con versión de formato y quién la hizo. Devuelve la tabla y lo quitado.
+function Profiles.export(cfg, values, hubVersion)
+	local out, removed = {}, {}
+	for id, v in values or {} do
+		if Profiles.isSecret(id, v) then table.insert(removed, id) else out[id] = v end
+	end
+	table.sort(removed)
+	return { name = cfg and cfg.name or "Perfil", profileVersion = Profiles.VERSION, exportedBy = hubVersion, values = out }, removed
+end
+
+-- Importación: texto JSON -> perfil validado. Devuelve ok, perfil {name, values}, problemas, avisos.
+function Profiles.import(text, json, known)
+	if type(text) ~= "string" or text:match("^%s*$") then return false, nil, { "texto vacío" }, {} end
+	if #text > Profiles.MAX_TEXT then return false, nil, { "demasiado largo (" .. #text .. " caracteres)" }, {} end
+	local okDecode, data = pcall(json.decode, text)
+	if not okDecode then return false, nil, { "no es JSON válido" }, {} end
+	if type(data) ~= "table" or type(data.values) ~= "table" then return false, nil, { "falta la lista values (¿es un perfil del hub?)" }, {} end
+	local ok, problems, warnings, clean = Profiles.validate(data, known)
+	if not ok then return false, nil, problems, warnings end
+	-- quita lo que rompe un nombre de archivo (control, < > : " / \ | ? *); los acentos se quedan
+	local name = type(data.name) == "string" and data.name:gsub('[%c<>:"/\\|%?%*]', ""):sub(1, 40) or ""
+	if name:match("^%s*$") then name = "Importado" end
+	return true, { name = name, values = clean, profileVersion = Profiles.VERSION }, {}, warnings
+end
+
+-- Texto corto de un valor para la vista previa
+function Profiles.show(v)
+	if type(v) == "table" then
+		local parts = {}
+		for k, x in v do
+			if x == true then table.insert(parts, tostring(k)) elseif x ~= false then table.insert(parts, tostring(k) .. "=" .. tostring(x)) end
+		end
+		table.sort(parts)
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return tostring(v)
+end
+
+return Profiles
 end
 __modules["Diagnostics"] = function(...)
 -- Diagnostics: informe del estado del hub para copiar y pegar al pedir ayuda. Sin Roblox: el hub le pasa una
@@ -6471,10 +8132,18 @@ local function line(out, k, v) table.insert(out, string.format("%-22s %s", k .. 
 local function componentStatus(c)
 	if c.status then return tostring(c.status) end -- formato de 1.3.2
 	local parts = { tostring(c.state) .. (c.reason and (" (" .. tostring(c.reason) .. ")") or "") }
+	if c.desiredState and c.matches == false then table.insert(parts, "PEDIDO " .. tostring(c.desiredState)) end
+	if (c.tasks or 0) > 0 then table.insert(parts, c.tasks .. " tareas") end
+	if c.lastTransition then
+		table.insert(parts, "última transición " .. tostring(c.lastTransition.from) .. "→" .. tostring(c.lastTransition.to))
+	end
 	if (c.uptime or 0) >= 1 then table.insert(parts, "activo " .. math.floor(c.uptime) .. " s") end
 	if c.deps and #c.deps > 0 then table.insert(parts, "necesita " .. table.concat(c.deps, ", ") .. (c.available == false and (" [" .. tostring(c.unavailableWhy) .. "]") or "")) end
 	if (c.resources or 0) > 0 then table.insert(parts, c.resources .. " recursos") end
-	if c.lastError then table.insert(parts, "último error x" .. tostring(c.errors or 1) .. ": " .. tostring(c.lastError)) end
+	if c.lastError then
+		table.insert(parts, "último error x" .. tostring(c.errors or 1) .. (c.lastErrorKind and (" [" .. c.lastErrorKind .. "]") or "")
+			.. ": " .. tostring(c.lastError))
+	end
 	return table.concat(parts, " · ")
 end
 function Diagnostics.format(r, secrets)
@@ -6526,22 +8195,231 @@ function Diagnostics.format(r, secrets)
 		for _, st in { "Initializing", "Ready", "Running", "Waiting", "Paused", "Stopping", "Error", "Unavailable", "Disabled" } do
 			if r.componentCounts[st] then table.insert(parts, st .. " " .. r.componentCounts[st]) end
 		end
-		line(out, "Componentes", table.concat(parts, ", "))
+		line(out, "Componentes", table.concat(parts, ", ") .. (r.mismatches and r.mismatches > 0 and (" · " .. r.mismatches .. " con estado distinto del pedido") or ""))
+	end
+	if r.profile then
+		local p = r.profile
+		line(out, "Perfil", string.format("%s (formato v%s), %s cambios sin guardar, %d perfiles", p.active and "activo" or "ninguno",
+			tostring(p.format), tostring(p.unsaved or 0), p.count or 0))
+	end
+	if r.config and r.config.schema then
+		local sc = r.config.schema
+		line(out, "Ajustes", string.format("%d en el esquema, %d cambiados, %d desconocidos%s", sc.total or 0, sc.custom or 0, sc.unknown or 0,
+			r.config.clamped and #r.config.clamped > 0 and (", recortados: " .. table.concat(r.config.clamped, ", ")) or ""))
+	end
+	if r.life and r.life.errorKinds and next(r.life.errorKinds) then
+		local parts = {}
+		for _, k in { "recoverable", "config", "critical" } do
+			if r.life.errorKinds[k] then table.insert(parts, k .. " " .. r.life.errorKinds[k]) end
+		end
+		line(out, "Errores por tipo", table.concat(parts, ", "))
+	end
+	if r.tasksBySource and next(r.tasksBySource) then
+		local parts = {}
+		for source, n in r.tasksBySource do table.insert(parts, tostring(source) .. " " .. n) end
+		table.sort(parts)
+		line(out, "Tareas vivas", table.concat(parts, ", "))
+	end
+	if r.coordination then
+		local c = r.coordination
+		local held = {}
+		for res, who in c.held or {} do table.insert(held, res .. "=" .. tostring(who)) end
+		table.sort(held)
+		local counts = c.counts or {}
+		line(out, "Coordinación", string.format("%s · denegadas %d, solapes %d, liberaciones tardías %d, referencias viejas %d, devueltas %d",
+			#held > 0 and table.concat(held, ", ") or "recursos libres", counts.denied or 0, counts.overlap or 0, counts.late_release or 0,
+			(counts.stale or 0) + (counts.stale_use or 0), counts.restored or 0))
+		local ev = c.events or {}
+		for i = math.max(1, #ev - 4), #ev do
+			local e = ev[i]
+			table.insert(out, string.format("  %s %s: %s%s", tostring(e.kind), tostring(e.resource), tostring(e.owner), e.detail and (" / " .. tostring(e.detail)) or ""))
+		end
+	end
+	if r.lastClose then
+		local s = r.lastClose.components or {}
+		line(out, "Cierre anterior", #s == 0 and "limpio (nada sobrevivió)" or ("sobrevivieron: " .. table.concat(s, ", ")))
 	end
 	line(out, "Funciones encendidas", r.features and #r.features > 0 and table.concat(r.features, ", ") or "-")
 	for _, c in r.components or {} do line(out, "  " .. tostring(c.name), componentStatus(c)) end
 	local errs = r.errors or {}
 	line(out, "Errores", #errs == 0 and "ninguno" or (#errs .. " distintos"))
 	for _, e in errs do
-		table.insert(out, string.format("  x%d  hace %ds  %s", e.count or 1, math.floor(e.ago or 0), tostring(e.message)))
+		table.insert(out, string.format("  x%d  hace %ds  %s%s", e.count or 1, math.floor(e.ago or 0),
+			e.source and ("[" .. tostring(e.source) .. (e.kind and ("/" .. e.kind) or "") .. "] ") or "", tostring(e.message)))
 	end
 	return Diagnostics.redact(table.concat(out, "\n"), secrets)
 end
 
 return Diagnostics
 end
+__modules["NpcFarm"] = function(...)
+-- NpcFarm: la lógica del apartado Bounty (NPCs) de 1.5.1, sin Roblox, para probarla con simulaciones.
+-- SOLO NPCs controlados por el juego (Workspace.Alive.NPCs): un candidato que sea el personaje de un jugador, o esté
+-- en la carpeta de jugadores, se descarta SIEMPRE (pickTarget). Las habilidades son TECLAS (las mismas Z X C V que
+-- usa Auto Boss); qué hace cada una depende de tu arma o fruta: el hub no inventa nombres de habilidades.
+local NpcFarm = {}
+
+NpcFarm.KEYS = { "Z", "X", "C", "V" }
+NpcFarm.INTERVALS = { 1, 2, 3, 5 } -- s entre una tanda de habilidades y la siguiente
+NpcFarm.RADII = { 50, 100, 200, 400 } -- studs alrededor del punto de referencia
+NpcFarm.LOW = { 20, 35, 50 } -- % de vida para retirarse a la zona segura
+NpcFarm.RECOVER = { 70, 90, 100 } -- % de vida para volver
+NpcFarm.OWNER = "Bounty" -- nombre del dueño de los recursos (move, hand)
+
+local function dist(a, b)
+	local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+NpcFarm.dist = dist
+
+-- ¿Puede ser objetivo? Nunca un jugador; nunca algo muerto o sin posición.
+function NpcFarm.valid(c)
+	if type(c) ~= "table" then return false, "no es un candidato" end
+	if c.isPlayer or c.inPlayersFolder then return false, "es un jugador" end
+	if not c.position then return false, "sin posición" end
+	if not c.health or c.health <= 0 then return false, "muerto" end
+	return true
+end
+
+-- El NPC válido más cercano al punto de referencia dentro del radio (nil si no hay)
+function NpcFarm.pickTarget(candidates, ref, radius)
+	local best, bestD = nil, math.huge
+	for _, c in candidates or {} do
+		if NpcFarm.valid(c) then
+			local d = dist(c.position, ref)
+			if d <= radius and d < bestD then best, bestD = c, d end
+		end
+	end
+	return best, best and bestD or nil
+end
+
+-- Teclas elegidas (selected[i] = true para NpcFarm.KEYS[i]); nada elegido = ninguna
+function NpcFarm.skills(selected)
+	local out = {}
+	for i, key in NpcFarm.KEYS do
+		if type(selected) == "table" and selected[i] == true then table.insert(out, key) end
+	end
+	return out
+end
+
+-- Índice guardado -> valor de una lista (fuera de rango: el de serie, 2)
+function NpcFarm.pick(list, index)
+	return list[tonumber(index) or 2] or list[2] or list[1]
+end
+
+-- Un paso. state = { phase, character, lastSkill } (se modifica). input = { enabled, point, alive, character, pct,
+-- low, recover, target, moveHolder, safeZone, now, interval }.
+-- Devuelve { action, state, reason, useSkills } con action: "stop" | "wait" | "retreat" | "recover" | "return" | "fight"
+-- y state (Components): Disabled | Waiting | Paused | Running.
+function NpcFarm.step(state, input)
+	local function out(action, compState, reason, extra)
+		local r = { action = action, state = compState, reason = reason }
+		for k, v in extra or {} do r[k] = v end
+		return r
+	end
+	if not input.enabled then
+		state.phase = "idle"
+		return out("stop", "Disabled", "apagado")
+	end
+	if not input.point then return out("wait", "Waiting", "sin punto de referencia (guárdalo primero)") end
+	if not input.alive then
+		state.phase = "dead"
+		return out("wait", "Waiting", "muerto: esperando reaparición")
+	end
+	if state.character ~= nil and input.character ~= state.character then
+		state.character, state.phase = input.character, "idle" -- vuelve una sola vez
+		return out("return", "Waiting", "reaparecido: volviendo al punto de referencia")
+	end
+	state.character = input.character
+	local pct = input.pct or 1
+	if state.phase == "recovering" then
+		if pct * 100 >= input.recover then
+			state.phase = "idle" -- vuelve una sola vez (antes repetía la vuelta en el paso siguiente)
+			return out("return", "Waiting", string.format("recuperado (%d%%): volviendo al punto", math.floor(pct * 100 + 0.5)))
+		end
+		return out("recover", "Paused", string.format("recuperando en la zona segura: %d%% de %d%%", math.floor(pct * 100 + 0.5), input.recover))
+	end
+	if pct * 100 < input.low then
+		if not input.safeZone then
+			return out("wait", "Paused", "vida baja y la zona segura está apagada: actívala para retirarte")
+		end
+		state.phase = "recovering"
+		return out("retreat", "Paused", string.format("vida baja (%d%%): a la zona segura", math.floor(pct * 100 + 0.5)))
+	end
+	if input.moveHolder and input.moveHolder ~= NpcFarm.OWNER then
+		return out("wait", "Waiting", "otra función tiene el movimiento: " .. tostring(input.moveHolder))
+	end
+	if not input.target then
+		state.phase = "idle"
+		return out("wait", "Waiting", "ningún NPC cerca del punto", { stay = true }) -- se queda en el punto, con el turno
+	end
+	state.phase = "fighting"
+	local useSkills = state.lastSkill == nil or input.now - state.lastSkill >= (input.interval or 2)
+	if useSkills then state.lastSkill = input.now end
+	return out("fight", "Running", "atacando a " .. tostring(input.target.name), { useSkills = useSkills })
+end
+
+return NpcFarm
+end
+__modules["Favorites"] = function(...)
+-- Favorites: lista ordenada de favoritos por IDENTIFICADOR ESTABLE (la ruta "Pestaña/Caja/Nombre" en inglés que
+-- usan los perfiles). Un favorito no es otra copia del control: es un acceso que lleva al control original, así no
+-- hay dos controles con estados distintos. Sin Roblox; se guarda en config.favorites.
+local Favorites = {}
+Favorites.MAX = 20
+
+-- Limpia una lista guardada: solo textos, sin repetidos, como mucho MAX; aplica alias de ids movidos (old -> new)
+function Favorites.normalize(list, aliases)
+	local out, seen = {}, {}
+	for _, key in type(list) == "table" and list or {} do
+		if type(key) == "string" and key ~= "" then
+			key = aliases and aliases[key] or key
+			if not seen[key] and #out < Favorites.MAX then
+				seen[key] = true
+				table.insert(out, key)
+			end
+		end
+	end
+	return out
+end
+
+function Favorites.has(list, key) return table.find(list, key) ~= nil end
+
+-- Añade al final (o quita si ya está). Devuelve la lista y true si quedó añadido.
+function Favorites.toggle(list, key)
+	local i = table.find(list, key)
+	if i then
+		table.remove(list, i)
+		return list, false
+	end
+	if #list >= Favorites.MAX then return list, false end
+	table.insert(list, key)
+	return list, true
+end
+
+-- Mueve un favorito dir posiciones (−1 arriba, +1 abajo). Devuelve si se movió.
+function Favorites.move(list, key, dir)
+	local i = table.find(list, key)
+	if not i then return false end
+	local j = math.clamp(i + dir, 1, #list)
+	if j == i then return false end
+	list[i], list[j] = list[j], list[i]
+	return true
+end
+
+-- Separa los que apuntan a controles que existen de los que ya no (un control renombrado sin alias)
+function Favorites.resolve(list, exists)
+	local ok, missing = {}, {}
+	for _, key in list do
+		if exists(key) then table.insert(ok, key) else table.insert(missing, key) end
+	end
+	return ok, missing
+end
+
+return Favorites
+end
 local __loaded = {}
-local function import(name)
+function import(name) -- declarada antes de los módulos (local import): un módulo puede importar otro
 	local m = __loaded[name]
 	if m == nil then
 		local f = __modules[name]
@@ -6551,11 +8429,11 @@ local function import(name)
 	end
 	return m
 end
-local HUB_BUILD = "f8338114"
+local HUB_BUILD = "a038d77e"
 -- El Hoyo Hub
 -- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
-local HUB_VERSION = "1.4.0-rc1" -- Release Candidate: falta pasar las pruebas en el juego (TESTING.md)
-local UI_MIN_VERSION = 3 -- ElHoyoUI.lua con Library.Version menor no vale (cambió algo que el hub necesita)
+local HUB_VERSION = "1.5.2-rc1" -- Release Candidate: falta pasar las pruebas en el juego (TESTING.md)
+local UI_MIN_VERSION = 5 -- ElHoyoUI.lua con Library.Version menor no vale (cambió algo que el hub necesita)
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
 local function ElHoyoHubMain()
@@ -6578,9 +8456,15 @@ local cleanup = life.cleanup -- table.insert(cleanup, conexión) = se desconecta
 local closeHub = life.close
 -- Estado central de los componentes (módulo Components): infraestructura, informativos y funciones. Al cerrar,
 -- justo después de "Apagar todo", suelta sus recursos y los deja Disabled.
-local comps = import("Components").new()
+local comps = import("Components").new({
+	-- error de una tarea propia de un componente (c:spawn): al registro general con su nombre (sin volver a marcarlo)
+	onError = function(c, message, kind) life.errors:add(message, c.name, kind) end,
+})
 comps:register("Hub", { state = "Initializing", reason = "cargando" })
-life.add(function() comps:shutdown("cierre") end)
+life.add(function()
+	local _, survivors = comps:shutdown("cierre")
+	genv.ElHoyoHubLastClose = { components = survivors } -- lo lee el Diagnóstico del siguiente hub
+end)
 
 local missingRemotes = {} -- se avisan en la consola cuando ya existe
 local getRemote
@@ -6631,15 +8515,8 @@ local json = {
 	decode = function(t) return HttpService:JSONDecode(t) end,
 	encode = function(v) return HttpService:JSONEncode(v) end,
 }
-local config, bootNotes, configState = Config.load(diskFs, json, CONFIG_FILE, {
-	profiles = {}, -- perfiles guardados con nombre: funciones encendidas + ajustes
-	lang = genv.ElHoyoHubLang or "es",
-	palette = "Abismo",
-	key = "RightShift",
-	notify = true,
-	scale = 1,
-	hubUrl = "https://raw.githubusercontent.com/saulandujar/elhoyohub/refs/heads/main/ElHoyoHub.lua", -- para Autoexec
-})
+-- Valores de serie: Config.SCHEMA (una sola lista con tipos, rangos y secretos). Aquí solo lo que depende de la sesión.
+local config, bootNotes, configState = Config.load(diskFs, json, CONFIG_FILE, Config.defaults({ lang = genv.ElHoyoHubLang or "es" }))
 comps:register("Config", { state = "Ready", reason = tostring(configState.file) })
 local saveConfig
 do
@@ -6713,12 +8590,20 @@ life.addFinal(function() gui:Destroy() end)
 
 local console = import("Console").new({ gui = gui, C = C, UIS = UIS, UI = UI, life = life, config = config, T = T, cleanup = cleanup })
 local consoleWin, setConsole, log = console.frame, console.set, console.log
-comps:register("Console", { state = "Ready" })
+-- La consola con el contrato de Components: visible = Running, oculta = Ready (intención = lo que pidió el usuario)
+do
+	-- sin impl: la consola se muestra sola; el componente solo refleja intención y estado (sin bucles de aviso)
+	local consoleComp = comps:register("Console", { kind = "info", state = "Ready" })
+	console.onVisible = function(show)
+		if show then consoleComp:start() else consoleComp:stop() end
+	end
+end
 hubLog = log
-life.onError = function(message, source)
-	log(T("Error interno: ", "Internal error: ") .. message, "error")
+-- Los hilos heredan el origen (life.spawn dentro de una función lleva su nombre): el error marca ESA función
+life.onError = function(message, source, kind)
+	log(T("Error interno: ", "Internal error: ") .. (source and ("[" .. tostring(source) .. "] ") or "") .. message, "error")
 	local c = source and comps:get(source)
-	if c then c:fail(message) end -- el error de una función la marca en Error (Diagnóstico)
+	if c then c:fail(message, kind) end
 end
 
 ------------------------------------------------------------------ Ventana y pestañas
@@ -6787,16 +8672,25 @@ local function toggle(page, text, onChange, desc, noSave)
 		Callback = function(v) -- pulsado a mano o cargado de un perfil: deja de ser de ninguna automatización
 			obj.value = v
 			ownership.userChanged(key)
-			if comp then comp:set(v and "Running" or "Disabled", "usuario / perfil") end
-			life.spawnAs(key, onChange, v)
+			if comp then
+				comp:setDesired(v and "Running" or "Disabled") -- intención: el interruptor
+				-- estado real: el juego no confirma que una función "va", así que encendida = Waiting (en marcha, sin
+				-- confirmar), nunca Running; Error si falla cualquier hilo suyo
+				comp:set(v and "Waiting" or "Disabled", v and "encendida (sin confirmación del juego)" or "usuario / perfil")
+			end
+			life.spawnAs(key, onChange, v) -- sus hilos internos heredan el nombre
 		end,
 	}
 	if noSave then o.Flag = false end
 	local control = boxFor(page):Toggle(o)
+	obj.control = control -- para el punto de estado (control:SetStatus)
 	function obj.set(v)
 		obj.value = v == true
 		control:Set(obj.value, true)
-		if comp then comp:set(obj.value and "Running" or "Disabled", "automático") end
+		if comp then
+			comp:setDesired(obj.value and "Running" or "Disabled")
+			comp:set(obj.value and "Waiting" or "Disabled", obj.value and "encendida por una automatización (sin confirmar)" or "automático")
+		end
 	end
 	toggles[key] = obj
 	return obj
@@ -6838,9 +8732,15 @@ local function input(page, text, placeholder, default, onDone, desc, secret)
 		Flag = if secret then false else nil, Callback = life.guarded(onDone), Tip = desc and uiText(desc) or nil })
 end
 
--- 3 grupos y 11 pestañas: más no caben en la barra lateral (34 px por pestaña, 470 px de alto)
+-- Navegación (1.5.0): 4 grupos plegables y 15 secciones; la barra lateral se desplaza, así que ya no hay límite
+-- de 11. Los ids de los perfiles salen de "Pestaña/Caja/Nombre": añadir o reordenar secciones no los cambia; lo que
+-- se movió de sitio está en data/ui_moves.json y en Profiles.ALIASES (migración explícita).
+local pagesX = {} -- secciones nuevas de 1.5.0, en una tabla para no sumar locales a ElHoyoHubMain
 win:Group(uiText(L("PRINCIPAL", "MAIN")))
+pagesX.dash = addTab(L("Panel", "Dashboard"), "TH")
 local pageHome = addTab(L("Inicio", "Home"), "STAR")
+pagesX.explorer = addTab(L("Explorador", "Explorer"), "SEARCH")
+win:Group(uiText(L("MUNDO", "WORLD")))
 local pagePlayer = addTab(L("Jugador", "Player"), "RUNNING")
 local pageTp = addTab("Teleports", "GLOBE")
 local pageGuis = addTab(L("Tiendas", "Shops"), "TH_LARGE")
@@ -6850,7 +8750,10 @@ local pageBoss = addTab(L("Jefes", "Bosses"), "SKULL")
 local pageTrain = addTab(L("Entrenamiento", "Training"), "FIRE")
 local pageQuest = addTab(L("Misiones", "Quests"), "AWARD")
 local pageFruits = addTab(L("Frutas", "Fruits"), "GEM")
+pagesX.bounty = addTab("Bounty (NPCs)", "CROSSHAIRS")
 win:Group("HUB")
+pagesX.profiles = addTab(L("Perfiles", "Presets"), "SAVE")
+pagesX.diag = addTab(L("Diagnóstico", "Diagnostics"), "PROJECT_DIAGRAM")
 local pageMisc = addTab("Misc", "SLIDERS_H")
 local pageSettings = addTab(L("Ajustes", "Settings"), "COG")
 
@@ -6930,13 +8833,17 @@ function teleport(pos, skip)
 end
 end
 
+-- 1.5.2: el turno de movimiento es el recurso "move" de Ownership (mismo comportamiento: un dueño, los demás
+-- esperan) y `busy` refleja quién lo tiene. Así se apuntan peticiones denegadas, liberaciones tardías (una función
+-- apagada suelta el turno mientras su tarea aún sigue) y lo que queda de antes de reaparecer.
 local function claimMove(name)
-	if busy and busy ~= name then return false end
-	busy = name
-	return true
+	local ok = ownership.acquire("move", name)
+	busy = ownership.holder("move")
+	return ok
 end
 local function releaseMove(name)
-	if busy == name then busy = nil end
+	ownership.release("move", name)
+	busy = ownership.holder("move")
 end
 
 -- Zona segura: plataforma muy alta creada solo en tu cliente (los demás te ven flotando, no la ven).
@@ -6952,6 +8859,7 @@ local function goSafe()
 	end
 end
 local function returnTo(cf)
+	if busy == "Escape" then return end -- 1.5.2: durante la Huida nadie te baja (antes te devolvían abajo a mitad)
 	if safePart then return goSafe() end
 	local hrp = getHRP()
 	if cf and hrp then hrp.CFrame = cf end
@@ -7117,7 +9025,7 @@ end)
 end
 
 ------------------------------------------------------------------ Auto Sam
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 local SAM_EVERY = 60 -- reintento si CompassTokenAt no dice nada
 local claimRemote = getRemote("CompassQuestService", "RF", "Claim")
 local treasureArrive = getRemote("TreasureService", "RE", "Arrive")
@@ -7131,6 +9039,7 @@ local function findCompass()
 end
 
 local function useCompass(compass)
+	local done = ownership.use("hand", "Auto Sam") -- solo observa: apunta si otra función usa la mano a la vez
 	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 	if hum and compass.Parent ~= player.Character then
 		hum:EquipTool(compass)
@@ -7138,6 +9047,7 @@ local function useCompass(compass)
 	end
 	compass:Activate()
 	clickMouse()
+	done()
 end
 
 local function tryClaim()
@@ -7248,7 +9158,7 @@ life.spawn(function()
 		end
 	end
 end)
-end
+end)()
 
 ------------------------------------------------------------------ Auto Chest
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
@@ -7448,7 +9358,7 @@ end)
 end
 
 ------------------------------------------------------------------ Auto Pesca
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 -- Grabado con EspiaRemotes (una pesca a mano):
 --   Cast(Vector3 del agua) -> Reel(false) -> el servidor manda MinigameStarted("Easy", "Scatter")
 --   -> el cliente manda Hit(1..10) (en cualquier orden; Miss() si falla uno)
@@ -7695,7 +9605,7 @@ life.spawn(function()
 	end
 end)
 
-end
+end)()
 
 -- Quien da misiones en cada isla (cartel "Quests"); lo usan Auto Quest y Teleports
 
@@ -7783,7 +9693,7 @@ local QUEST_GIVERS = {
 	{ name = "Merlin", model = "QuestFishMerchant" }, -- al final: config.questGiver guarda el número
 }
 ------------------------------------------------------------------ Auto Quest
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 -- Lee la misión activa del rastreador del juego (PlayerGui.QuestTracker.Frame.Rows: Header y Objective1..)
 -- y actúa según lo que diga. Por ahora entiende "Defeat <enemigo> (Lv N+): a/b": va a por ese enemigo en
 -- Workspace.Alive.NPCs (se llaman "Lv12 Boar") y le ataca con clic real hasta completar el objetivo.
@@ -8112,7 +10022,7 @@ life.spawn(function()
 		end
 	end
 end)
-end
+end)()
 
 ------------------------------------------------------------------ Auto Merlin
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
@@ -8344,7 +10254,7 @@ note(pagePlayer, L("Auto Sam, Auto Chest, Auto Train y Frutas te mueven por el m
 end
 
 ------------------------------------------------------------------ Train
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 section(pageTrain, "Haki")
 button(pageTrain, L("Ir con Silvers Rayleigh", "Go to Silvers Rayleigh"), function()
 	local npc = merchant("QuestHakiMerchant")
@@ -8517,7 +10427,7 @@ end)
 note(pageTrain, L("Te llevan a Rayleigh y juegan en bucle hasta el límite diario (2250 exp cada uno). Si los dos están encendidos, se turnan.",
 	"They take you to Rayleigh and play in a loop until the daily limit (2250 exp each). If both are on, they take turns."))
 
-end
+end)()
 
 local groundFruits = function() return {} end -- la rellena Frutas; la usa el ESP
 ------------------------------------------------------------------ Frutas
@@ -8751,6 +10661,13 @@ end
 
 local function openBoxes()
 	local opened = 0
+	-- 1.5.1: si otra función tiene la mano (Auto Sam con el compass, la venta, Bounty), esta vuelta se salta
+	local other = ownership.inUse("hand", "Auto abrir cajas")
+	if other then
+		ownership.event("yielded", "hand", "Auto abrir cajas", other)
+		return 0
+	end
+	local done = ownership.use("hand", "Auto abrir cajas")
 	for _, tool in myTools() do
 		local rank = boxRank(tool.Name)
 		if rank and config.boxRarities[rank] and hold(tool) then
@@ -8760,6 +10677,7 @@ local function openBoxes()
 			task.wait(1.5) -- que llegue la fruta
 		end
 	end
+	done()
 	return opened
 end
 
@@ -8777,7 +10695,13 @@ local function sellFruits()
 	if #list == 0 then return end
 	local hrp, buyer = getHRP(), fruitBuyer()
 	if not (hrp and buyer) then return end
+	local other = ownership.inUse("hand", "Auto vender frutas")
+	if other then -- 1.5.1: espera a que la mano quede libre (siguiente vuelta)
+		ownership.event("yielded", "hand", "Auto vender frutas", other)
+		return
+	end
 	if not claimMove("Sell") then return end
+	local handDone = ownership.use("hand", "Auto vender frutas")
 	local back = hrp.CFrame
 	local char = player.Character
 	local prevTool = char and char:FindFirstChildOfClass("Tool")
@@ -8806,6 +10730,7 @@ local function sellFruits()
 	returnTo(back)
 	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 	if hum and prevTool and prevTool.Parent == player:FindFirstChild("Backpack") then hum:EquipTool(prevTool) end
+	handDone()
 	releaseMove("Sell")
 	log(T("Venta: comprador = ", "Sell: buyer = ") .. buyer.Name)
 end
@@ -9181,7 +11106,7 @@ end
 --  * Beber: en la mano y clic, uno a uno (la pantalla Drink con "Drink all" es la del bar, no de estos zumos).
 -- Exprimidor (confirmado por el usuario): un clic y a los pocos segundos da los zumos de todas las frutas.
 -- Sin confirmar: si se nota un barril vacío.
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 local BARREL_COOLDOWN = 180 -- shortcut: el usuario calcula 2-3 min hasta que se rellena; mirar si el barril cambia al vaciarse
 local autoStats = false
 local visited = {} -- pieza del barril -> os.clock() de la última visita
@@ -9452,10 +11377,10 @@ life.spawn(function()
 		end
 	end
 end)
-end
+end)()
 
 ------------------------------------------------------------------ Misc
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 local antiAfk = false
 section(pageMisc, L("Utilidades", "Utilities"))
 toggle(pageMisc, "Anti-AFK", function(on)
@@ -9520,6 +11445,8 @@ local function watchDeath(char)
 end
 if player.Character then life.spawn(watchDeath, player.Character) end
 table.insert(cleanup, player.CharacterAdded:Connect(watchDeath))
+-- 1.5.2: personaje nuevo = epoch nuevo: lo pedido con el anterior queda marcado como referencia vieja (Diagnóstico)
+table.insert(cleanup, player.CharacterAdded:Connect(function() ownership.newEpoch("reaparición") end))
 section(pagePlayer, L("Protección", "Protection"), 2)
 toggle(pagePlayer, "Auto Respawn", function(on)
 	autoRespawn = on
@@ -9745,10 +11672,10 @@ toggle(pageMisc, L("ESP frutas", "Fruit ESP"), function(on) espOn.fruits = on en
 	L("Muestra las Devil Fruits tiradas en el suelo, con el color de su rareza.", "Shows Devil Fruits lying on the ground, colored by rarity."))
 end)()
 
-end
+end)()
 
 ------------------------------------------------------------------ Movilidad (pestaña Jugador)
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 -- Todo en tu cliente: el juego podría notar velocidades raras (shortcut: sin anti-cheat conocido; si expulsa,
 -- bajar los valores).
 local move = { fly = false, speed = false, jump = false, infJump = false, noclip = false, clickTp = false }
@@ -9881,23 +11808,38 @@ table.insert(cleanup, UIS.InputBegan:Connect(function(input)
 		hrp.AssemblyLinearVelocity = Vector3.zero
 	end
 end))
-end
+end)()
 
 ------------------------------------------------------------------ Huida (pestaña Jugador, Protección)
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 -- Un god mode de verdad no se puede hacer desde el cliente: la vida la lleva el servidor. Lo más parecido: si la
 -- vida baja del límite, te saca al cielo (zona segura o una plataforma temporal) hasta que te recuperas, y
 -- ninguna función te mueve mientras tanto.
 local LIMITS = { 20, 35, 50, 70 }
+local Protection = import("Protection")
 local escapeOn = false
 local limit = LIMITS[tonumber(config.escapeAt) or 2] or 35
-local escaping = false
+local state = { escaping = false }
+local lastReading, lastReason = nil, "apagada"
+local temp
 
-local function escape(h)
-	escaping = true
-	busy = "Escape" -- se queda con el movimiento aunque otra función lo tuviera
+local function characterParts()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local attrs = nil
+	if char then
+		local ok, all = pcall(function() return char:GetAttributes() end)
+		attrs = ok and all or nil
+	end
+	return char, hum, attrs
+end
+
+-- Subir: a la zona segura o a una plataforma temporal. El turno de movimiento se QUITA (preempt) y al acabar se
+-- devuelve a quien lo tuviera (antes se ponía a nil y la función que movía se quedaba sin él).
+local function startEscape()
+	ownership.acquire("move", "Escape", { preempt = true })
+	busy = ownership.holder("move")
 	local hrp = getHRP()
-	local temp
 	if safePart then
 		goSafe()
 	elseif hrp then
@@ -9912,13 +11854,16 @@ local function escape(h)
 		hrp.AssemblyLinearVelocity = Vector3.zero
 	end
 	log(T("Huida: vida baja, te saco de ahí", "Escape: low health, getting you out"), "warn", true)
-	local t0 = os.clock()
-	while life.alive and h.Parent and h.Health > 0 and h.Health < h.MaxHealth * 0.9 and os.clock() - t0 < 60 do task.wait(0.5) end
-	if temp then temp:Destroy() end
-	if busy == "Escape" then busy = nil end
-	escaping = false
-	log(T("Huida: recuperado, las funciones siguen", "Escape: recovered, features carry on"))
 end
+local function stopEscape(why)
+	if temp then temp:Destroy(); temp = nil end
+	ownership.release("move", "Escape")
+	busy = ownership.holder("move")
+	local good = why == "recuperado"
+	log((good and T("Huida: recuperado, las funciones siguen", "Escape: recovered, features carry on")
+		or (T("Huida terminada: ", "Escape ended: ") .. why)), good and "info" or "warn", not good)
+end
+life.add(function() if state.escaping then stopEscape("hub cerrado") end end)
 
 section(pagePlayer, L("Protección", "Protection"), 2)
 toggle(pagePlayer, L("Huida automática", "Auto escape"), function(on) escapeOn = on end,
@@ -9933,16 +11878,34 @@ do
 		saveConfig()
 	end, L("Porcentaje de vida que hace saltar la huida.", "Health percentage that triggers the escape."))
 end
-life.spawn(function()
+-- 1.5.2: qué vida se está leyendo y por qué espera (para comprobar en el juego si el Humanoid refleja tu vida)
+note(pagePlayer, function()
+	local r = lastReading
+	if not r then return T("Vida: sin leer", "Health: not read") end
+	local hum = r.ok and string.format("Humanoid %d/%d", math.floor(r.health), math.floor(r.max)) or "Humanoid -"
+	local attr = r.attrHealth and string.format(T(" · atributo Health %d", " · Health attribute %d"), math.floor(r.attrHealth)) or ""
+	return T("Vida: ", "Health: ") .. hum .. attr .. (r.mismatch and T("  ⚠ no coinciden", "  ⚠ they differ") or "") .. "\n" .. tostring(lastReason)
+end, 2)
+life.spawnAs("Huida automática", function()
+	local warned = false
 	while life.alive do
 		task.wait(0.2)
-		local h = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-		if escapeOn and not escaping and h and h.Health > 0 and h.Health < h.MaxHealth * limit / 100 then
-			life.spawn(escape, h)
+		local char, hum, attrs = characterParts()
+		lastReading = Protection.read(hum, attrs)
+		if lastReading.mismatch and not warned then
+			warned = true
+			log(T("Huida: la vida del Humanoid no coincide con el atributo Health del personaje. Si la huida no salta, es probable que el juego use su propia vida (compruébalo en Jugador > Protección).",
+				"Escape: the Humanoid's health doesn't match the character's Health attribute. If the escape never triggers, the game probably uses its own health (check Player > Protection)."), "warn")
 		end
+		local action, why = Protection.step(state, { enabled = escapeOn, limit = limit, reading = lastReading, character = char,
+			now = os.clock(), alive = life.alive })
+		lastReason = why
+		if action == "start" then startEscape() elseif action == "stop" then stopEscape(why) end
+		local comp = comps:get("Huida automática")
+		if comp and escapeOn and comp.state ~= "Error" then comp:set("Waiting", why) end
 	end
 end)
-end
+end)()
 
 ------------------------------------------------------------------ Auto Boss
 ;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain (1.4.0)
@@ -10149,7 +12112,7 @@ end)
 end)()
 
 ------------------------------------------------------------------ Inicio
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 local DISCORD_URL = nil -- poner aquí la invitación cuando exista
 local rows = {}
 local function row(key) rows[key] = note(pageHome, " ") end
@@ -10227,10 +12190,10 @@ life.spawn(function()
 		task.wait(1)
 	end
 end)
-end
+end)()
 
 ------------------------------------------------------------------ Jugadores: seguir y espectar (pestaña Jugador)
-do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 local targetName = ""
 local following, spectating = false, false
 
@@ -10299,7 +12262,7 @@ life.spawn(function()
 		end
 	end
 end)
-end
+end)()
 
 ------------------------------------------------------------------ Treasure Rain
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
@@ -10671,112 +12634,322 @@ button(pageSettings, L("Cerrar El Hoyo Hub", "Close El Hoyo Hub"), function() cl
 	L("Apaga todas las funciones, deja el personaje como estaba y cierra el hub.", "Turns off every feature, restores your character and closes the hub."))
 end
 
------------------------------------------------------------------- Explorador del juego (pestaña Jefes, columna 2)
--- Consulta el catálogo documentado (módulo Knowledge, datos de data/catalog.json): búsqueda, filtros y fichas con
--- fuentes, estado de verificación y lo que no se sabe. Solo informa: no mueve ni toca nada del juego, y no
--- presenta deducciones como hechos (cada ficha dice si es CONFIRMADO, DOCUMENTADO, DEDUCIDO o CONTRADICTORIO).
+------------------------------------------------------------------ Explorador del juego (sección propia)
+-- Consulta el catálogo documentado (Knowledge + KnowledgeView): búsqueda, filtros agrupados (Mostrar, Estado,
+-- Papel), orden, lista desplazable, ficha completa con fuentes, estado y desconocidos, y navegación por relacionadas
+-- con historial ("‹ Volver"). Solo informa: no mueve ni toca nada del juego.
+-- 1.5.0: sección propia (antes columna 2 de Jefes). El id de "Buscar" cambió (Profiles.ALIASES lo migra).
 ;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 local Knowledge = import("Knowledge")
+local KnowledgeView = import("KnowledgeView")
 local catalogIndex = import("CatalogIndex")
 local problems = Knowledge.validate(catalogIndex)
 comps:register("Knowledge", { kind = "info", state = #problems == 0 and "Ready" or "Error",
 	reason = #problems == 0 and ("catálogo " .. tostring(catalogIndex.meta.version)) or (#problems .. " problemas en el catálogo") })
-local explorerComp = comps:register(T("Explorador", "Explorer"), { kind = "info", deps = { "Knowledge" }, state = "Initializing" })
-local k = Knowledge.new(catalogIndex)
+local page = pagesX.explorer
+local view, listLabel, sheetLabel
 local function tr(pair) return T(pair[1], pair[2]) end
-local FILTERS = {
-	{ L("Todo", "All"), {} },
-	{ L("Islas", "Islands"), { category = "island" } },
-	{ "NPCs", { category = "npc" } },
-	{ L("Jefes", "Bosses"), { role = "boss" } },
-	{ L("Enemigos", "Enemies"), { category = "enemy" } },
-	{ L("Misiones (objetivos)", "Quests (objectives)"), { category = "objective" } },
-	{ L("Eventos", "Events"), { category = "event" } },
-	{ L("Objetos", "Items"), { category = "item" } },
-	{ L("Frutas", "Fruits"), { category = "fruit" } },
-	{ L("Comerciantes", "Merchants"), { role = "merchant" } },
-	{ L("Dan misiones", "Quest givers"), { role = "quest_giver" } },
-	{ L("Sistemas y progresión", "Systems & progression"), { categories = { "system", "mechanic" } } },
-	{ L("Armas y talentos", "Weapons & talents"), { category = "weapon" } },
-	{ L("Con requisitos", "With requirements"), { has = "requirements" } },
-	{ L("Con recompensas", "With rewards"), { has = "rewards" } },
-	{ L("Contradictorias", "Contradictory"), { contradictory = true } },
-	{ L("Incompletas", "Incomplete"), { incomplete = true } },
-	{ L("Archivadas", "Archived"), { archived = "only" } },
-}
-local query, filterIdx, results, sel = "", 1, {}, 1
-local listLabel, sheetLabel
-
-local function statusShort(e)
-	local st = k:status(e.id)
-	return tr(Knowledge.LABELS[st.label] or { st.label, st.label }):match("^(%S+)")
+local function refresh()
+	if listLabel then listLabel.Text = view:listText(17) end
+	if sheetLabel then sheetLabel.Text = table.concat(view:sheetLines(), "\n") end
 end
-local function listText()
-	if #results == 0 then return T("Sin resultados: prueba otro nombre o filtro.", "No results: try another name or filter.") end
-	local out = { string.format(T("%d resultados (%d/%d)", "%d results (%d/%d)"), #results, sel, #results) }
-	local first = math.clamp(sel - 3, 1, math.max(1, #results - 6))
-	for i = first, math.min(#results, first + 6) do
-		local e = results[i]
-		table.insert(out, (i == sel and "▶ " or "    ") .. e.name .. " · " .. tr(Knowledge.LABELS[e.category] or { e.category, e.category }) .. " · " .. statusShort(e))
-	end
-	return table.concat(out, "\n")
-end
-local function sheetLines()
-	local e = results[sel]
-	local sheet = e and k:sheet(e.id, tr)
-	if not sheet then return {} end
-	local out = { "■ " .. sheet.name .. " — " .. sheet.categoryLabel }
-	for _, sec in sheet.sections do table.insert(out, sec.title .. ": " .. table.concat(sec.items, " · ")) end
+local function options(list)
+	local out = {}
+	for i, p in KnowledgeView.options(list) do out[i] = L(p[1], p[2]) end
 	return out
 end
-local function refresh()
-	if listLabel then listLabel.Text = listText() end
-	if sheetLabel then sheetLabel.Text = table.concat(sheetLines(), "\n") end
-end
-local function run()
-	results = k:search(query, FILTERS[filterIdx][2])
-	sel = 1
-	refresh()
-end
+local explorer = comps:register(T("Explorador", "Explorer"), { kind = "info", deps = { "Knowledge" }, impl = {
+	init = function() view = KnowledgeView.new(Knowledge.new(catalogIndex), tr) end,
+	start = function(c) view:run(); refresh(); c.reason = #view.results .. " entidades" end,
+} })
 
-section(pageBoss, L("Explorador del juego", "Game explorer"), 2)
-input(pageBoss, L("Buscar", "Search"), L("nombre o alias", "name or alias"), "", function(text)
-	query = text
-	run()
-end, L("Busca islas, NPCs, jefes, misiones, eventos, objetos, frutas... por nombre, alias o id.",
-	"Search islands, NPCs, bosses, quests, events, items, fruits... by name, alias or id."))
-combo(pageBoss, L("Mostrar", "Show"), (function()
-	local names = {}
-	for i, f in FILTERS do names[i] = f[1] end
-	return names
-end)(), 1, function(i)
-	filterIdx = i
-	run()
-end, L("Filtra por categoría, por papel (jefes, comerciantes) o por estado de la información.",
-	"Filter by category, role (bosses, merchants) or by the state of the information."))
-listLabel = note(pageBoss, listText, 8)
-button(pageBoss, L("‹ Anterior", "‹ Previous"), function()
-	if #results > 0 then sel = sel > 1 and sel - 1 or #results; refresh() end
+page.tab:Columns({ 1, 1.15 })
+section(page, L("Búsqueda", "Search"), 1)
+local controls = {}
+controls.search = input(page, L("Buscar", "Search"), L("nombre, alias o id", "name, alias or id"), "", function(text)
+	if view then view:set("query", text); refresh() end
+end, L("Busca en todo el catálogo: islas, NPCs, jefes, misiones, eventos, objetos, frutas… por nombre, alias o id.",
+	"Searches the whole catalog: islands, NPCs, bosses, quests, events, items, fruits… by name, alias or id."))
+controls.group = combo(page, L("Mostrar", "Show"), options(KnowledgeView.GROUPS), 1, function(i)
+	if view then view:set("group", i); refresh() end
+end, L("Qué tipo de cosas ver.", "What kind of things to show."))
+controls.status = combo(page, L("Estado", "Status"), options(KnowledgeView.STATUS), 1, function(i)
+	if view then view:set("status", i); refresh() end
+end, L("Filtra por cómo de segura es la información (confirmada en el juego, solo de la wiki, contradictoria…).",
+	"Filters by how reliable the information is (confirmed in game, wiki only, contradictory…)."))
+controls.role = combo(page, L("Papel", "Role"), options(KnowledgeView.ROLES), 1, function(i)
+	if view then view:set("role", i); refresh() end
+end, L("Jefes, élites, comerciantes o quien da misiones (según la wiki).", "Bosses, elites, merchants or quest givers (per the wiki)."))
+controls.sort = combo(page, L("Orden", "Order"), options(KnowledgeView.SORTS), 1, function(i)
+	if view then view:set("sort", i); refresh() end
 end)
-button(pageBoss, L("Siguiente ›", "Next ›"), function()
-	if #results > 0 then sel = sel < #results and sel + 1 or 1; refresh() end
-end)
-sheetLabel = note(pageBoss, function() return table.concat(sheetLines(), "\n") end, 16)
-button(pageBoss, L("Ficha completa en la consola", "Full sheet in the console"), function()
-	local lines = sheetLines()
+listLabel = note(page, function() return view and view:listText(17) or "" end, 18)
+button(page, L("‹ Anterior", "‹ Previous"), function() if view and view:move(-1) then refresh() end end)
+button(page, L("Siguiente ›", "Next ›"), function() if view and view:move(1) then refresh() end end)
+button(page, L("Restablecer filtros", "Reset filters"), function()
+	if not view then return end
+	view:reset()
+	controls.search:Set("")
+	for _, key in { "group", "status", "role", "sort" } do controls[key]:Set(1, true) end
+	refresh()
+end, L("Vacía la búsqueda y vuelve a Todo / Cualquiera / Relevancia.", "Clears the search and goes back to All / Any / Relevance."))
+
+section(page, L("Ficha", "Sheet"), 2)
+sheetLabel = note(page, function() return view and table.concat(view:sheetLines(), "\n") or "" end, 26)
+button(page, L("Relacionada siguiente", "Next related"), function()
+	if view and view:nextRelated() then refresh() end
+end, L("Mueve ▶ por las relacionadas de la ficha.", "Moves ▶ through the sheet's related entries."))
+button(page, L("Abrir relacionada", "Open related"), function()
+	if view and view:openRelated() then refresh() else log(T("Esta ficha no tiene relacionadas", "This sheet has no related entries"), "info") end
+end, L("Abre la ficha de la relacionada marcada con ▶.", "Opens the sheet of the related entry marked with ▶."))
+button(page, L("‹ Volver", "‹ Back"), function()
+	if view and view:back() then refresh() end
+end, L("Vuelve a la ficha anterior.", "Goes back to the previous sheet."))
+button(page, L("Ficha completa en la consola", "Full sheet in the console"), function()
+	local lines = view and view:sheetLines() or {}
 	if #lines == 0 then return log(T("Elige antes un resultado", "Pick a result first"), "warn") end
 	for _, l in lines do log(l) end
 	setConsole(true)
-end, L("Escribe la ficha entera en la consola (la caja corta lo que no cabe).", "Writes the whole sheet to the console (the box cuts what doesn't fit)."))
-note(pageBoss, L("Fuente: wiki del juego (datos.json) y lo grabado en el juego. DOCUMENTADO = lo dice la wiki, sin comprobar.",
-	"Source: the game's wiki (datos.json) and what was recorded in game. DOCUMENTED = the wiki says so, unchecked."))
-run()
-explorerComp:set("Ready", #results .. " entidades")
+end, L("Copia la ficha en la consola (la caja ya la muestra entera; esto sirve para copiarla).", "Copies the sheet to the console (the box already shows it; this is for copying)."))
+note(page, L("Fuente: wiki del juego (datos.json) y lo grabado en el juego. DOCUMENTADO = lo dice la wiki, sin comprobar. ?N = datos que no se saben.",
+	"Source: the game's wiki (datos.json) and what was recorded in game. DOCUMENTED = the wiki says so, unchecked. ?N = unknown data."))
+explorer:start()
 comps:refresh()
+
+-- Buscador global (Ctrl+K): las entidades del catálogo también salen; elegir una abre su ficha aquí (no hace nada más)
+win.searchProviders = win.searchProviders or {}
+table.insert(win.searchProviders, function(q)
+	if not view then return {} end
+	local out = {}
+	for _, e in view.k:search(q, {}, 5) do
+		table.insert(out, { label = e.name, aliases = e.aliases, group = "catalog",
+			path = tr(Knowledge.LABELS[e.category] or { e.category, e.category }), pick = function()
+				controls.search:Set(e.name)
+				view:set("query", e.name)
+				refresh()
+				win:selectTab(page.tab)
+			end })
+	end
+	return out
+end)
+end)()
+
+------------------------------------------------------------------ Perfiles (sección propia)
+-- Centro de perfiles (1.5.0). Reglas: módulo Profiles (validar, aplicar atómico, diff, exportar sin secretos);
+-- guardar, renombrar, duplicar y papelera: la librería (win.configs). Aquí solo se ordena y se enseña: no hay otra
+-- forma de guardar perfiles. Las cajas de texto de esta sección no van en los perfiles.
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
+local Profiles = import("Profiles")
+local configs = win.configs
+local page = pagesX.profiles
+Profiles.ALIASES = { ["Bosses/Game explorer/Search"] = "Explorer/Search/Search" } -- = data/ui_moves.json > ids
+win.profileVersion = Profiles.VERSION
+win.profileApply = function(values, controls, pending)
+	local ok, problems, warnings = Profiles.apply(values, controls, pending)
+	if not ok then
+		log(T("Perfil NO aplicado (no se ha cambiado nada): ", "Preset NOT applied (nothing changed): ") .. table.concat(problems, "; "), "error")
+	end
+	for _, w in warnings do
+		if w:find("secreto", 1, true) then log(T("Perfil: ", "Preset: ") .. w, "warn") end
+	end
+	return ok, problems
+end
+win.profileExport = function(cfg, values)
+	local out, removed = Profiles.export(cfg, values, HUB_VERSION)
+	if #removed > 0 then log(T("Exportado sin ", "Exported without ") .. #removed .. T(" secretos", " secrets"), "info") end
+	return json.encode(out)
+end
+local profilesComp = comps:register(T("Perfiles", "Presets"), { kind = "info", state = "Ready" })
+
+local target, pendingImport, armed = "", nil, nil
+local previewText = T("Escribe un perfil y pulsa Vista previa.", "Type a preset and press Preview.")
+local labels = {}
+local function changed() if win.configsChanged then win.configsChanged() end end
+local function findProfile(name)
+	local want = tostring(name):lower():match("^%s*(.-)%s*$")
+	if want == "" then return configs.selected end
+	for i, cfg in configs.list do if cfg.name:lower() == want then return i end end
+	for i, cfg in configs.list do if cfg.name:lower():find(want, 1, true) then return i end end
+	return nil
+end
+local function dirtyCount()
+	local okPeek, saved = pcall(configs.peek, configs.selected)
+	local _, n = Profiles.dirty(okPeek and saved or {}, configs.snapshot())
+	return n
+end
+local function statusText()
+	local cfg = configs.current()
+	if not cfg then return T("Sin perfil activo", "No active preset") end
+	local n = dirtyCount()
+	return string.format(T("● %s   (formato v%d)\n%s\nPerfiles: %d · papelera: %d", "● %s   (format v%d)\n%s\nPresets: %d · bin: %d"),
+		cfg.name, Profiles.VERSION, n > 0 and string.format(T("%d cambios sin guardar", "%d unsaved changes"), n) or T("Todo guardado", "Everything saved"),
+		#configs.list, #configs.trash)
+end
+local function listText()
+	local out = {}
+	local pick = findProfile(target)
+	for i, cfg in configs.list do
+		if i > 12 then table.insert(out, "… +" .. (#configs.list - 12)); break end
+		table.insert(out, (i == configs.selected and "● " or "   ") .. cfg.name .. (i == pick and i ~= configs.selected and "   ◂ " .. T("elegido", "picked") or ""))
+	end
+	return table.concat(out, "\n")
+end
+local function refresh()
+	if labels.status then labels.status.Text = statusText() end
+	if labels.list then labels.list.Text = listText() end
+	if labels.preview then labels.preview.Text = previewText end
+end
+local function picked()
+	local i = findProfile(target)
+	if not i then log(T("Elige antes un perfil (escribe su nombre en Perfil)", "Pick a preset first (type its name in Preset)"), "warn") end
+	return i
+end
+
+page.tab:Columns({ 1, 1 })
+section(page, L("Perfil activo", "Active preset"), 1)
+labels.status = note(page, statusText, 3)
+labels.list = note(page, listText, 13)
+
+section(page, L("Gestionar", "Manage"), 1)
+input(page, L("Perfil", "Preset"), L("nombre (vacío = el activo)", "name (empty = active)"), "", function(text)
+	target = text
+	local i = findProfile(text)
+	log(i and (T("Perfil elegido: ", "Preset picked: ") .. configs.list[i].name) or T("No hay ningún perfil con ese nombre", "No preset with that name"), i and "info" or "warn")
+	refresh()
+end, L("Escribe el nombre (o parte) del perfil sobre el que actúan los botones.", "Type the name (or part) of the preset the buttons act on."), true)
+button(page, L("Vista previa", "Preview"), function()
+	local i = picked()
+	if not i then return end
+	local values = configs.peek(i) or {}
+	local ok, problems = Profiles.validate({ values = values })
+	local d = Profiles.diff(configs.snapshot(), values)
+	local out = { string.format(T("%s: %d cambios · %d iguales · %d de controles aún sin crear", "%s: %d changes · %d unchanged · %d for controls not built yet"),
+		configs.list[i].name, #d.changes, d.unchanged, #d.unknown) }
+	if not ok then table.insert(out, T("NO se puede aplicar: ", "CAN'T be applied: ") .. table.concat(problems, "; ")) end
+	for k, c in d.changes do
+		if k > 14 then table.insert(out, "… +" .. (#d.changes - 14)); break end
+		table.insert(out, c.id:match("[^/]+$") .. ": " .. Profiles.show(c.from) .. " → " .. Profiles.show(c.to))
+	end
+	previewText = table.concat(out, "\n")
+	refresh()
+end, L("Enseña qué cambiaría si aplicas ese perfil, sin aplicarlo.", "Shows what would change if you applied that preset, without applying it."))
+button(page, L("Aplicar perfil", "Apply preset"), function()
+	local i = picked()
+	if not i then return end
+	local ok = configs.load(i)
+	changed()
+	if ok then log(T("Perfil aplicado: ", "Preset applied: ") .. configs.list[i].name, "ok", true) end
+	refresh()
+end, L("Aplica el perfil entero o, si tiene datos no válidos, no cambia nada y dice por qué.", "Applies the whole preset or, if it has invalid data, changes nothing and says why."))
+button(page, L("Descartar cambios sin guardar", "Discard unsaved changes"), function()
+	local ok = configs.revert()
+	if ok then log(T("Vuelto a lo guardado en ", "Back to what was saved in ") .. tostring(configs.current() and configs.current().name), "ok", true) end
+	refresh()
+end, L("Vuelve a poner el perfil activo tal y como está guardado.", "Puts the active preset back exactly as it is saved."))
+input(page, L("Renombrar a", "Rename to"), L("nombre nuevo", "new name"), "", function(text)
+	text = text:match("^%s*(.-)%s*$")
+	if text == "" then return end
+	local i = picked()
+	if not i then return end
+	local old = configs.list[i].name
+	configs.rename(i, text)
+	changed()
+	log(string.format(T("Perfil renombrado: %s → %s", "Preset renamed: %s → %s"), old, configs.list[i].name), "ok", true)
+	target = configs.list[i].name
+	refresh()
+end, L("Cambia el nombre del perfil elegido (no cambia su contenido).", "Renames the picked preset (its content stays the same)."), true)
+button(page, L("Duplicar perfil", "Duplicate preset"), function()
+	local i = picked()
+	if not i then return end
+	local copy = configs.duplicate(i)
+	changed()
+	log(T("Perfil duplicado: ", "Preset duplicated: ") .. copy.name, "ok", true)
+	refresh()
+end, L("Crea una copia del perfil elegido.", "Makes a copy of the picked preset."))
+button(page, L("Enviar a la papelera", "Move to bin"), function()
+	local i = picked()
+	if not i then return end
+	local name = configs.list[i].name
+	-- confirmación: segundo clic en 4 s sobre el mismo perfil
+	if not (armed and armed.name == name and os.clock() - armed.at < 4) then
+		armed = { name = name, at = os.clock() }
+		return log(string.format(T("¿Mandar %s a la papelera? Vuelve a pulsar en 4 s para confirmar (se puede restaurar)",
+			"Move %s to the bin? Press again within 4 s to confirm (it can be restored)"), name), "warn", true)
+	end
+	armed = nil
+	configs.remove(i)
+	changed()
+	log(T("Perfil en la papelera: ", "Preset moved to the bin: ") .. name, "ok", true)
+	refresh()
+end, L("Lo manda a la papelera (pide confirmación; desde la papelera se puede restaurar).", "Moves it to the bin (asks to confirm; it can be restored from the bin)."))
+button(page, L("Restaurar de la papelera", "Restore from bin"), function()
+	if #configs.trash == 0 then return log(T("La papelera está vacía", "The bin is empty"), "info") end
+	local back = configs.restore(#configs.trash)
+	changed()
+	log(T("Perfil restaurado: ", "Preset restored: ") .. back.name, "ok", true)
+	refresh()
+end, L("Recupera el último perfil que mandaste a la papelera.", "Brings back the last preset you moved to the bin."))
+
+section(page, L("Vista previa", "Preview"), 2)
+labels.preview = note(page, function() return previewText end, 16)
+
+section(page, L("Importar y exportar", "Import and export"), 2)
+button(page, L("Exportar perfil (sin secretos)", "Export preset (no secrets)"), function()
+	if configs.export(configs.selected) then log(T("Perfil copiado al portapapeles, sin secretos", "Preset copied to the clipboard, without secrets"), "ok", true)
+	else log(T("Tu executor no deja copiar", "Your executor can't copy"), "warn") end
+end, L("Copia el perfil activo sin URLs de webhook ni otros secretos.", "Copies the active preset without webhook URLs or other secrets."))
+input(page, L("Importar perfil", "Import preset"), L("pega aquí el JSON exportado", "paste the exported JSON here"), "", function(text)
+	if text:match("^%s*$") then pendingImport = nil; return end
+	local known = configs.snapshot()
+	local ok, profile, problems, warnings = Profiles.import(text, json, known)
+	if not ok then
+		pendingImport = nil
+		previewText = T("Importación rechazada: ", "Import rejected: ") .. table.concat(problems, "; ")
+		refresh()
+		return log(previewText, "warn")
+	end
+	pendingImport = profile
+	local d = Profiles.diff(known, profile.values)
+	previewText = string.format(T("Perfil válido \"%s\": %d valores (%d cambiarían), %d avisos.\nPulsa \"Crear perfil importado\": no se aplica hasta que lo elijas.",
+		"Valid preset \"%s\": %d values (%d would change), %d warnings.\nPress \"Create imported preset\": nothing is applied until you pick it."),
+		profile.name, d.unchanged + #d.changes + #d.unknown, #d.changes, #warnings)
+	refresh()
+end, L("Comprueba el JSON de un perfil exportado. No aplica nada hasta que lo crees y lo cargues.", "Checks an exported preset's JSON. Nothing is applied until you create and load it."), true)
+button(page, L("Crear perfil importado", "Create imported preset"), function()
+	if not pendingImport then return log(T("Pega antes un perfil válido en Importar perfil", "Paste a valid preset into Import preset first"), "warn") end
+	local _, cfg = configs.createFrom(pendingImport.name, pendingImport.values)
+	log(T("Perfil creado (sin aplicar): ", "Preset created (not applied): ") .. cfg.name, "ok", true)
+	pendingImport = nil
+	refresh()
+end, L("Guarda lo importado como un perfil nuevo. Para usarlo, aplícalo después.", "Saves the import as a new preset. To use it, apply it afterwards."))
+
+-- Lo que se ve se recalcula cada 3 s con la sección abierta: tarea del componente (se cancela al cerrar)
+profilesComp.impl = { start = function(c) c:spawn(function(token)
+	while life.alive and token.alive() do
+		if main.Visible and win.current == page.tab then refresh() end
+		task.wait(3)
+	end
+end) end }
+profilesComp:start()
+
+-- Buscador global: los perfiles salen como resultados; elegir uno lo selecciona aquí (NO lo aplica)
+win.searchProviders = win.searchProviders or {}
+table.insert(win.searchProviders, function()
+	local out = {}
+	for i, cfg in configs.list do
+		table.insert(out, { label = cfg.name, group = "profiles", path = i == configs.selected and T("activo", "active") or "", pick = function()
+			target = cfg.name
+			refresh()
+			win:selectTab(page.tab)
+		end })
+	end
+	return out
+end)
+pagesX.profilesStatus = function() return configs.current() and configs.current().name, dirtyCount() end
 end)()
 
 ------------------------------------------------------------------ Diagnóstico (pestaña Ajustes)
-do -- bloque propio: sus variables no cuentan para el límite de locales del script
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
 -- Estado del hub para pedir ayuda: versiones, carga, componentes, memoria, FPS, errores, recursos, config y
 -- funciones del executor. "Copiar informe" lo pasa por Diagnostics.format, que quita secretos y datos
 -- personales (URL del webhook, tu nombre, tu UserId, el JobId del servidor).
@@ -10804,7 +12977,19 @@ local function collect()
 	table.sort(features)
 	local now = os.clock()
 	local errs = {}
-	for _, e in life.errors:recent(10) do table.insert(errs, { message = e.message, count = e.count, ago = now - e.last }) end
+	for _, e in life.errors:recent(10) do
+		table.insert(errs, { message = e.message, count = e.count, ago = now - e.last, source = e.source, kind = e.kind })
+	end
+	-- tareas vivas por origen (componente)
+	local tasksBySource = {}
+	for _, t in life.tasks() do
+		local key = t.source or "?"
+		tasksBySource[key] = (tasksBySource[key] or 0) + 1
+	end
+	local cfgSel = win.configs and win.configs.current()
+	local okPeek, saved = pcall(function() return win.configs.peek(win.configs.selected) end)
+	local Profiles = import("Profiles")
+	local _, dirtyN = Profiles.dirty(okPeek and saved or {}, win.configs and win.configs.snapshot() or {})
 	local okMem, mem = pcall(function() return game:GetService("Stats"):GetTotalMemoryUsageMb() end)
 	local okExec, exec = pcall(function() return identifyexecutor and table.concat({ identifyexecutor() }, " ") end)
 	return {
@@ -10812,7 +12997,11 @@ local function collect()
 		uptime = now - life.startedAt, fps = hubStats.fps, memoryMb = okMem and mem or nil, luaKb = gcinfo(),
 		executor = okExec and exec or nil, deps = deps,
 		config = { file = configState.file, version = config.configVersion, target = Config.VERSION, ignored = configState.ignored,
-			webhook = validWebhook(config.webhook), migrations = configState.migrations },
+			webhook = validWebhook(config.webhook), migrations = configState.migrations, clamped = configState.clamped,
+			schema = Config.summary(config) },
+		profile = { active = cfgSel and cfgSel.name or nil, format = Profiles.VERSION, unsaved = dirtyN,
+			count = win.configs and #win.configs.list or 0 },
+		tasksBySource = tasksBySource, lastClose = genv.ElHoyoHubLastClose, coordination = ownership.coordination(), mismatches = #comps:mismatches(),
 		life = life.stats(), features = features,
 		-- infraestructura e informativos siempre; funciones solo si no están apagadas (si no, la lista es enorme)
 		components = (function()
@@ -10832,10 +13021,12 @@ local function secrets()
 	return { player.Name, player.DisplayName, tostring(player.UserId), game.JobId }
 end
 
-section(pageSettings, L("Diagnóstico", "Diagnostics"), 2)
+-- 1.5.0: sección propia (antes una caja de Ajustes): esta caja y Componentes, Errores y avisos, Recursos
+local dpage = pagesX.diag
+section(dpage, L("Diagnóstico", "Diagnostics"), 1)
 local rows = {}
-for _, k in { "versions", "state", "perf", "resources", "components", "errors" } do rows[k] = note(pageSettings, " ") end
-button(pageSettings, L("Copiar informe", "Copy report"), function()
+for _, k in { "versions", "state", "perf", "resources", "components", "errors" } do rows[k] = note(dpage, " ") end
+button(dpage, L("Copiar informe", "Copy report"), function()
 	local text = Diagnostics.format(collect(), secrets())
 	if setclipboard then
 		setclipboard(text)
@@ -10846,15 +13037,71 @@ button(pageSettings, L("Copiar informe", "Copy report"), function()
 	end
 end, L("Copia un informe del estado del hub para pedir ayuda. No incluye secretos ni tus datos.",
 	"Copies a report of the hub's state to ask for help. It doesn't include secrets or your details."))
-button(pageSettings, L("Ver errores", "Show errors"), function()
+button(dpage, L("Ver errores", "Show errors"), function()
 	local list = life.errors:recent(10)
 	if #list == 0 then return log(T("Sin errores internos", "No internal errors"), "ok") end
 	for _, e in list do log(string.format("x%d  %s", e.count, e.message), "warn") end
 end, L("Escribe en la consola los últimos errores internos con cuántas veces han pasado.",
 	"Writes the latest internal errors to the console with how many times they happened."))
 
-life.spawn(function()
-	while life.alive do
+-- Componentes: lo pedido frente a lo real y el motivo (o por qué no está disponible)
+section(dpage, L("Componentes", "Components"), 2)
+rows.compList = note(dpage, " ", 15)
+section(dpage, L("Errores y avisos", "Errors and notices"), 2)
+rows.errList = note(dpage, " ", 8)
+section(dpage, L("Recursos y dependencias", "Resources and dependencies"), 1)
+rows.resList = note(dpage, " ", 7)
+local Notifications = import("Notifications")
+local function componentLines(r)
+	local out = {}
+	for _, c in r.components do
+		local line = string.format("%s  %s", tostring(c.state), tostring(c.name))
+		if c.desiredState and c.matches == false then line ..= T("  (pedido ", "  (wanted ") .. c.desiredState .. ")" end
+		if c.available == false then line ..= "  · " .. tostring(c.unavailableWhy)
+		elseif c.lastError then line ..= "  · " .. tostring(c.lastError)
+		elseif c.reason then line ..= "  · " .. tostring(c.reason) end
+		table.insert(out, line)
+	end
+	return #out > 0 and table.concat(out, "\n") or "-"
+end
+local function errorLines(r)
+	local out = {}
+	for _, e in r.errors do
+		table.insert(out, string.format("x%d %s%s", e.count or 1, e.source and ("[" .. tostring(e.source) .. "] ") or "", tostring(e.message)))
+	end
+	local logN = UI.NotificationLog
+	if logN then
+		for _, e in logN:history(4) do table.insert(out, Notifications.line(e, os.clock())) end
+	end
+	return #out > 0 and table.concat(out, "\n") or T("Sin errores ni avisos", "No errors or notices")
+end
+local function resourceLines(r)
+	local deps, missing = {}, {}
+	for name, ok in r.deps do table.insert(ok and deps or missing, name) end
+	table.sort(missing)
+	local tasks = {}
+	for source, n in r.tasksBySource or {} do table.insert(tasks, tostring(source) .. " " .. n) end
+	table.sort(tasks)
+	return table.concat({
+		string.format(T("Registrados %d (+%d al cerrar) · conexiones %d/%d · hilos %d", "Registered %d (+%d at close) · connections %d/%d · threads %d"),
+			r.life.cleanups, r.life.finals or 0, r.life.connected, r.life.connections, r.life.threads),
+		T("Tareas vivas: ", "Live tasks: ") .. (#tasks > 0 and table.concat(tasks, ", ") or "-"),
+		T("Funciones del executor que faltan: ", "Missing executor functions: ") .. (#missing > 0 and table.concat(missing, ", ") or T("ninguna", "none")),
+		(function()
+			local c = r.coordination
+			if not c then return "-" end
+			local held = {}
+			for res, who in c.held do table.insert(held, res .. "=" .. tostring(who)) end
+			return string.format(T("Recursos: %s · denegadas %d · solapes %d · liberaciones tardías %d · referencias viejas %d", "Resources: %s · denied %d · overlaps %d · late releases %d · stale %d"),
+				#held > 0 and table.concat(held, ", ") or T("libres", "free"), c.counts.denied or 0, c.counts.overlap or 0, c.counts.late_release or 0, (c.counts.stale or 0) + (c.counts.stale_use or 0))
+		end)(),
+		T("Cierre anterior: ", "Previous close: ") .. (r.lastClose and (#(r.lastClose.components or {}) == 0 and T("limpio", "clean") or table.concat(r.lastClose.components, ", ")) or "-"),
+	}, "\n")
+end
+-- El refresco de la caja es una tarea del componente Diagnostics (contrato): se cancela sola al cerrar
+local diagComp = comps:get("Diagnostics")
+diagComp.impl = { start = function(c) c:spawn(function(token)
+	while life.alive and token.alive() do
 		if main.Visible then -- con la ventana oculta no se recalcula nada
 			local r = collect()
 			rows.versions.Text = string.format("Hub %s · UI v%s · build %s", r.hubVersion, tostring(r.uiVersion), tostring(r.build))
@@ -10868,17 +13115,337 @@ life.spawn(function()
 			end
 			rows.components.Text = T("Componentes: ", "Components: ") .. table.concat(parts, " · ")
 			rows.errors.Text = T("Errores: ", "Errors: ") .. #r.errors .. (r.life.errorTotal > #r.errors and (" (" .. r.life.errorTotal .. T(" en total)", " in total)")) or "")
+			if win.current == dpage.tab then -- las listas largas solo con la sección abierta
+				rows.compList.Text = componentLines(r)
+				rows.errList.Text = errorLines(r)
+				rows.resList.Text = resourceLines(r)
+			end
 		end
 		task.wait(2)
 	end
-end)
+end) end }
+diagComp:start()
+end)()
+
+------------------------------------------------------------------ Bounty (NPCs) (FARMEO, 1.5.1)
+-- Farmeo de NPCs alrededor de un punto de referencia, para un entorno de pruebas propio. SOLO NPCs del juego
+-- (Workspace.Alive.NPCs): NpcFarm.pickTarget descarta cualquier personaje de jugador. Lógica en NpcFarm (probada con
+-- simulaciones); aquí solo se lee el juego y se actúa. Reutiliza: equipWeapon y attack (Auto Quest), teclas como
+-- Auto Boss, zona segura, turnos de Ownership ("move" y "hand"), Components (estado) y Config (persistencia).
+-- Coordinación: con la zona segura activa, quien no tiene el movimiento es devuelto arriba; por eso Bounty se queda
+-- el turno mientras está en el punto y lo CEDE en cuanto otra función lo pide (Auto Sam, venta…).
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
+local NpcFarm = import("NpcFarm")
+local Protection = import("Protection")
+local page = pagesX.bounty
+local OWNER = NpcFarm.OWNER
+local KEY = "Bounty: farmear NPCs" -- nombre del interruptor (y de su componente)
+local enabled = false
+local state = { phase = "idle" }
+local last = { reason = T("apagado", "off"), target = nil, yielded = nil }
+local holding = false
+
+local function pointVec()
+	local p = config.bountyPoint
+	if type(p) == "table" and tonumber(p[1]) and tonumber(p[2]) and tonumber(p[3]) then return { x = p[1], y = p[2], z = p[3] } end
+	return nil
 end
+local function candidates()
+	local alive = workspace:FindFirstChild("Alive")
+	local npcs = alive and alive:FindFirstChild("NPCs")
+	local playersFolder = alive and alive:FindFirstChild("Players")
+	local out = {}
+	for _, model in npcs and npcs:GetChildren() or {} do
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		local root = model:FindFirstChild("HumanoidRootPart")
+		table.insert(out, { model = model, name = model.Name,
+			isPlayer = Players:GetPlayerFromCharacter(model) ~= nil, -- nunca un jugador
+			inPlayersFolder = playersFolder ~= nil and model:IsDescendantOf(playersFolder),
+			health = hum and hum.Health or 0, position = root and { x = root.Position.X, y = root.Position.Y, z = root.Position.Z } or nil })
+	end
+	return out
+end
+local function take()
+	-- el turno tiene que seguir siendo nuestro (la Huida puede habérselo quitado)
+	if holding and ownership.holder("move") == OWNER then return true end
+	holding = claimMove(OWNER)
+	return holding
+end
+local function drop()
+	if holding then releaseMove(OWNER) end
+	holding = false
+end
+local function pressSkills()
+	for _, key in NpcFarm.skills(config.bountySkills) do
+		local code = Enum.KeyCode[key]
+		if code then
+			VIM:SendKeyEvent(true, code, false, game)
+			VIM:SendKeyEvent(false, code, false, game)
+			task.wait(0.15)
+		end
+	end
+end
+
+section(page, L("Bounty (solo NPCs)", "Bounty (NPCs only)"), 1)
+toggle(page, L(KEY, "Bounty: farm NPCs"), function(on)
+	enabled = on
+	if not on then drop() end
+	log("Bounty (NPCs) " .. (on and "ON" or "OFF"))
+end, L("Ataca a los NPCs del juego cerca del punto de referencia con tu arma y las habilidades elegidas. Nunca elige jugadores. Con vida baja se retira a la zona segura y vuelve al recuperarse.",
+	"Attacks the game's NPCs near the reference point with your weapon and the chosen skills. Never picks players. With low health it retreats to the safe zone and comes back after recovering."))
+button(page, L("Guardar punto de referencia aquí", "Save reference point here"), function()
+	local hrp = getHRP()
+	if not hrp then return log(T("Sin personaje", "No character"), "warn") end
+	local p = hrp.Position
+	config.bountyPoint = { math.floor(p.X * 10) / 10, math.floor(p.Y * 10) / 10, math.floor(p.Z * 10) / 10 }
+	saveConfig()
+	log(string.format(T("Bounty: punto guardado (%d, %d, %d)", "Bounty: point saved (%d, %d, %d)"), p.X, p.Y, p.Z), "ok", true)
+end, L("Se guarda en la configuración: tras reaparecer o recuperarte vuelves aquí.", "Saved in the settings: after respawning or recovering you come back here."))
+button(page, L("Borrar punto de referencia", "Clear reference point"), function()
+	config.bountyPoint = nil
+	saveConfig()
+	log(T("Bounty: punto borrado", "Bounty: point cleared"), "ok")
+end)
+local function statusText()
+	local p = pointVec()
+	local c = comps:get(KEY)
+	return table.concat({
+		T("Punto: ", "Point: ") .. (p and string.format("%d, %d, %d", p.x, p.y, p.z) or T("sin guardar", "not saved")),
+		T("Estado: ", "State: ") .. tostring(c and c.state or "-") .. " · " .. tostring(last.reason),
+		T("Objetivo: ", "Target: ") .. tostring(last.target and last.target.name or "-"),
+		T("Último error: ", "Last error: ") .. tostring(c and c.lastError or "-"),
+		T("Coordinación: ", "Coordination: ") .. (last.yielded and (T("cede a ", "yields to ") .. last.yielded) or
+			(holding and T("tiene el movimiento", "holds movement") or T("sin turno", "no turn"))),
+	}, "\n")
+end
+local statusLabel = note(page, statusText, 5)
+
+section(page, L("Habilidades y vida", "Skills and health"), 2)
+multi(page, L("Teclas de habilidad", "Skill keys"), NpcFarm.KEYS, config.bountySkills, function(chosen)
+	local list = {}
+	for i in NpcFarm.KEYS do list[i] = chosen[i] == true end
+	config.bountySkills = list
+	saveConfig()
+end, L("Qué teclas de habilidad se pulsan (lo que hace cada una depende de tu arma o fruta). Ninguna = solo golpes.",
+	"Which skill keys are pressed (what each one does depends on your weapon or fruit). None = basic hits only."))
+local function choice(text, list, key, suffix, desc)
+	local names = {}
+	for i, v in list do names[i] = v .. suffix end
+	combo(page, text, names, math.clamp(tonumber(config[key]) or 2, 1, #list), function(i)
+		config[key] = i
+		saveConfig()
+	end, desc)
+end
+choice(L("Intervalo de habilidades", "Skill interval"), NpcFarm.INTERVALS, "bountyInterval", " s",
+	L("Segundos entre una tanda de habilidades y la siguiente.", "Seconds between one round of skills and the next."))
+choice(L("Radio de búsqueda", "Search radius"), NpcFarm.RADII, "bountyRadius", " studs",
+	L("Solo NPCs a esta distancia del punto de referencia.", "Only NPCs within this distance of the reference point."))
+choice(L("Retirarse con vida bajo", "Retreat below health"), NpcFarm.LOW, "bountyLow", "%",
+	L("Con menos vida se va a la zona segura (tiene que estar activa en Automatización).", "Below this it goes to the safe zone (it must be on in Automation)."))
+choice(L("Volver con vida", "Return at health"), NpcFarm.RECOVER, "bountyRecover", "%",
+	L("Vuelve al punto cuando se recupera hasta aquí.", "Returns to the point once health is back to this."))
+note(page, L("Solo para tu entorno de pruebas: el objetivo es siempre un NPC del juego (Workspace.Alive.NPCs), nunca un jugador.",
+	"Only for your test environment: the target is always a game NPC (Workspace.Alive.NPCs), never a player."))
+
+life.spawnAs(KEY, function()
+	while life.alive do
+		task.wait(0.25)
+		local char = player.Character
+		local reading = Protection.read(char and char:FindFirstChildOfClass("Humanoid"), nil)
+		local point = pointVec()
+		local target = enabled and point and NpcFarm.pickTarget(candidates(), point, NpcFarm.pick(NpcFarm.RADII, config.bountyRadius)) or nil
+		-- ceder el turno si otra función lo ha pedido hace nada (Sam, venta…): esta vuelta no se mueve
+		local wants = holding and ownership.wanted("move", OWNER, 2) or nil
+		if wants then drop() end
+		last.yielded = wants
+		local res = NpcFarm.step(state, { enabled = enabled, point = point, alive = reading.ok and reading.health > 0,
+			character = char, pct = reading.pct, low = NpcFarm.pick(NpcFarm.LOW, config.bountyLow),
+			recover = NpcFarm.pick(NpcFarm.RECOVER, config.bountyRecover), target = target,
+			moveHolder = ownership.holder("move") ~= OWNER and busy or nil, safeZone = safePart ~= nil, now = os.clock(),
+			interval = NpcFarm.pick(NpcFarm.INTERVALS, config.bountyInterval) })
+		last.reason, last.target = res.reason, target
+		local comp = comps:get(KEY)
+		if comp and enabled and comp.state ~= "Error" then comp:set(res.state, res.reason) end
+		if res.action == "stop" or (res.action == "wait" and not res.stay) then
+			drop()
+		elseif res.action == "retreat" or res.action == "recover" then
+			drop() -- sin turno, la zona segura te mantiene arriba
+			if res.action == "retreat" then goSafe() end
+		elseif res.action == "return" then
+			if take() then teleport(Vector3.new(point.x, point.y + 3, point.z)) end
+		elseif res.action == "fight" and take() then
+			local other = ownership.inUse("hand", OWNER)
+			if other then
+				ownership.event("yielded", "hand", OWNER, other)
+			else
+				local done = ownership.use("hand", OWNER)
+				equipWeapon(nil)
+				attack(target.model)
+				if res.useSkills then pressSkills() end
+				done()
+			end
+		end
+		if main.Visible and win.current == page.tab and statusLabel then statusLabel.Text = statusText() end
+	end
+end)
+life.add(function() drop() end)
+end)()
+
+------------------------------------------------------------------ Panel (inicio, 1.5.0)
+-- Pantalla principal: estado del hub, accesos rápidos, favoritos, actividad y errores recientes. Todo sale de lo que
+-- ya existe (Lifecycle, Components, perfiles, notificaciones): no se inventa ninguna cifra.
+;(function() -- función propia: sus locales no cuentan para el límite de ElHoyoHubMain
+local Favorites = import("Favorites")
+local Notifications = import("Notifications")
+local page = pagesX.dash
+local labels = {}
+local favSel = 1
+config.favorites = Favorites.normalize(config.favorites, import("Profiles").ALIASES)
+
+local function shown(en) -- texto de un control en el idioma actual (las traducciones las registra uiText)
+	local t = UI.Translations and UI.Translations[en]
+	if LANG == "es" and t and t[1] then return t[1] end
+	return en
+end
+local function favName(key)
+	local entry = win.findKey and win:findKey(key)
+	if not entry then return key:match("[^/]+$") .. T("  (ya no existe)", "  (no longer exists)") end
+	return shown(entry.label) .. "  ·  " .. shown(entry.tabName or "")
+end
+
+-- favoritos: el buscador los marca con ★ y los cambia con Ctrl+Enter
+function win.isFavorite(key) return Favorites.has(config.favorites, key) end
+function win.toggleFavorite(key)
+	local _, added = Favorites.toggle(config.favorites, key)
+	saveConfig()
+	log((added and T("Favorito añadido: ", "Favourite added: ") or T("Favorito quitado: ", "Favourite removed: ")) .. favName(key), "ok", true)
+	if labels.refresh then labels.refresh() end
+end
+
+local function statusText()
+	local stats = life.stats()
+	local counts = comps:counts()
+	local active, unsaved = nil, 0
+	if pagesX.profilesStatus then active, unsaved = pagesX.profilesStatus() end
+	local okMem, mem = pcall(function() return game:GetService("Stats"):GetTotalMemoryUsageMb() end)
+	local parts = {}
+	for _, st in { "Running", "Waiting", "Ready", "Error", "Unavailable" } do
+		if counts[st] then table.insert(parts, st .. " " .. counts[st]) end
+	end
+	local mismatch = #comps:mismatches()
+	return table.concat({
+		string.format("El Hoyo Hub %s · build %s · UI v%s", HUB_VERSION, tostring(HUB_BUILD), tostring(UI.Version)),
+		string.format(T("Estado: %s · carga %s", "State: %s · load %s"), tostring(life.stage), stats.initTime and string.format("%.2f s", stats.initTime) or "…"),
+		T("Perfil: ", "Preset: ") .. tostring(active or "-") .. (unsaved > 0 and string.format(T(" · %d sin guardar", " · %d unsaved"), unsaved) or ""),
+		T("Componentes: ", "Components: ") .. table.concat(parts, " · ") .. (mismatch > 0 and string.format(T(" · %d distintos de lo pedido", " · %d not as requested"), mismatch) or ""),
+		T("Señales del juego: ", "Game signals: ") .. (#missingRemotes == 0 and "OK" or (#missingRemotes .. T(" no encontradas", " missing"))),
+		string.format("FPS %d · %s MB", hubStats.fps or 0, okMem and tostring(math.floor(mem)) or "?"),
+	}, "\n")
+end
+local function favText()
+	if #config.favorites == 0 then
+		return T("Sin favoritos. Ctrl+K, busca una función y pulsa Ctrl+Enter para añadirla.",
+			"No favourites. Ctrl+K, search a feature and press Ctrl+Enter to add it.")
+	end
+	favSel = math.clamp(favSel, 1, #config.favorites)
+	local out = {}
+	for i, key in config.favorites do
+		if i > 8 then table.insert(out, "… +" .. (#config.favorites - 8)); break end
+		table.insert(out, (i == favSel and "▶ " or "    ") .. favName(key))
+	end
+	return table.concat(out, "\n")
+end
+local function activityText()
+	local logN = UI.NotificationLog
+	local list = logN and logN:history(6) or {}
+	if #list == 0 then return T("Sin actividad todavía", "No activity yet") end
+	local out = {}
+	for _, e in list do table.insert(out, Notifications.line(e, os.clock())) end
+	return table.concat(out, "\n")
+end
+local function errorsText()
+	local list = life.errors:recent(4)
+	if #list == 0 then return T("Sin errores", "No errors") end
+	local out = {}
+	for _, e in list do table.insert(out, string.format("x%d %s%s", e.count, e.source and ("[" .. tostring(e.source) .. "] ") or "", e.message)) end
+	return table.concat(out, "\n")
+end
+function labels.refresh()
+	if labels.status then labels.status.Text = statusText() end
+	if labels.fav then labels.fav.Text = favText() end
+	if labels.activity then labels.activity.Text = activityText() end
+	if labels.errors then labels.errors.Text = errorsText() end
+end
+local function go(p) win:selectTab(p.tab) end
+
+page.tab:Columns({ 1, 1 })
+section(page, L("Estado", "Status"), 1)
+labels.status = note(page, statusText, 6)
+section(page, L("Accesos rápidos", "Quick access"), 1)
+button(page, L("Buscar (Ctrl+K)", "Search (Ctrl+K)"), function()
+	if win.search then win.search.setOpen(true) end
+end, L("Busca funciones, ajustes, perfiles y entidades del catálogo. Elegir un resultado solo lleva hasta él.",
+	"Searches features, settings, presets and catalog entries. Picking a result only takes you there."))
+button(page, L("Explorador del juego", "Game explorer"), function() go(pagesX.explorer) end)
+button(page, L("Centro de perfiles", "Presets"), function() go(pagesX.profiles) end)
+button(page, L("Diagnóstico", "Diagnostics"), function() go(pagesX.diag) end)
+button(page, L("Ajustes", "Settings"), function() go(pageSettings) end)
+button(page, L("Mostrar / ocultar consola", "Show / hide console"), function() setConsole(not console.shown()) end)
+
+section(page, L("Favoritos", "Favourites"), 2)
+labels.fav = note(page, favText, 9)
+button(page, L("Ir al favorito", "Go to favourite"), function()
+	local key = config.favorites[favSel]
+	if not key then return log(T("No hay favoritos", "No favourites"), "info") end
+	if not win:goToKey(key) then log(T("Ese control ya no existe: quítalo de favoritos", "That control no longer exists: remove it"), "warn") end
+end, L("Lleva al control original (no lo pulsa).", "Takes you to the original control (it doesn't press it)."))
+button(page, L("Favorito siguiente", "Next favourite"), function()
+	if #config.favorites > 0 then favSel = (favSel % #config.favorites) + 1; labels.refresh() end
+end)
+button(page, L("Subir favorito", "Move favourite up"), function()
+	local key = config.favorites[favSel]
+	if key and Favorites.move(config.favorites, key, -1) then favSel -= 1; saveConfig(); labels.refresh() end
+end)
+button(page, L("Quitar favorito", "Remove favourite"), function()
+	local key = config.favorites[favSel]
+	if key then win.toggleFavorite(key) end
+end)
+section(page, L("Actividad reciente", "Recent activity"), 2)
+labels.activity = note(page, activityText, 6)
+section(page, L("Errores recientes", "Recent errors"), 2)
+labels.errors = note(page, errorsText, 4)
+
+-- refresco cada 2 s, solo con el Panel abierto y la ventana visible (tarea del componente: se cancela al cerrar)
+local dash = comps:register(T("Panel", "Dashboard"), { kind = "info", impl = { start = function(c) c:spawn(function(token)
+	while life.alive and token.alive() do
+		if main.Visible and win.current == page.tab then labels.refresh() end
+		task.wait(2)
+	end
+end) end } })
+dash:start()
+
+-- Punto de estado de cada interruptor = estado REAL de su componente (Waiting = encendida sin confirmar, Error…)
+comps:onChange(function(c)
+	if c.kind ~= "feature" then return end
+	local t = toggles[c.name]
+	if t and t.control and t.control.SetStatus then t.control:SetStatus(c.state) end
+end)
+end)()
 
 ------------------------------------------------------------------ Ocultar, cursor
 -- Mostrar / ocultar con la tecla elegida (la librería no la gestiona: ToggleKey = false)
 table.insert(cleanup, UIS.InputBegan:Connect(function(input)
 	if waitingKey or UIS:GetFocusedTextBox() then return end
 	if input.KeyCode.Name == config.key then main.Visible = not main.Visible end
+	-- 1.5.0: Ctrl+K (config.searchKey) abre el buscador; Ctrl+RePág / Ctrl+AvPág cambian de sección
+	if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl) then
+		if input.KeyCode.Name == (config.searchKey or "K") and win.search then
+			main.Visible = true
+			win.search.setOpen(true)
+		elseif input.KeyCode == Enum.KeyCode.PageUp or input.KeyCode == Enum.KeyCode.PageDown then
+			win:stepTab(input.KeyCode == Enum.KeyCode.PageDown and 1 or -1)
+		end
+	end
 end))
 
 -- Cursor: el juego a veces lo esconde. Encima del hub o la consola se fuerza a que se vea.
