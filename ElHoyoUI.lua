@@ -12,7 +12,7 @@
 		local Box = Tab:Box({ Name = "HAKI", Column = 1 })
 		Box:Toggle({ Name = "Auto Buso", Callback = print })
 		Box:Button({ Name = "Teleport", Callback = function() end })
-		Box:Label("Texto informativo")
+		Box:Label("Texto informativo")      -- o Box:Label(function() return texto end, líneas): texto vivo, alto fijo
 		Box:Input({ Name = "URL", Placeholder = "https://...", Callback = print })
 		Window:Finish()
 ]]
@@ -22,7 +22,9 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 
-local Library = { Language = 1, Theme = "Abismo", ThemeNames = { "Abismo", "Light" } } -- 1 = español
+-- Version: nivel de API. ElHoyoHub.lua se niega a usar una librería más vieja que la que necesita (UI_MIN_VERSION).
+-- 2 = v1.3.1 (Unload completo, escala limitada, ventana dentro de la pantalla).
+local Library = { Version = 3, Language = 1, Theme = "Abismo", ThemeNames = { "Abismo", "Light" } } -- 1 = español
 
 local floor, ceil, max, min, abs, exp, huge = math.floor, math.ceil, math.max, math.min, math.abs, math.exp, math.huge
 local function round(x) return floor(x + 0.5) end
@@ -829,6 +831,7 @@ local function strokeContours(points, thickness)
 end
 
 local function setRasterScale(scale)
+	scale = clamp(tonumber(scale) or 1, 0.5, 2) -- un settings.json roto (0, 100...) dejaba la ventana inservible
 	Scale = scale
 	StageScale.Scale = scale
 	Stage.Size = UDim2.fromScale(1 / scale, 1 / scale)
@@ -2528,20 +2531,24 @@ function Flow:Button(o)
 	return { row = row }
 end
 
--- Texto informativo que ocupa varias líneas si hace falta
-function Flow:Label(text)
+-- Texto informativo que ocupa varias líneas si hace falta.
+-- Versión 3: text puede ser una función (texto vivo: cada repintado vuelve a leerla, así un cambio de tema no
+-- borra lo escrito) y fixedLines reserva un alto fijo (lo que no quepa se corta con "…").
+function Flow:Label(text, fixedLines)
 	self:rowBegin()
 	local W, scope = self.rw, self.scope
+	local function current() return type(text) == "function" and tostring(text() or "") or tr(text) end
 	local label = New("TextLabel", {
-		Text = "", Position = UDim2.fromOffset(self.x, self.y), Size = UDim2.fromOffset(W, 0),
-		AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, FontFace = FontMedium, TextSize = 12,
-		TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		Text = "", Position = UDim2.fromOffset(self.x, self.y), Size = UDim2.fromOffset(W, fixedLines and fixedLines * 15 or 0),
+		AutomaticSize = fixedLines and Enum.AutomaticSize.None or Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+		FontFace = FontMedium, TextSize = 12, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, TextTruncate = fixedLines and Enum.TextTruncate.AtEnd or Enum.TextTruncate.None,
 	}, self.parent)
 	scope:paint(function()
-		label.Text = tr(text)
+		label.Text = current()
 		label.TextColor3, label.TextTransparency = T.Disabled, 1 - scope.alpha
 	end)
-	local lines = math.max(1, math.ceil(measure(tr(text), 12) / math.max(W, 1)))
+	local lines = fixedLines or math.max(1, math.ceil(measure(current(), 12) / math.max(W, 1)))
 	self:advance(lines * 15 + 2)
 	return label
 end
@@ -4242,7 +4249,8 @@ function Library:CreateWindow(o)
 	local saved = loadSaved(folder)
 	if tonumber(saved.scale) and saved.scale ~= 1 then setRasterScale(saved.scale) end
 	local view = viewport()
-	local start = o.Position or Vector2.new(floor((view.X - 800) * 0.5), floor((view.Y - 600) * 0.5))
+	-- en pantallas más pequeñas que la ventana, la esquina queda dentro (se ve la barra para arrastrarla)
+	local start = o.Position or Vector2.new(max(0, floor((view.X - 800) * 0.5)), max(0, floor((view.Y - 600) * 0.5)))
 	local frame = Box(Stage, start.X, start.Y, 800, 600)
 	frame.Active, frame.Name, frame.ZIndex = true, "Menu", 10
 	New("TextButton", { Modal = true, Text = "", BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 0) }, frame) -- frees a locked mouse
@@ -4979,6 +4987,12 @@ end
 function Library:Unload()
 	for _, connection in Connections do connection:Disconnect() end
 	table.clear(Connections)
+	Connected = false -- si se vuelve a crear una ventana con esta misma copia, que reconecte la entrada
+	table.clear(Moving)
+	table.clear(Tickers)
+	table.clear(Popups)
+	table.clear(Windows)
+	Hover, Held, Dragging = nil, nil, nil
 	if Screen then Screen:Destroy() end
 	Screen = nil
 end
