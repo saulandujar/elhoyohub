@@ -1,6 +1,7 @@
 -- El Hoyo Hub
 -- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
-local HUB_VERSION = "1.1.1"
+local HUB_VERSION = "1.3.1"
+local UI_MIN_VERSION = 2 -- ElHoyoUI.lua con Library.Version menor no vale (cambió algo que el hub necesita)
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
 local function ElHoyoHubMain()
@@ -15,6 +16,36 @@ local mouse = player:GetMouse()
 -- Si ya hay un hub abierto (se volvió a ejecutar el script), se cierra antes: dos hubs harían todo doble
 local genv = getgenv and getgenv() or {}
 if genv.ElHoyoHubClose then pcall(genv.ElHoyoHubClose) end
+
+-- Ciclo de vida. cleanup: lo que se deshace al cerrar, en orden (conexiones y objetos con :Disconnect()).
+-- El cierre se registra ya aquí, antes de esperar a nada: así un hub a medio cargar (o que falló al cargar)
+-- también se puede cerrar, y si se vuelve a ejecutar mientras este carga, este se para en vez de duplicarse.
+local alive = true
+local cleanup = {}
+local function closeHub()
+	if not alive then return end
+	alive = false -- todos los bucles miran esto y se paran
+	for _, c in cleanup do pcall(c.Disconnect, c) end
+	table.clear(cleanup)
+end
+genv.ElHoyoHubClose = closeHub
+
+-- Los errores en hilos propios (bucles, callbacks) antes morían en silencio en la consola de Roblox, que el
+-- usuario no ve. Este task envuelve spawn/delay/defer: el error sale en la consola del hub (una vez por mensaje).
+local reportError -- se asigna cuando existe log()
+local realTask = task
+local function guarded(fn)
+	if type(fn) ~= "function" then return fn end -- task.spawn(hilo) se deja igual
+	return function(...)
+		local ok, err = xpcall(fn, debug.traceback, ...)
+		if not ok and alive and reportError then reportError(err) end
+	end
+end
+local task = setmetatable({
+	spawn = function(fn, ...) return realTask.spawn(guarded(fn), ...) end,
+	defer = function(fn, ...) return realTask.defer(guarded(fn), ...) end,
+	delay = function(t, fn, ...) return realTask.delay(t, guarded(fn), ...) end,
+}, { __index = realTask })
 
 local Services = game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Packages"):WaitForChild("_Index")
 	:WaitForChild("sleitnick_knit@1.7.0"):WaitForChild("knit"):WaitForChild("Services")
@@ -35,13 +66,24 @@ local function call(remote, method, ...)
 	return pcall(remote[method], remote, ...)
 end
 
-local alive = true
-local cleanup = {} -- conexiones que se desconectan al cerrar
+
+------------------------------------------------------------------ Idioma
+-- La librería traduce sola los nombres: el texto base va en inglés y el español es su idioma 1.
+-- L("es", "en") para nombres fijos (se registran en la librería); T("es", "en") para mensajes del momento.
+local LANG = "es" -- lo fija syncLang() según el idioma de la librería
+local function L(es, en)
+	return { es = es, en = en }
+end
+local function T(es, en)
+	return LANG == "en" and en or es
+end
 
 ------------------------------------------------------------------ Configuración guardada
 -- Se guarda en un archivo del executor (writefile/readfile). Si el executor no lo permite, dura solo la sesión.
 local HttpService = game:GetService("HttpService")
 local CONFIG_FILE = "ElHoyoHub.json"
+local CONFIG_VERSION = 2 -- 2 = v1.3.1 (webhook fuera de los perfiles)
+local bootNotes = {} -- avisos de la carga { es, en }: se escriben en la consola cuando existe (y se sabe el idioma)
 local config = {
 	profiles = {}, -- perfiles guardados con nombre: funciones encendidas + ajustes
 	lang = genv.ElHoyoHubLang or "es",
@@ -51,40 +93,147 @@ local config = {
 	scale = 1,
 	hubUrl = "https://raw.githubusercontent.com/saulandujar/elhoyohub/refs/heads/main/ElHoyoHub.lua", -- para Autoexec
 }
-pcall(function()
-	if isfile and readfile and isfile(CONFIG_FILE) then
-		for k, v in HttpService:JSONDecode(readfile(CONFIG_FILE)) do config[k] = v end
+-- Tipo de cada clave conocida: un valor de otro tipo (archivo editado a mano o roto) se ignora y queda el de
+-- serie, en vez de romper la sección que lo lee. Las claves sin tipo aquí las valida quien las usa.
+do -- bloque propio: CONFIG_TYPES solo se usa al cargar (límite de 200 locales)
+local CONFIG_TYPES = {
+	profiles = "table", lang = "string", palette = "string", key = "string", notify = "boolean", scale = "number",
+	hubUrl = "string", webhook = "string", autoExec = "boolean", fishSpot = "table", juiceFruits = "table",
+	fruitSel = "table", sellRarities = "table", boxRarities = "table", bossKeys = "string", configVersion = "number",
+}
+do
+	local text
+	pcall(function() if isfile and readfile and isfile(CONFIG_FILE) then text = readfile(CONFIG_FILE) end end)
+	if text then
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, text)
+		if ok and type(data) == "table" then
+			for k, v in data do
+				local want = CONFIG_TYPES[k]
+				if type(k) == "string" and (not want or type(v) == want) then
+					config[k] = v
+				else
+					table.insert(bootNotes, { "Ajuste ignorado (valor no válido): " .. tostring(k), "Setting ignored (invalid value): " .. tostring(k) })
+				end
+			end
+		else
+			-- Archivo roto: se guarda una copia antes de que el siguiente guardado lo pise
+			if writefile then pcall(writefile, CONFIG_FILE .. ".bak", text) end
+			table.insert(bootNotes, { "ElHoyoHub.json estaba dañado: se usan los ajustes de serie (copia en ElHoyoHub.json.bak)",
+				"ElHoyoHub.json was damaged: using default settings (copy in ElHoyoHub.json.bak)" })
+		end
 	end
-end)
+end
+end
 local saveQueued = false
 local function saveConfig()
 	if not writefile or saveQueued then return end
 	saveQueued = true
 	task.delay(1, function() -- agrupa varios cambios seguidos en una sola escritura
 		saveQueued = false
-		pcall(writefile, CONFIG_FILE, HttpService:JSONEncode(config))
+		local ok, text = pcall(HttpService.JSONEncode, HttpService, config)
+		if ok then pcall(writefile, CONFIG_FILE, text) end
 	end)
+end
+
+-- Lo conseguido en esta sesión (sale en Inicio)
+local session = { compass = 0, chests = 0, fruits = 0, juices = 0, fish = 0, quests = 0, deliveries = 0 }
+
+-- Avisos a un webhook de Discord (config.webhook). Solo el texto del aviso: nada de tu cuenta.
+-- Solo se aceptan URLs de webhook de Discord, sin menciones (@everyone/@here/roles no avisan a nadie) y como
+-- mucho WEBHOOK_PER_MIN avisos por minuto (Discord corta a ~30).
+local hubLog -- = log(), cuando existe
+local wh = { fruits = false, bosses = false, admins = false }
+local httpRequest = request or http_request or (syn and syn.request) or (http and http.request)
+local function validWebhook(url)
+	if type(url) ~= "string" then return false end
+	local host = url:match("^https://([%w%.]+)/api/webhooks/%d+/[%w_%-]+$")
+	return host == "discord.com" or host == "discordapp.com" or host == "ptb.discord.com" or host == "canary.discord.com"
+end
+-- done(ok, motivo) opcional: lo usa el botón de prueba para decir qué pasó
+local sendWebhook
+do -- bloque propio (límite de 200 locales)
+local WEBHOOK_PER_MIN = 20
+local whSent, whWarned = {}, -math.huge
+function sendWebhook(text, done)
+	local url = config.webhook
+	local function finish(ok, why)
+		if done then
+			done(ok, why)
+		elseif not ok and hubLog and os.clock() - whWarned > 60 then -- un aviso por minuto como mucho
+			whWarned = os.clock()
+			hubLog("Webhook: " .. why, "warn")
+		end
+	end
+	if not httpRequest then return finish(false, T("tu executor no permite peticiones HTTP", "your executor can't make HTTP requests")) end
+	if not validWebhook(url) then return finish(false, T("no hay una URL de webhook de Discord válida", "no valid Discord webhook URL")) end
+	local now = os.clock()
+	while whSent[1] and now - whSent[1] > 60 do table.remove(whSent, 1) end
+	if #whSent >= WEBHOOK_PER_MIN then return finish(false, T("demasiados avisos seguidos, se descartan", "too many alerts in a row, dropped")) end
+	table.insert(whSent, now)
+	task.spawn(function()
+		local ok, res = pcall(httpRequest, {
+			Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({
+				content = "**El Hoyo Hub** · " .. tostring(text):sub(1, 1800),
+				allowed_mentions = { parse = {} },
+			}),
+		})
+		local code = ok and type(res) == "table" and tonumber(res.StatusCode)
+		if not ok then
+			finish(false, T("error de conexión", "connection error"))
+		elseif code and (code < 200 or code >= 300) then
+			finish(false, T("Discord respondió ", "Discord answered ") .. code
+				.. (code == 404 and T(" (webhook borrado o URL mal copiada)", " (webhook deleted or URL miscopied)") or ""))
+		else
+			finish(true)
+		end
+	end)
+end
 end
 
 ------------------------------------------------------------------ Interfaz: El Hoyo UI
 -- La ventana la dibuja ElHoyoUI.lua (librería propia, basada en Neverlose Reloaded y adaptada a El Hoyo Hub).
--- Se usa el archivo de la carpeta del executor si existe; si no, se descarga del mismo sitio que el hub.
--- Aquí abajo hay una capa fina con las funciones de siempre (section, toggle, button, note...) para que las
--- secciones de funciones no tengan que saber nada de la librería.
+-- Se usa el archivo de la carpeta del executor si existe y es de una versión compatible; si no, se descarga del
+-- mismo sitio que el hub. Aquí abajo hay una capa fina con las funciones de siempre (section, toggle, button,
+-- note...) para que las secciones de funciones no tengan que saber nada de la librería.
 local UI_URL = "https://raw.githubusercontent.com/saulandujar/elhoyohub/refs/heads/main/ElHoyoUI.lua"
-local uiSource
-pcall(function()
-	if isfile and readfile and isfile("ElHoyoUI.lua") then uiSource = readfile("ElHoyoUI.lua") end
-end)
-if not uiSource then
-	local nextToHub = config.hubUrl and config.hubUrl:gsub("ElHoyoHub%.lua$", "ElHoyoUI.lua")
-	local url = (nextToHub and nextToHub ~= config.hubUrl) and nextToHub or UI_URL
-	local ok, src = pcall(game.HttpGet, game, url)
-	if ok then uiSource = src end
+local UI, uiErrors = nil, {}
+do -- bloque propio (límite de 200 locales)
+local function loadUI(source, from)
+	if type(source) ~= "string" or #source < 1000 then return nil, from .. ": vacío o sin descargar" end
+	local chunk, err = loadstring(source)
+	if not chunk then return nil, from .. ": " .. tostring(err) end
+	local ok, lib = pcall(chunk)
+	if not ok or type(lib) ~= "table" then return nil, from .. ": " .. tostring(lib) end
+	if (tonumber(lib.Version) or 1) < UI_MIN_VERSION then
+		pcall(lib.Unload, lib)
+		return nil, from .. ": versión " .. tostring(lib.Version or 1) .. " (hace falta " .. UI_MIN_VERSION .. ")"
+	end
+	return lib
 end
-assert(type(uiSource) == "string" and #uiSource > 1000,
-	"No pude cargar ElHoyoUI.lua: súbelo a GitHub junto a ElHoyoHub.lua (o ponlo en la carpeta del executor)")
-local UI = loadstring(uiSource)()
+	local localSource
+	pcall(function() if isfile and readfile and isfile("ElHoyoUI.lua") then localSource = readfile("ElHoyoUI.lua") end end)
+	local err
+	if localSource then
+		UI, err = loadUI(localSource, "ElHoyoUI.lua local")
+		if err then table.insert(uiErrors, err) end
+	end
+	if not UI then
+		local hubUrl = type(config.hubUrl) == "string" and config.hubUrl or ""
+		local nextToHub = hubUrl:gsub("ElHoyoHub%.lua$", "ElHoyoUI.lua")
+		local url = (nextToHub ~= hubUrl and nextToHub:match("^https://")) and nextToHub or UI_URL
+		local ok, src = pcall(game.HttpGet, game, url)
+		UI, err = loadUI(ok and src, url)
+		if err then table.insert(uiErrors, err) end
+	end
+	if UI and localSource and #uiErrors > 0 then
+		table.insert(bootNotes, { "Tu ElHoyoUI.lua local no vale (" .. uiErrors[1] .. "): uso el de internet. Bórralo o actualízalo.",
+			"Your local ElHoyoUI.lua can't be used (" .. uiErrors[1] .. "): using the online one. Delete or update it." })
+	end
+end
+assert(UI, "No pude cargar un ElHoyoUI.lua compatible (" .. table.concat(uiErrors, "; ")
+	.. "). Sube ElHoyoUI.lua a GitHub junto a ElHoyoHub.lua o pon la versión nueva en la carpeta del executor.")
+table.insert(cleanup, { Disconnect = function() pcall(UI.Unload, UI) end })
 
 -- Colores fijos para lo que no dibuja la librería (consola, ESP, zona segura): los de la paleta Abismo roja
 local C = {
@@ -94,16 +243,7 @@ local C = {
 }
 local FONT_SEMI = Enum.Font.GothamMedium
 
------------------------------------------------------------------- Idioma
--- La librería traduce sola los nombres: el texto base va en inglés y el español es su idioma 1.
--- L("es", "en") para nombres fijos (se registran en la librería); T("es", "en") para mensajes del momento.
-local LANG = "es"
-local function L(es, en)
-	return { es = es, en = en }
-end
-local function T(es, en)
-	return LANG == "en" and en or es
-end
+------------------------------------------------------------------ Idioma (traducción de nombres)
 local function uiText(v)
 	if type(v) ~= "table" then return v end
 	if v.es ~= v.en then UI.Translations[v.en] = { v.es } end
@@ -117,6 +257,7 @@ gui.Name = "ElHoyoHub"
 gui.ResetOnSpawn = false
 gui.DisplayOrder = 60
 gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+table.insert(cleanup, { Disconnect = function() gui:Destroy() end })
 
 local function isOver(f)
 	if not f.Visible then return false end
@@ -253,6 +394,16 @@ local function log(msg, level, notify)
 		pcall(UI.Notify, UI, title, msg)
 	end
 end
+hubLog = log
+do
+	local reported = {} -- mismo error, una sola vez (un bucle que falla cada 0,2 s llenaría la consola)
+	reportError = function(err)
+		local first = tostring(err):match("^[^\n]*")
+		if reported[first] then return end
+		reported[first] = true
+		log(T("Error interno: ", "Internal error: ") .. first, "error")
+	end
+end
 
 ------------------------------------------------------------------ Ventana y pestañas
 local win = UI:CreateWindow({ Folder = "ElHoyoHub", ToggleKey = false, SubBrand = "HUB v" .. HUB_VERSION }) -- versión bajo el logo
@@ -301,16 +452,22 @@ end
 
 -- Todos los interruptores por nombre (en español): para "Apagar todo"
 local toggles = {}
+-- Quién encendió cada interruptor de forma automática: owners[nombre] = { [dueño] = true }. Así Auto Expert,
+-- Auto Quest y Treasure Rain no apagan lo que otro (o tú) necesita. Vacío/nil = lo encendiste tú.
+local owners = {}
 
 -- Interruptor. onChange(estado) al pulsarlo o al cargar un perfil; .set(v) lo cambia sin llamar a onChange.
 -- noSave = es un ajuste, no una función (no entra en perfiles ni en "Apagar todo").
+-- obj.transient = true: no va en perfiles, pero sí se apaga con "Apagar todo" y al cerrar (Seguir, Espectar).
 local function toggle(page, text, onChange, desc, noSave)
+	local key = type(text) == "table" and text.es or text
 	local obj = { value = false, onChange = onChange, noSave = noSave }
 	local o = {
 		Name = uiText(text),
 		Tip = desc and uiText(desc) or nil,
-		Callback = function(v)
+		Callback = function(v) -- pulsado a mano o cargado de un perfil: deja de ser de ninguna automatización
 			obj.value = v
+			owners[key] = nil
 			task.spawn(onChange, v)
 		end,
 	}
@@ -320,12 +477,55 @@ local function toggle(page, text, onChange, desc, noSave)
 		obj.value = v == true
 		control:Set(obj.value, true)
 	end
-	toggles[type(text) == "table" and text.es or text] = obj
+	toggles[key] = obj
 	return obj
 end
 
+-- Una automatización pide (on = true) o suelta (on = false) un interruptor. Solo se apaga cuando lo suelta el
+-- último que lo pidió; si ya lo tenías encendido tú, nadie lo apaga.
+local function want(name, owner, on)
+	local t = toggles[name]
+	if not t then return end
+	local set = owners[name]
+	if on then
+		if not t.value then
+			owners[name] = { [owner] = true }
+			t.set(true)
+			task.spawn(t.onChange, true)
+		elseif set then
+			set[owner] = true
+		end
+	elseif set and set[owner] then
+		set[owner] = nil
+		if next(set) == nil then
+			owners[name] = nil
+			if t.value then
+				t.set(false)
+				task.spawn(t.onChange, false)
+			end
+		end
+	end
+end
+
+-- Apaga las funciones (no los ajustes). sync = esperar a que cada una termine de apagarse (al cerrar el hub).
+local function turnAllOff(sync)
+	local n = 0
+	for _, t in toggles do
+		if t.value and (not t.noSave or t.transient) then
+			t.set(false)
+			if sync then pcall(t.onChange, false) else task.spawn(t.onChange, false) end
+			n += 1
+		end
+	end
+	table.clear(owners)
+	return n
+end
+-- Lo primero al cerrar: apagar todo para devolver el personaje, la cámara y los objetos a como estaban
+table.insert(cleanup, 1, { Disconnect = function() turnAllOff(true) end })
+
+
 local function button(parent, text, onClick, desc)
-	return boxFor(parent):Button({ Name = uiText(text), Callback = onClick, Tip = desc and uiText(desc) or nil })
+	return boxFor(parent):Button({ Name = uiText(text), Callback = guarded(onClick), Tip = desc and uiText(desc) or nil })
 end
 
 -- Lista desplegable de una opción. onPick(índice). Se guarda en config, no en los perfiles.
@@ -334,7 +534,7 @@ local function combo(page, text, options, default, onPick, desc)
 	for i, opt in options do names[i] = uiText(opt) end
 	return boxFor(page):Combo({
 		Name = uiText(text), Options = names, Default = default, Flag = false,
-		Tip = desc and uiText(desc) or nil, Callback = function(_, i) onPick(i) end,
+		Tip = desc and uiText(desc) or nil, Callback = guarded(function(_, i) onPick(i) end),
 	})
 end
 
@@ -344,22 +544,29 @@ local function multi(page, text, options, defaults, onChange, desc)
 	for i, opt in options do names[i] = uiText(opt) end
 	return boxFor(page):Multi({
 		Name = uiText(text), Options = names, Default = defaults, Flag = false,
-		Tip = desc and uiText(desc) or nil, Callback = onChange,
+		Tip = desc and uiText(desc) or nil, Callback = guarded(onChange),
 	})
 end
 
+-- Caja de texto. Flag = false: lo escrito se guarda en config (si hace falta), nunca en los perfiles; antes iba
+-- en ellos y la URL del webhook salía al exportar o copiar un perfil.
 local function input(page, text, placeholder, default, onDone, desc)
-	return boxFor(page):Input({ Name = uiText(text), Placeholder = uiText(placeholder), Default = default, Callback = onDone, Tip = desc and uiText(desc) or nil })
+	return boxFor(page):Input({ Name = uiText(text), Placeholder = uiText(placeholder), Default = default, Flag = false,
+		Callback = guarded(onDone), Tip = desc and uiText(desc) or nil })
 end
 
+-- 3 grupos y 11 pestañas: más no caben en la barra lateral (34 px por pestaña, 470 px de alto)
+win:Group(uiText(L("PRINCIPAL", "MAIN")))
+local pageHome = addTab(L("Inicio", "Home"), "STAR")
+local pagePlayer = addTab(L("Jugador", "Player"), "RUNNING")
+local pageTp = addTab("Teleports", "GLOBE")
+local pageGuis = addTab(L("Tiendas", "Shops"), "TH_LARGE")
 win:Group(uiText(L("FARMEO", "FARMING")))
 local pageAuto = addTab(L("Automatización", "Automation"), "BOLT")
-local pageTrain = addTab("Train", "FIRE")
+local pageBoss = addTab(L("Jefes", "Bosses"), "SKULL")
+local pageTrain = addTab(L("Entrenamiento", "Training"), "FIRE")
 local pageQuest = addTab(L("Misiones", "Quests"), "AWARD")
 local pageFruits = addTab(L("Frutas", "Fruits"), "GEM")
-win:Group(uiText(L("MUNDO", "WORLD")))
-local pageTp = addTab("Teleports", "GLOBE")
-local pageGuis = addTab("GUIs", "TH_LARGE")
 win:Group("HUB")
 local pageMisc = addTab("Misc", "SLIDERS_H")
 local pageSettings = addTab(L("Ajustes", "Settings"), "COG")
@@ -411,6 +618,7 @@ end
 local function teleport(pos, skip)
 	local hrp = getHRP()
 	if not hrp then return false end
+	if busy == "Escape" then return false end -- Huida automática: nadie te mueve hasta que te recuperes
 	if avoid.on and busy then
 		local t0 = os.clock()
 		local who = playerNear(pos)
@@ -429,6 +637,7 @@ local function teleport(pos, skip)
 		if not hrp then return false end
 	end
 	hrp.CFrame = CFrame.new(pos)
+	hrp.AssemblyLinearVelocity = Vector3.zero
 	return true
 end
 
@@ -485,6 +694,29 @@ local function clickMouse()
 	VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
 end
 
+-- Pulsa un botón de la interfaz del juego como si le hicieras clic, para que el juego haga lo suyo
+local function pressGuiButton(btn)
+	if getconnections then
+		for _, signal in { btn.MouseButton1Click, btn.Activated } do
+			local conns = getconnections(signal)
+			if #conns > 0 then
+				for _, c in conns do pcall(function() c:Fire() end) end
+				return
+			end
+		end
+	end
+	if firesignal then
+		pcall(firesignal, btn.MouseButton1Click)
+		return
+	end
+	-- Último recurso: clic real en el centro del botón (tiene que verse en pantalla)
+	local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+	local inset = game:GetService("GuiService"):GetGuiInset()
+	local x, y = p.X + s.X / 2, p.Y + s.Y / 2 + inset.Y
+	VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+	VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+end
+
 ------------------------------------------------------------------ Auto Haki
 -- Cuanto más se activa, más se entrena: mientras esté ON se reactiva en cuanto se apaga.
 -- Cada haki: señal para alternarlo, atributo que es true mientras está activo, atributo de energía
@@ -519,7 +751,7 @@ local function hakiActive(haki)
 	return char ~= nil and char:GetAttribute(haki.activeAttr) == true
 end
 
-section(pageAuto, "Haki")
+section(pageTrain, "Haki")
 for _, haki in HAKIS do
 	local enabled, noEnergyLogged = false, false
 
@@ -529,7 +761,7 @@ for _, haki in HAKIS do
 	end
 
 	local t
-	t = toggle(pageAuto, "Auto " .. haki.name, function(on)
+	t = toggle(pageTrain, "Auto " .. haki.name, function(on)
 		if on and not hasSkill() then
 			log(T("No tienes ", "You don't have ") .. haki.name .. " (" .. haki.max .. " = 0)", "warn")
 			t.set(false)
@@ -668,6 +900,7 @@ local function goTreasure()
 	end
 	local c = findCompass()
 	if not c then
+		session.compass += 1
 		log(T("Sam: compass reclamado", "Sam: compass claimed"), "ok", true)
 	elseif c:GetAttribute("TreasureTarget") ~= target then
 		log(T("Sam: el compass marca un destino nuevo", "Sam: the compass points to a new place"))
@@ -776,6 +1009,7 @@ local function openChest(chest)
 		clickChest(chest)
 		task.wait(0.25)
 	until not chest.Parent or os.clock() - t0 >= speed.stay
+	if not chest.Parent then session.chests += 1 end
 end
 
 toggle(pageAuto, "Auto Chest", function(on)
@@ -834,34 +1068,77 @@ task.spawn(function()
 end)
 end
 
------------------------------------------------------------------- Auto Gifts
+------------------------------------------------------------------ Auto Rewards y Challenges
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 -- DailyRewardService.RF.ClaimAll: reclama todos los regalos disponibles de golpe
-local GIFT_EVERY = 60
-local autoGifts = false
+local REWARD_EVERY = 60
+local autoRewards, autoChallenges = false, false
 local claimAllGifts = getRemote("DailyRewardService", "RF", "ClaimAll")
 
-local function claimGifts()
+local function claimRewards()
 	local ok, result = call(claimAllGifts, "InvokeServer")
 	if not ok then
-		log("Gifts: error " .. tostring(result), "error")
+		log("Rewards: error " .. tostring(result), "error")
 	elseif result then
-		log(T("Gifts: reclamado -> ", "Gifts: claimed -> ") .. tostring(result), "ok", true)
+		log(T("Rewards: reclamado -> ", "Rewards: claimed -> ") .. tostring(result), "ok", true)
+	end
+end
+
+-- Challenges: se pulsan los botones "Claim" de su apartado en el menú del juego (PlayerGui.MenuNew).
+-- shortcut: sin grabar; no sé la ruta exacta del apartado ni qué id pide ChallengeService.RE.Claim. Se buscan
+-- botones con "Claim" dentro de cualquier parte de PlayerGui cuyo nombre contenga "Challenge". Si no hay ninguna,
+-- lo dice una vez (entonces: abrir Challenges y pasar EscaneoGUI).
+local challengeWarned = false
+local function claimChallenges()
+	local menu = player.PlayerGui -- el menú Challenges del juego; se busca en todas sus pantallas
+	local claimed, found = 0, false
+	for _, d in menu and menu:GetDescendants() or {} do
+		if d:IsA("GuiButton") then
+			local inside, p = false, d.Parent
+			while p and p ~= menu do
+				if p.Name:lower():find("challenge") then inside = true break end
+				p = p.Parent
+			end
+			if inside then
+				found = true
+				local child = d:FindFirstChild("Text")
+				local text = (child and child:IsA("TextLabel")) and child.Text or (d:IsA("TextButton") and d.Text or "")
+				if text:lower():find("claim") and d.Visible then
+					pressGuiButton(d)
+					claimed += 1
+					task.wait(0.3)
+				end
+			end
+		end
+	end
+	if claimed > 0 then log(T("Challenges: reclamados ", "Challenges: claimed ") .. claimed, "ok", true) end
+	if not found and not challengeWarned then
+		challengeWarned = true
+		log(T("Challenges: no encuentro su apartado en el menú. Ábrelo una vez y pásame EscaneoGUI",
+			"Challenges: can't find its section in the menu. Open it once and send me EscaneoGUI"), "warn")
 	end
 end
 
 section(pageAuto, L("Farmeo", "Farming"))
-toggle(pageAuto, "Auto Gifts", function(on)
-	autoGifts = on
-	log("Auto Gifts " .. (on and "ON" or "OFF"))
-	if on then claimGifts() end
-end, L("Reclama los regalos diarios y por hora al encenderlo y después cada minuto.",
+toggle(pageAuto, "Auto Rewards", function(on)
+	autoRewards = on
+	log("Auto Rewards " .. (on and "ON" or "OFF"))
+	if on then claimRewards() end
+end, L("Reclama las recompensas diarias y por hora al encenderlo y después cada minuto.",
 	"Claims the daily and hourly rewards when turned on and then every minute."))
+toggle(pageAuto, "Auto Claim Challenges (beta)", function(on)
+	autoChallenges = on
+	challengeWarned = false
+	log("Auto Claim Challenges " .. (on and "ON" or "OFF"))
+	if on then task.spawn(claimChallenges) end
+end, L("Reclama los Challenges completados (menú Challenges del juego) cada minuto.",
+	"Claims finished Challenges (the game's Challenges menu) every minute."))
 
 task.spawn(function()
 	while alive do
-		task.wait(GIFT_EVERY)
-		if autoGifts then claimGifts() end
+		task.wait(REWARD_EVERY)
+		if autoRewards then claimRewards() end
+		if autoChallenges then pcall(claimChallenges) end
 	end
 end)
 
@@ -901,6 +1178,7 @@ if fishEnded then
 	table.insert(cleanup, fishEnded.OnClientEvent:Connect(function(score, fish)
 		minigame = nil
 		if autoFish then
+			session.fish += 1
 			log(T("Pesca: ", "Fishing: ") .. tostring(fish) .. " (" .. tostring(score) .. "/10)", "ok")
 		end
 	end))
@@ -1117,27 +1395,47 @@ end)
 end
 
 -- Quien da misiones en cada isla (cartel "Quests"); lo usan Auto Quest y Teleports
--- Pulsa un botón de la interfaz del juego como si le hicieras clic, para que el juego haga lo suyo
-local function pressGuiButton(btn)
-	if getconnections then
-		for _, signal in { btn.MouseButton1Click, btn.Activated } do
-			local conns = getconnections(signal)
-			if #conns > 0 then
-				for _, c in conns do pcall(function() c:Fire() end) end
-				return
-			end
+
+------------------------------------------------------------------ Combate compartido (Auto Quest, Auto Boss)
+local QUEST_DIST = 4 -- studs detrás del enemigo
+
+-- Arma: la que tengas en la mano si vale; si no, la primera del inventario. slot = "Melee" / "Sword" / ... o nil
+local function equipWeapon(slot)
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	local function fits(tool)
+		local s = tool:IsA("Tool") and tool:GetAttribute("WeaponSlot")
+		return s and s ~= "Utility" and (not slot or s == slot)
+	end
+	local held = char:FindFirstChildOfClass("Tool")
+	if held and fits(held) then return end
+	local backpack = player:FindFirstChild("Backpack")
+	for _, tool in backpack and backpack:GetChildren() or {} do
+		if fits(tool) then
+			hum:EquipTool(tool)
+			task.wait(0.2)
+			return
 		end
 	end
-	if firesignal then
-		pcall(firesignal, btn.MouseButton1Click)
-		return
+end
+
+-- Se pone detrás del enemigo mirándole, apunta la cámara hacia él y hace clic real sobre él
+-- (el ataque usa el punto del ratón; enviar Attack a mano no funciona)
+local function attack(enemy)
+	local root, hrp = enemy:FindFirstChild("HumanoidRootPart"), getHRP()
+	if not (root and hrp) then return end
+	local away = hrp.Position - root.Position
+	away = away.Magnitude > 0.1 and Vector3.new(away.X, 0, away.Z).Unit or Vector3.new(0, 0, 1)
+	hrp.CFrame = CFrame.lookAt(root.Position + away * QUEST_DIST, root.Position)
+	local cam = workspace.CurrentCamera
+	cam.CFrame = CFrame.lookAt(hrp.Position + away * 10 + Vector3.new(0, 4, 0), root.Position)
+	local p, onScreen = cam:WorldToViewportPoint(root.Position)
+	if onScreen then
+		VIM:SendMouseMoveEvent(p.X, p.Y, game)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
 	end
-	-- Último recurso: clic real en el centro del botón (tiene que verse en pantalla)
-	local p, s = btn.AbsolutePosition, btn.AbsoluteSize
-	local inset = game:GetService("GuiService"):GetGuiInset()
-	local x, y = p.X + s.X / 2, p.Y + s.Y / 2 + inset.Y
-	VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
-	VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
 end
 
 ------------------------------------------------------------------ Entregas
@@ -1161,6 +1459,7 @@ local function deliverPackage(package)
 	end
 	local ok, delivered = call(deliverRemote, "InvokeServer")
 	log(T("Entrega de ", "Delivery of ") .. package.Name .. " -> " .. tostring(delivered), (ok and delivered) and "ok" or "warn", ok and delivered)
+	if ok and delivered then session.deliveries += 1 end
 	return ok and delivered
 end
 
@@ -1186,7 +1485,6 @@ do -- bloque propio: sus variables no cuentan para el límite de 200 locales del
 -- y actúa según lo que diga. Por ahora entiende "Defeat <enemigo> (Lv N+): a/b": va a por ese enemigo en
 -- Workspace.Alive.NPCs (se llaman "Lv12 Boar") y le ataca con clic real hasta completar el objetivo.
 -- shortcut: aceptar y entregar misiones (QuestLogService) aún no está grabado; hay que hacerlo a mano.
-local QUEST_DIST = 4 -- studs detrás del enemigo
 local autoQuest = false
 
 local function questObjectives()
@@ -1237,42 +1535,6 @@ local function findEnemy(name, minLv)
 		end
 	end
 	return best
-end
-
--- Arma: la que tengas en la mano si es un arma; si no, la primera del inventario (Melee/Sword/Sniper)
-local function equipWeapon()
-	local char = player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if not hum then return end
-	local held = char:FindFirstChildOfClass("Tool")
-	if held and held:GetAttribute("WeaponSlot") and held:GetAttribute("WeaponSlot") ~= "Utility" then return end
-	local backpack = player:FindFirstChild("Backpack")
-	for _, tool in backpack and backpack:GetChildren() or {} do
-		local slot = tool:IsA("Tool") and tool:GetAttribute("WeaponSlot")
-		if slot and slot ~= "Utility" then
-			hum:EquipTool(tool)
-			task.wait(0.2)
-			return
-		end
-	end
-end
-
--- Se pone detrás del enemigo mirándole, apunta la cámara hacia él y hace clic real sobre él
--- (el ataque usa el punto del ratón; enviar Attack a mano no funciona)
-local function attack(enemy)
-	local root, hrp = enemy:FindFirstChild("HumanoidRootPart"), getHRP()
-	if not (root and hrp) then return end
-	local away = hrp.Position - root.Position
-	away = away.Magnitude > 0.1 and Vector3.new(away.X, 0, away.Z).Unit or Vector3.new(0, 0, 1)
-	hrp.CFrame = CFrame.lookAt(root.Position + away * QUEST_DIST, root.Position)
-	local cam = workspace.CurrentCamera
-	cam.CFrame = CFrame.lookAt(hrp.Position + away * 10 + Vector3.new(0, 4, 0), root.Position)
-	local p, onScreen = cam:WorldToViewportPoint(root.Position)
-	if onScreen then
-		VIM:SendMouseMoveEvent(p.X, p.Y, game)
-		VIM:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
-		VIM:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
-	end
 end
 
 -- Ventana del NPC de misiones (EscaneoGUI con Farmer Otto): PlayerGui.QuestGiver.Frame.Window.Body
@@ -1392,7 +1654,7 @@ local function progressOf(text)
 	return tonumber(have), tonumber(need)
 end
 
-section(pageQuest, "Auto Quest")
+section(pageQuest, "Auto Quest", 1)
 toggle(pageQuest, "Auto Quest (beta)", function(on)
 	autoQuest = on
 	if not on then releaseMove("Quest") end
@@ -1416,11 +1678,7 @@ local questFishing = false -- Auto Quest encendió Auto Pesca y la apagará al a
 local function stopQuestFishing()
 	if not questFishing then return end
 	questFishing = false
-	local fish = toggles["Auto Pesca (beta)"]
-	if fish and fish.value then
-		fish.set(false)
-		task.spawn(fish.onChange, false)
-	end
+	want("Auto Pesca (beta)", "Quest", false) -- solo se apaga si nadie más (Auto Expert, tú) la quiere
 end
 -- Un paso de Auto Quest. Va en pcall: si algo falla sale en la consola en vez de parar el bucle en silencio
 local function questTick()
@@ -1493,7 +1751,10 @@ local function questTick()
 			lastClaimTry = os.clock()
 			local hrp = getHRP()
 			if not questStart and hrp then questStart = hrp.CFrame end
-			if claimQuest(giver) then log(T("Quest: entregada", "Quest: turned in"), "ok", true) end
+			if claimQuest(giver) then
+					session.quests += 1
+					log(T("Quest: entregada", "Quest: turned in"), "ok", true)
+				end
 			returnTo(questStart)
 			questStart = nil
 			releaseMove("Quest")
@@ -1503,11 +1764,9 @@ local function questTick()
 	end
 
 	if fishing and not target then
-		local fish = toggles["Auto Pesca (beta)"]
-		if fish and not fish.value then
-			fish.set(true)
-			task.spawn(fish.onChange, true)
+		if not questFishing then
 			questFishing = true
+			want("Auto Pesca (beta)", "Quest", true)
 			if not config.fishSpot then
 				log(T("Quest: no hay sitio de pesca guardado; pescará donde apunte el ratón", "Quest: no saved fishing spot; it will fish where the mouse points"), "warn")
 			end
@@ -1685,7 +1944,7 @@ local function merlinRound()
 	return ok2 and delivered
 end
 
-section(pageQuest, "Merlin")
+section(pageQuest, "Auto Quest", 1) -- Merlin también da misiones: va en la misma caja
 toggle(pageQuest, "Auto Merlin (beta)", function(on)
 	autoMerlin = on
 	if not on then
@@ -1718,8 +1977,8 @@ end
 ------------------------------------------------------------------ Zona segura
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 local safeBack -- dónde estabas al encenderla
-section(pageAuto, L("Zona segura", "Safe zone"))
-toggle(pageAuto, L("Zona segura", "Safe zone"), function(on)
+section(pagePlayer, L("Protección", "Protection"), 2)
+toggle(pagePlayer, L("Zona segura", "Safe zone"), function(on)
 	local hrp = getHRP()
 	if on then
 		if not hrp then return end
@@ -1746,7 +2005,7 @@ end, L("Crea una plataforma muy alta que solo ves tú y te deja ahí para farmea
 	"Creates a very high platform only you can see and keeps you there to farm. Sam, Chest and Fruits come back to it when done. Turning it off brings you back."))
 table.insert(cleanup, { Disconnect = function() if safePart then safePart:Destroy() end end }) -- se quita al cerrar el hub
 
-toggle(pageAuto, L("Evitar jugadores", "Avoid players"), function(on)
+toggle(pagePlayer, L("Evitar jugadores", "Avoid players"), function(on)
 	avoid.on = on
 	log(T("Evitar jugadores ", "Avoid players ") .. (on and "ON" or "OFF"))
 end, L("Las funciones automáticas no te llevan a un sitio con otro jugador cerca: esperan a que se vaya o (barriles) pasan al siguiente.",
@@ -1757,7 +2016,7 @@ do
 	for i, r in RADII do names[i] = r .. " studs" end
 	local pick = table.find(RADII, tonumber(config.avoidRadius)) or 2
 	avoid.radius = RADII[pick]
-	combo(pageAuto, L("Radio para evitar", "Avoid radius"), names, pick, function(i)
+	combo(pagePlayer, L("Radio para evitar", "Avoid radius"), names, pick, function(i)
 		avoid.radius = RADII[i]
 		config.avoidRadius = RADII[i]
 		saveConfig()
@@ -1776,7 +2035,7 @@ task.spawn(function()
 	end
 end)
 
-note(pageAuto, L("Auto Sam, Auto Chest, Auto Train y Frutas te mueven por el mapa: si hay varios encendidos, se turnan.",
+note(pagePlayer, L("Auto Sam, Auto Chest, Auto Train y Frutas te mueven por el mapa: si hay varios encendidos, se turnan.",
 	"Auto Sam, Auto Chest, Auto Train and Fruits move you around the map: if several are on, they take turns."))
 
 end
@@ -2076,6 +2335,7 @@ local function collectFruit(tool)
 		fruitTried[tool] = os.clock()
 		log(T("Frutas: no pude coger ", "Fruits: couldn't pick up ") .. name, "warn")
 	else
+		session.fruits += 1
 		log(T("Frutas: recogida ", "Fruits: picked up ") .. name, "ok", true)
 	end
 end
@@ -2322,7 +2582,7 @@ pageTp.tab:Columns({ 1.45, 1 }) -- columna 1 más ancha: solo lleva el mapa
 local mapBox = section(pageTp, L("Mapa", "Map"), 1)
 section(pageTp, "NPCs", 2)
 npcButtons(pageTp, NPCS)
-section(pageQuest, L("Ir a un NPC de misiones", "Go to a quest giver"))
+section(pageQuest, L("Ir a un NPC de misiones", "Go to a quest giver"), 2)
 npcButtons(pageQuest, QUEST_GIVERS)
 
 -- Nombres de las islas según la wiki del juego (datos.json) y los NPCs que hay en cada una.
@@ -2565,29 +2825,6 @@ end
 
 ------------------------------------------------------------------ GUIs
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
--- Botones del menú del juego (Crews, Challenges, Quests, Shop, Stats...), leídos en vivo de su interfaz
-section(pageGuis, L("Menú del juego", "Game menu"))
-local menuGrid = grid(pageGuis)
-local menuNew = player.PlayerGui:FindFirstChild("MenuNew")
-local column = menuNew and menuNew:FindFirstChild("Column")
-local menuButtons = column and column:FindFirstChild("Buttons")
-local menuList = {}
-for _, b in menuButtons and menuButtons:GetChildren() or {} do
-	if b:IsA("GuiButton") then table.insert(menuList, b) end
-end
-table.sort(menuList, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
-for _, b in menuList do
-	local textLabel = b:FindFirstChild("Text")
-	local name = textLabel and textLabel:IsA("TextLabel") and textLabel.Text ~= "" and textLabel.Text or b.Name
-	button(menuGrid, name, function()
-		pressGuiButton(b)
-		log(T("Abriendo ", "Opening ") .. name)
-	end, L("Abre el menú " .. name .. " del juego.", "Opens the game's " .. name .. " menu."))
-end
-if #menuList == 0 then
-	note(pageGuis, L("No encuentro el menú del juego (PlayerGui.MenuNew).", "Can't find the game menu (PlayerGui.MenuNew)."))
-end
-
 -- Menús de NPCs: te lleva un momento al NPC, le habla y te devuelve a donde estabas
 -- shortcut: no sabemos cómo se habla con los NPCs; se prueban ClickDetector y ProximityPrompt.
 -- Si el juego cierra el menú al alejarte, habría que quedarse junto al NPC.
@@ -2597,8 +2834,10 @@ local function talkTo(entry)
 	if not hrp then return end
 	if not claimMove("GUIs") then return log(T("Otra función te está moviendo, prueba en un momento", "Another feature is moving you, try again in a moment"), "warn") end
 	local back = hrp.CFrame
+	-- shortcut: el clic solo vale a menos de 32 studs (lo comprueba el servidor), así que hay que ir; se vuelve al
+	-- instante y la ventana se queda abierta. Si alguna tienda se cierra al alejarte, habría que quedarse.
 	teleport(npc:GetPivot().Position + Vector3.new(0, 3, 4))
-	task.wait(0.4)
+	task.wait(0.2)
 	local talked = false
 	for _, d in npc:GetDescendants() do
 		if d:IsA("ClickDetector") and fireclickdetector then
@@ -2609,7 +2848,7 @@ local function talkTo(entry)
 			talked = true
 		end
 	end
-	task.wait(0.6)
+	task.wait(0.25)
 	hrp = getHRP()
 	if hrp then hrp.CFrame = back end
 	releaseMove("GUIs")
@@ -2620,7 +2859,7 @@ local function talkTo(entry)
 	end
 end
 
-section(pageGuis, L("Tiendas y NPCs (beta)", "Shops and NPCs (beta)"))
+section(pageGuis, L("Tiendas y NPCs", "Shops and NPCs"))
 local npcGuiGrid = grid(pageGuis)
 for _, entry in NPCS do
 	button(npcGuiGrid, entry.name, function() talkTo(entry) end,
@@ -2643,7 +2882,7 @@ do -- bloque propio: sus variables no cuentan para el límite de 200 locales del
 local BARREL_COOLDOWN = 180 -- shortcut: el usuario calcula 2-3 min hasta que se rellena; mirar si el barril cambia al vaciarse
 local autoStats = false
 local visited = {} -- pieza del barril -> os.clock() de la última visita
-local juiceFailed = false
+local juiceFailed = false -- os.clock() del último fallo, o false
 config.juiceFruits = config.juiceFruits or {}
 local fruitNames = { Banana = true, ["Prickly Pear"] = true } -- y las que salgan de los barriles
 -- Las "...Grapple" salen de los barriles pero no dan zumo (confirmado por el usuario): se tiran
@@ -2705,7 +2944,8 @@ local function collect()
 	local before = {}
 	for _, t in tools() do before[t] = true end
 	local here, clicked, skipped = hrp.Position, 0, 0
-	while #pending > 0 and autoStats do
+	local char = player.Character
+	while #pending > 0 and autoStats and player.Character == char and getHRP() do
 		local best, bestD = 1, math.huge
 		for i, cd in pending do
 			local d = (cd.Parent.Position - here).Magnitude
@@ -2740,13 +2980,14 @@ local function collect()
 			end
 		end
 	end
+	if clicked == 0 and skipped == 0 then return end -- vuelta sin barriles listos: nada que contar
 	log(T("Auto Stats: ", "Auto Stats: ") .. clicked .. T(" barriles", " barrels")
 		.. (skipped > 0 and (", " .. skipped .. T(" con gente", " with people")) or "") .. T(", frutas nuevas ", ", new fruits ") .. got)
 end
 
 -- start: adónde volver nada más clicar (o la zona segura); los zumos llegan aunque no estés al lado
 local function makeJuice(start)
-	if juiceFailed then return end
+	if juiceFailed and os.clock() - juiceFailed < 60 then return end
 	local count = 0
 	for _, t in tools() do
 		if fruitNames[t.Name] then count += 1 end
@@ -2782,7 +3023,7 @@ local function makeJuice(start)
 		end
 	until left < count or os.clock() - t0 > 10
 	if left >= count then
-		juiceFailed = true -- no insistir en cada vuelta
+		juiceFailed = os.clock() -- no insistir en cada vuelta: otra vez dentro de 1 min
 		return log(T("Auto Stats: el exprimidor no gasta las frutas. Pásame lo que salga en la consola",
 			"Auto Stats: the juicer doesn't use the fruits. Send me what the console shows"), "warn")
 	end
@@ -2791,32 +3032,77 @@ local function makeJuice(start)
 end
 
 -- Los zumos se beben como cualquier Tool: en la mano y clic (confirmado por el usuario; no tienen "Drink all").
--- Se beben uno tras otro sin esperas, para que todos los efectos estén activos a la vez.
-local function drinkAll()
-	local hum = humanoid()
-	if not hum then return end
-	local drank, failed = 0, 0
-	for _, d in tools() do
-		if not autoStats then break end
-		if isDrink(d) and d.Parent then
-			hum:EquipTool(d)
-			task.wait(0.25)
-			d:Activate()
-			local t0 = os.clock()
-			while d.Parent and os.clock() - t0 < 1.5 do task.wait(0.1) end
-			if d.Parent then
-				clickMouse() -- si Activate no basta, clic real
-				t0 = os.clock()
-				while d.Parent and os.clock() - t0 < 1.5 do task.wait(0.1) end
-			end
-			if d.Parent then failed += 1 else drank += 1 end
-		end
+-- Algunos se quedaban sin beber: el juego tarda en dejar beber el siguiente (animación). Ahora cada zumo se
+-- reintenta hasta que desaparece y se dan hasta 3 pasadas por si quedó alguno.
+local function drinkGone(d)
+	return not (d:IsDescendantOf(player) or (player.Character and d:IsDescendantOf(player.Character)))
+end
+
+-- Beber a la vez: todas las bebidas en el personaje al mismo tiempo y Activate en todas seguidas. Renombrarlas no
+-- sirve: el nombre solo cambia en tu pantalla y el servidor las sigue viendo separadas.
+-- shortcut: no sé si el servidor acepta varias Tools en la mano; las que no se gasten van al bucle de una en una.
+local function drinkTogether()
+	local char, hum = player.Character, humanoid()
+	if not (char and hum) then return end
+	local list = {}
+	for _, t in tools() do
+		if isDrink(t) then table.insert(list, t) end
+	end
+	if #list < 2 then return end
+	for _, d in list do d.Parent = char end
+	task.wait(0.3)
+	for _, d in list do pcall(function() d:Activate() end) end
+	task.wait(1.5)
+	local gone = 0
+	for _, d in list do
+		if drinkGone(d) then gone += 1 end
 	end
 	hum:UnequipTools()
+	session.juices += gone
+	if gone > 0 then log(T("Auto Stats: bebidos a la vez ", "Auto Stats: drank at once ") .. gone .. "/" .. #list, "ok") end
+end
+
+local drinking = false
+local function drinkAll()
+	if drinking then return end
+	drinking = true
+	pcall(drinkTogether)
+	local drank, failed = 0, {}
+	for _ = 1, 3 do
+		local list = {}
+		for _, t in tools() do
+			if isDrink(t) then table.insert(list, t) end
+		end
+		if #list == 0 then break end
+		table.clear(failed)
+		for _, d in list do
+			if not autoStats then break end
+			local hum = humanoid()
+			if not hum then
+				drinking = false
+				return
+			end
+			for try = 1, 6 do
+				if drinkGone(d) then break end
+				if d.Parent ~= player.Character then
+					hum:EquipTool(d)
+					task.wait(0.3)
+				end
+				d:Activate()
+				if try >= 3 then clickMouse() end -- si Activate no basta, clic real
+				local t0 = os.clock()
+				while not drinkGone(d) and os.clock() - t0 < 1.2 do task.wait(0.1) end
+			end
+			if drinkGone(d) then drank += 1 else table.insert(failed, d.Name) end
+		end
+	end
+	local hum = humanoid()
+	if hum then hum:UnequipTools() end
+	drinking = false
+	session.juices += drank
 	if drank > 0 then log(T("Auto Stats: bebidos ", "Auto Stats: drank ") .. drank .. T(" zumos", " juices"), "ok", true) end
-	if failed > 0 then
-		log(T("Auto Stats: ", "Auto Stats: ") .. failed .. T(" zumos no se gastaron al clicar (¿se bebe en varios tragos?)",
-			" juices weren't used up by clicking (several sips?)"), "warn")
+	if #failed > 0 then
+		log(T("Auto Stats: no se gastaron al clicar: ", "Auto Stats: not used up by clicking: ") .. table.concat(failed, ", "), "warn")
 	end
 end
 
@@ -2832,7 +3118,7 @@ end, L("Clica barriles y cajas para sacar frutas normales, las exprime en el pue
 task.spawn(function()
 	while alive do
 		task.wait(2)
-		if autoStats and claimMove("Stats") then
+		if autoStats and getHRP() and claimMove("Stats") then -- sin personaje (muerto): esperar al nuevo
 			local hrp = getHRP()
 			local start = hrp and hrp.CFrame
 			local ok, err = pcall(function()
@@ -2844,7 +3130,22 @@ task.spawn(function()
 			if not ok then log("Auto Stats: error " .. tostring(err), "error") end
 			if start then returnTo(start) end
 			releaseMove("Stats")
-			task.wait(20)
+			task.wait(5) -- siempre recogiendo: los barriles vacíos se saltan solos (BARREL_COOLDOWN)
+		end
+	end
+end)
+
+-- Vigila el inventario: si aparece un zumo (el exprimidor tarda, o te lo dan), se bebe aunque no toque vuelta
+task.spawn(function()
+	while alive do
+		task.wait(3)
+		if autoStats and (not busy or busy == "Stats") then
+			for _, t in tools() do
+				if isDrink(t) then
+					pcall(drinkAll)
+					break
+				end
+			end
 		end
 	end
 end)
@@ -2858,12 +3159,28 @@ toggle(pageMisc, "Anti-AFK", function(on)
 	antiAfk = on
 	log("Anti-AFK " .. (on and "ON" or "OFF"))
 end, L("Evita que Roblox te expulse por estar inactivo.", "Stops Roblox from kicking you for being idle."))
+-- Te echaron a los 20 min con solo el aviso Idled: ahora además, cada 2 min, clic virtual, movimiento de
+-- ratón y un saltito (por si el juego mira el personaje y no solo la entrada).
+local function nudge()
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new())
+	local m = UIS:GetMouseLocation()
+	VIM:SendMouseMoveEvent(m.X + 2, m.Y, game)
+	VIM:SendMouseMoveEvent(m.X, m.Y, game)
+end
 table.insert(cleanup, player.Idled:Connect(function()
-	if antiAfk then
-		VirtualUser:CaptureController()
-		VirtualUser:ClickButton2(Vector2.new())
-	end
+	if antiAfk then nudge() end
 end))
+task.spawn(function()
+	while alive do
+		task.wait(120)
+		if antiAfk then
+			nudge()
+			local h = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+			if h and not busy then h.Jump = true end
+		end
+	end
+end)
 
 local fpsToggle
 fpsToggle = toggle(pageMisc, L("Desbloquear FPS", "Unlock FPS"), function(on)
@@ -2900,7 +3217,8 @@ local function watchDeath(char)
 end
 if player.Character then task.spawn(watchDeath, player.Character) end
 table.insert(cleanup, player.CharacterAdded:Connect(watchDeath))
-toggle(pageMisc, "Auto Respawn", function(on)
+section(pagePlayer, L("Protección", "Protection"), 2)
+toggle(pagePlayer, "Auto Respawn", function(on)
 	autoRespawn = on
 	log("Auto Respawn " .. (on and "ON" or "OFF"))
 end, L("Al morir, reapareces enseguida. Con la zona segura activa, vuelves a ella.",
@@ -2924,8 +3242,8 @@ button(pageMisc, "Rejoin", function()
 	if not ok or #Players:GetPlayers() <= 1 then TeleportService:Teleport(game.PlaceId, player) end -- solo en el servidor: uno nuevo
 end, L("Sale y vuelve a entrar en este mismo servidor.", "Leaves and joins this same server again."))
 -- Cambia a otro servidor del juego con hueco (también lo usa la protección contra admins)
-local function serverHop()
-	-- Lista pública de servidores de Roblox; se elige uno al azar que no sea este y que tenga hueco
+local function serverHop(fewest)
+	-- Lista pública de servidores de Roblox; uno al azar con hueco que no sea este (o el que tenga menos gente)
 	local ok, data = pcall(function()
 		return HttpService:JSONDecode(game:HttpGet(
 			"https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
@@ -2938,10 +3256,20 @@ local function serverHop()
 		if s.id ~= game.JobId and (s.playing or 0) < (s.maxPlayers or 0) then table.insert(options, s.id) end
 	end
 	if #options == 0 then return log(T("No hay otros servidores con hueco", "No other servers with free slots"), "warn") end
+	local pick = options[math.random(#options)]
+	if fewest == true then
+		local best
+		for _, sv in data.data do
+			if table.find(options, sv.id) and (not best or (sv.playing or 0) < (best.playing or 0)) then best = sv end
+		end
+		pick = best and best.id or pick
+	end
 	log(T("Cambiando de servidor...", "Switching server..."), "ok", true)
-	TeleportService:TeleportToPlaceInstance(game.PlaceId, options[math.random(#options)], player)
+	TeleportService:TeleportToPlaceInstance(game.PlaceId, pick, player)
 end
-button(pageMisc, "Server Hop", serverHop, L("Te lleva a otro servidor del juego con hueco, elegido al azar.", "Takes you to another server of the game with free slots, picked at random."))
+button(pageMisc, L("Server Hop (menos gente)", "Server Hop (fewest players)"), function() serverHop(true) end,
+	L("Te lleva al servidor con menos jugadores de la lista.", "Takes you to the server with the fewest players in the list."))
+button(pageMisc, "Server Hop", function() serverHop() end, L("Te lleva a otro servidor del juego con hueco, elegido al azar.", "Takes you to another server of the game with free slots, picked at random."))
 
 -- Admins: el dueño del juego, o alguien del grupo del juego con un rango alto o un rol de staff.
 -- shortcut: solo ve staff que esté en el grupo del juego (o sea el dueño); un admin sin rango en el grupo
@@ -2974,6 +3302,7 @@ end
 local function checkAdmin(p)
 	if p == player or not (adminWatch or adminKick or adminHop) or not isAdmin(p) then return end
 	log(T("Admin en el servidor: ", "Admin in the server: ") .. p.Name, "warn")
+	if wh.admins then sendWebhook(T("Admin en el servidor", "Admin in the server")) end
 	if adminKick then
 		player:Kick(T("El Hoyo Hub: admin detectado (", "El Hoyo Hub: admin detected (") .. p.Name .. ")")
 	elseif adminHop then
@@ -3006,7 +3335,7 @@ end, L("Te cambia a otro servidor en cuanto detecta un admin. Si Auto Kick tambi
 do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
 -- Marcas que solo ves tú: nombre y distancia encima de jugadores, cofres y frutas tiradas.
 -- Jugadores además con contorno (Highlight: Roblox solo dibuja ~31 a la vez, por eso cofres y frutas no).
-local ESP_MAX_DIST = 3000
+local ESP_MAX_DIST = math.huge -- se ve desde cualquier distancia (si el juego tiene cargado al objetivo)
 local espOn = { players = false, chests = false, fruits = false }
 local espFolder = Instance.new("Folder")
 espFolder.Name = "ElHoyoHubESP"
@@ -3070,7 +3399,7 @@ task.spawn(function()
 					local root = char and char:FindFirstChild("HumanoidRootPart")
 					if p ~= player and root then
 						local lv = char:GetAttribute("Level")
-						mark(char, root, string.format("%s%s  [%d]", p.Name, lv and (" · Lv " .. lv) or "",
+						mark(char, root, string.format("%s%s  %d studs", p.Name, lv and (" · Lv " .. lv) or "",
 							(root.Position - hrp.Position).Magnitude), C.accent, true)
 					end
 				end
@@ -3081,13 +3410,13 @@ task.spawn(function()
 				for _, c in folder and folder:GetChildren() or {} do
 					local part = c:IsA("Model") and firstPart(c)
 					if part then
-						mark(c, part, string.format("%s  [%d]", T("Cofre", "Chest"), (part.Position - hrp.Position).Magnitude), C.warn)
+						mark(c, part, string.format("%s  %d studs", T("Cofre", "Chest"), (part.Position - hrp.Position).Magnitude), C.warn)
 					end
 				end
 			end
 			if espOn.fruits then
 				for _, f in groundFruits() do
-					mark(f.tool, f.part, string.format("%s Fruit  [%d]", f.name, (f.part.Position - hrp.Position).Magnitude),
+					mark(f.tool, f.part, string.format("%s Fruit  %d studs", f.name, (f.part.Position - hrp.Position).Magnitude),
 						C[RARITY_COLOR[f.rank]] or C.text)
 				end
 			end
@@ -3112,6 +3441,813 @@ toggle(pageMisc, L("ESP frutas", "Fruit ESP"), function(on) espOn.fruits = on en
 	L("Muestra las Devil Fruits tiradas en el suelo, con el color de su rareza.", "Shows Devil Fruits lying on the ground, colored by rarity."))
 end
 
+end
+
+------------------------------------------------------------------ Movilidad (pestaña Jugador)
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Todo en tu cliente: el juego podría notar velocidades raras (shortcut: sin anti-cheat conocido; si expulsa,
+-- bajar los valores).
+local move = { fly = false, speed = false, jump = false, infJump = false, noclip = false, clickTp = false }
+local FLY_SPEEDS, WALK_SPEEDS, JUMP_MULTS = { 50, 100, 200, 400 }, { 24, 32, 50, 75, 100 }, { 1.5, 2, 3, 5 }
+local flySpeed = FLY_SPEEDS[tonumber(config.flySpeed) or 2] or 100
+local walkSpeed = WALK_SPEEDS[tonumber(config.walkSpeed) or 2] or 32
+local jumpMult = JUMP_MULTS[tonumber(config.jumpMult) or 2] or 2
+local base = {} -- valores del juego antes de tocarlos: { walk, power, height }
+
+local function hum()
+	return player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+end
+local function remember()
+	local h = hum()
+	if h and not base.walk then base = { walk = h.WalkSpeed, power = h.JumpPower, height = h.JumpHeight } end
+end
+table.insert(cleanup, player.CharacterAdded:Connect(function() base = {} end)) -- personaje nuevo, valores nuevos
+
+section(pagePlayer, L("Movilidad", "Movement"), 1)
+toggle(pagePlayer, "Fly", function(on)
+	move.fly = on
+	local h, hrp = hum(), getHRP()
+	if not on and h then h.PlatformStand = false end
+	if not on and hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+end, L("Vuela con W A S D hacia donde mira la cámara; Espacio sube y Ctrl baja.",
+	"Fly with W A S D towards where the camera looks; Space goes up and Ctrl goes down."))
+do
+	local names = {}
+	for i, v in FLY_SPEEDS do names[i] = tostring(v) end
+	combo(pagePlayer, L("Velocidad de vuelo", "Fly speed"), names, table.find(FLY_SPEEDS, flySpeed) or 2, function(i)
+		flySpeed = FLY_SPEEDS[i]
+		config.flySpeed = i
+		saveConfig()
+	end, L("Studs por segundo al volar.", "Studs per second while flying."))
+end
+toggle(pagePlayer, "Speed", function(on)
+	move.speed = on
+	if on then remember() elseif hum() and base.walk then hum().WalkSpeed = base.walk end
+end, L("Corres más rápido.", "You run faster."))
+do
+	local names = {}
+	for i, v in WALK_SPEEDS do names[i] = tostring(v) end
+	combo(pagePlayer, L("Velocidad al correr", "Walk speed"), names, table.find(WALK_SPEEDS, walkSpeed) or 2, function(i)
+		walkSpeed = WALK_SPEEDS[i]
+		config.walkSpeed = i
+		saveConfig()
+	end, L("WalkSpeed con Speed encendido (lo normal ronda 16).", "WalkSpeed with Speed on (normal is around 16)."))
+end
+toggle(pagePlayer, "Jump", function(on)
+	move.jump = on
+	local h = hum()
+	if on then
+		remember()
+	elseif h and base.power then
+		h.JumpPower, h.JumpHeight = base.power, base.height
+	end
+end, L("Saltas más alto.", "You jump higher."))
+do
+	local names = {}
+	for i, v in JUMP_MULTS do names[i] = "x" .. v end
+	combo(pagePlayer, L("Altura de salto", "Jump height"), names, table.find(JUMP_MULTS, jumpMult) or 2, function(i)
+		jumpMult = JUMP_MULTS[i]
+		config.jumpMult = i
+		saveConfig()
+	end, L("Cuántas veces el salto normal.", "How many times the normal jump."))
+end
+toggle(pagePlayer, L("Salto infinito", "Infinite jump"), function(on) move.infJump = on end,
+	L("Puedes volver a saltar en el aire.", "You can jump again in mid-air."))
+-- Colisión original de cada pieza que Noclip apagó, para devolverla al apagarlo (antes te quedabas sin colisión)
+local noclipped = setmetatable({}, { __mode = "k" })
+toggle(pagePlayer, "Noclip", function(on)
+	move.noclip = on
+	if not on then
+		for p, was in noclipped do
+			if p.Parent then p.CanCollide = was end
+		end
+		table.clear(noclipped)
+	end
+end,
+	L("Atraviesas paredes y suelos.", "You go through walls and floors."))
+toggle(pagePlayer, "Click TP", function(on) move.clickTp = on end,
+	L("Mantén Alt y haz clic: te teletransporta a ese punto.", "Hold Alt and click: teleports you to that point."))
+
+table.insert(cleanup, game:GetService("RunService").Heartbeat:Connect(function()
+	local h, hrp = hum(), getHRP()
+	if not (h and hrp) then return end
+	if move.fly then
+		local cam = workspace.CurrentCamera
+		local dir = Vector3.zero
+		if not UIS:GetFocusedTextBox() then
+			if UIS:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+			if UIS:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+			if UIS:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+			if UIS:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+			if UIS:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+			if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+		end
+		h.PlatformStand = true
+		hrp.AssemblyLinearVelocity = dir.Magnitude > 0 and dir.Unit * flySpeed or Vector3.zero
+	end
+	-- el juego puede volver a poner sus valores: se repiten en cada frame
+	if move.speed then
+		remember()
+		h.WalkSpeed = walkSpeed
+	end
+	if move.jump then
+		remember()
+		if base.power then h.JumpPower, h.JumpHeight = base.power * jumpMult, base.height * jumpMult end
+	end
+end))
+table.insert(cleanup, game:GetService("RunService").Stepped:Connect(function()
+	if not move.noclip or not player.Character then return end
+	for _, p in player.Character:GetDescendants() do
+		if p:IsA("BasePart") and p.CanCollide then
+			if noclipped[p] == nil then noclipped[p] = true end
+			p.CanCollide = false
+		end
+	end
+end))
+table.insert(cleanup, UIS.JumpRequest:Connect(function()
+	local h = hum()
+	if move.infJump and h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+end))
+table.insert(cleanup, UIS.InputBegan:Connect(function(input)
+	if not move.clickTp or input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	if not (UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt)) or overOurGui() then return end
+	local hrp = getHRP()
+	if hrp then
+		hrp.CFrame = CFrame.new(mouse.Hit.Position + Vector3.new(0, 3, 0)) * hrp.CFrame.Rotation
+		hrp.AssemblyLinearVelocity = Vector3.zero
+	end
+end))
+end
+
+------------------------------------------------------------------ Huida (pestaña Jugador, Protección)
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Un god mode de verdad no se puede hacer desde el cliente: la vida la lleva el servidor. Lo más parecido: si la
+-- vida baja del límite, te saca al cielo (zona segura o una plataforma temporal) hasta que te recuperas, y
+-- ninguna función te mueve mientras tanto.
+local LIMITS = { 20, 35, 50, 70 }
+local escapeOn = false
+local limit = LIMITS[tonumber(config.escapeAt) or 2] or 35
+local escaping = false
+
+local function escape(h)
+	escaping = true
+	busy = "Escape" -- se queda con el movimiento aunque otra función lo tuviera
+	local hrp = getHRP()
+	local temp
+	if safePart then
+		goSafe()
+	elseif hrp then
+		temp = Instance.new("Part")
+		temp.Name = "ElHoyoHubEscape"
+		temp.Anchored = true
+		temp.Size = Vector3.new(20, 2, 20)
+		temp.Transparency = 1
+		temp.CFrame = CFrame.new(hrp.Position.X, SAFE_HEIGHT, hrp.Position.Z)
+		temp.Parent = workspace
+		hrp.CFrame = temp.CFrame + Vector3.new(0, 4, 0)
+		hrp.AssemblyLinearVelocity = Vector3.zero
+	end
+	log(T("Huida: vida baja, te saco de ahí", "Escape: low health, getting you out"), "warn", true)
+	local t0 = os.clock()
+	while alive and h.Parent and h.Health > 0 and h.Health < h.MaxHealth * 0.9 and os.clock() - t0 < 60 do task.wait(0.5) end
+	if temp then temp:Destroy() end
+	if busy == "Escape" then busy = nil end
+	escaping = false
+	log(T("Huida: recuperado, las funciones siguen", "Escape: recovered, features carry on"))
+end
+
+section(pagePlayer, L("Protección", "Protection"), 2)
+toggle(pagePlayer, L("Huida automática", "Auto escape"), function(on) escapeOn = on end,
+	L("No es un god mode (la vida la lleva el servidor): si tu vida baja del límite, te lleva al cielo hasta que te recuperas.",
+		"Not a god mode (the server owns your health): if your health drops below the limit, it takes you up to the sky until you recover."))
+do
+	local names = {}
+	for i, v in LIMITS do names[i] = v .. "%" end
+	combo(pagePlayer, L("Huir con vida bajo", "Escape below health"), names, table.find(LIMITS, limit) or 2, function(i)
+		limit = LIMITS[i]
+		config.escapeAt = i
+		saveConfig()
+	end, L("Porcentaje de vida que hace saltar la huida.", "Health percentage that triggers the escape."))
+end
+task.spawn(function()
+	while alive do
+		task.wait(0.2)
+		local h = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if escapeOn and not escaping and h and h.Health > 0 and h.Health < h.MaxHealth * limit / 100 then
+			task.spawn(escape, h)
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Auto Boss
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Jefes de la wiki (datos.json, lista Enemies) y la isla donde salen, para ir allí si el jefe no está cargado
+-- (el mapa solo carga lo cercano). shortcut: islas deducidas de la wiki y nombre del modelo sin comprobar (se busca
+-- por texto en Alive.NPCs); si no lo encuentra, decir cómo se llama el modelo (ESP o EscaneoPersonaje).
+local BOSSES = {
+	{ name = "Captain Blacksurf", island = "IslandDeepwake" },
+	{ name = "Gunner Captain", island = "IslandCaver" },
+	{ name = "Ryuma", island = "IslandHalloween" },
+	{ name = "Gecko Moria", island = "IslandHalloween" },
+	{ name = "Perona", island = "IslandHalloween" },
+	{ name = "Vokun" }, -- sin isla conocida: solo si está cargado (cerca)
+}
+local WEAPONS = { { L("La de la mano", "The one in hand"), false }, { L("Cualquiera", "Any"), nil }, { "Melee", "Melee" },
+	{ L("Espada", "Sword"), "Sword" }, { L("Fruta", "Fruit"), "Fruit" } }
+local MODES = { L("Encima + hitbox grande", "On top + big hitbox"), L("Detrás", "Behind") }
+local modePick = math.clamp(tonumber(config.bossMode) or 1, 1, #MODES)
+-- Encima: te pones pegado sobre el jefe mirando hacia abajo y su HumanoidRootPart se agranda en tu pantalla, así
+-- cada clic le da. shortcut: el agrandado es solo local; vale si el juego mira los golpes desde el cliente
+-- (si no hace más daño así, usar "Detrás").
+local HITBOX, ABOVE = 25, 7
+local grown = setmetatable({}, { __mode = "k" }) -- raíz del jefe -> valores originales
+local function shrinkAll() -- deja los jefes como estaban (al apagar Auto Boss, cambiar de modo o cerrar)
+	for root, was in grown do
+		if root.Parent then root.Size, root.Transparency, root.CanCollide = was.size, was.transparency, was.canCollide end
+	end
+	table.clear(grown)
+end
+local function attackAbove(boss)
+	local root, hrp = boss:FindFirstChild("HumanoidRootPart"), getHRP()
+	if not (root and hrp) then return end
+	if not grown[root] then
+		grown[root] = { size = root.Size, transparency = root.Transparency, canCollide = root.CanCollide }
+		root.Size = Vector3.new(HITBOX, HITBOX, HITBOX)
+		root.Transparency = 0.85
+		root.CanCollide = false
+	end
+	hrp.CFrame = CFrame.new(root.Position + Vector3.new(0, ABOVE, 0)) * CFrame.Angles(-math.pi / 2, 0, 0)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	local cam = workspace.CurrentCamera
+	cam.CFrame = CFrame.lookAt(root.Position + Vector3.new(0, ABOVE + 14, 8), root.Position)
+	local p, onScreen = cam:WorldToViewportPoint(root.Position)
+	if onScreen then
+		VIM:SendMouseMoveEvent(p.X, p.Y, game)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+		VIM:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+	end
+end
+local autoBoss = false
+local bossPick = math.clamp(tonumber(config.bossPick) or 1, 1, #BOSSES)
+local weaponPick = math.clamp(tonumber(config.bossWeapon) or 1, 1, #WEAPONS)
+local bossStart, lastSearch, lastSkill, lastSeen = nil, -math.huge, 0, nil
+local slotsLogged = false
+
+local function findBoss(entry)
+	local folder = workspace:FindFirstChild("Alive")
+	local npcs = folder and folder:FindFirstChild("NPCs")
+	local want = entry.name:lower()
+	for _, m in npcs and npcs:GetChildren() or {} do
+		local h = m:FindFirstChildOfClass("Humanoid")
+		if h and h.Health > 0 and m:FindFirstChild("HumanoidRootPart") and m.Name:lower():find(want, 1, true) then return m end
+	end
+end
+
+local function skillKeys()
+	local keys = {}
+	for k in tostring(config.bossKeys or "Z X C V"):gmatch("%S+") do
+		local code = Enum.KeyCode[k:upper()]
+		if code then table.insert(keys, code) end
+	end
+	return keys
+end
+
+section(pageBoss, "Auto Boss", 1)
+toggle(pageBoss, "Auto Boss (beta)", function(on)
+	autoBoss = on
+	if not on then
+		shrinkAll()
+		if bossStart then returnTo(bossStart) end
+		bossStart = nil
+		releaseMove("Boss")
+	end
+	log("Auto Boss " .. (on and "ON" or "OFF"))
+end, L("Va a por el jefe elegido y le ataca hasta matarlo; cuando reaparece, repite.",
+	"Goes after the chosen boss and attacks it until it dies; when it respawns, repeats."))
+do
+	local names = {}
+	for i, b in BOSSES do names[i] = b.name end
+	combo(pageBoss, L("Jefe", "Boss"), names, bossPick, function(i)
+		bossPick = i
+		config.bossPick = i
+		saveConfig()
+	end, L("A qué jefe atacar.", "Which boss to attack."))
+	local wnames = {}
+	for i, w in WEAPONS do wnames[i] = w[1] end
+	local mnames = {}
+	for i, m in MODES do mnames[i] = m end
+	combo(pageBoss, L("Cómo atacar", "How to attack"), mnames, modePick, function(i)
+		modePick = i
+		if i ~= 1 then shrinkAll() end
+		config.bossMode = i
+		saveConfig()
+	end, L("Encima: pegado sobre el jefe con su hitbox agrandada y clic continuo. Detrás: como Auto Quest.",
+		"On top: right above the boss with its hitbox enlarged and constant clicking. Behind: like Auto Quest."))
+	combo(pageBoss, L("Arma", "Weapon"), wnames, weaponPick, function(i)
+		weaponPick = i
+		config.bossWeapon = i
+		saveConfig()
+	end, L("Con qué atacar: Melee, espada o la fruta (si tu fruta va en la mano).", "What to attack with: melee, sword or your fruit (if it goes in your hand)."))
+	input(pageBoss, L("Teclas de habilidades", "Skill keys"), "Z X C V", config.bossKeys or "Z X C V", function(text)
+		config.bossKeys = text
+		saveConfig()
+	end, L("Teclas que pulsa cada 2 s mientras ataca (habilidades de fruta o de arma). Vacío = ninguna.",
+		"Keys it presses every 2 s while attacking (fruit or weapon skills). Empty = none."))
+end
+-- Aviso por webhook cuando aparece cualquier jefe de la lista (aunque Auto Boss esté apagado)
+local warned = setmetatable({}, { __mode = "k" }) -- jefes ya avisados (no retiene modelos borrados)
+task.spawn(function()
+	while alive do
+		task.wait(5)
+		if wh.bosses then
+			for _, b in BOSSES do
+				local m = findBoss(b)
+				if m and not warned[m] then
+					warned[m] = true
+					sendWebhook(T("Jefe vivo: ", "Boss alive: ") .. b.name)
+				end
+			end
+		end
+	end
+end)
+note(pageBoss, L("Si el jefe no está cargado, va a su isla y lo busca. Las islas y los nombres salen de la wiki: si no lo encuentra, dímelo.",
+	"If the boss isn't loaded, it goes to its island and looks for it. Islands and names come from the wiki: if it can't find it, tell me."))
+
+task.spawn(function()
+	while alive do
+		task.wait(0.15)
+		if autoBoss and getHRP() and claimMove("Boss") then
+			local entry = BOSSES[bossPick]
+			local boss = findBoss(entry)
+			if not boss then
+				if lastSeen then
+					log(T("Auto Boss: ", "Auto Boss: ") .. entry.name .. T(" derrotado (o desaparecido)", " defeated (or gone)"), "ok", true)
+					lastSeen = nil
+				end
+				-- ir a su isla a buscarlo como mucho cada 15 s; entre medias, de vuelta a donde estabas
+				if os.clock() - lastSearch > 15 and not entry.island then
+					lastSearch = os.clock()
+					log(T("Auto Boss: ", "Auto Boss: ") .. entry.name .. T(" no está cerca y no sé en qué isla sale: ve a su zona", " isn't nearby and I don't know its island: go to its area"))
+				elseif os.clock() - lastSearch > 15 then
+					lastSearch = os.clock()
+					local map = workspace:FindFirstChild("Map")
+					local island = map and map:FindFirstChild("Islands") and map.Islands:FindFirstChild(entry.island)
+					local target = island and (island:FindFirstChild("QuestBoard") or island:FindFirstChildWhichIsA("BasePart", true))
+					local hrp = getHRP()
+					if target and hrp then
+						if not bossStart then bossStart = hrp.CFrame end
+						teleport(target:GetPivot().Position + Vector3.new(0, 5, 0))
+						task.wait(2) -- que cargue la zona
+						if not findBoss(entry) then
+							log(T("Auto Boss: ", "Auto Boss: ") .. entry.name .. T(" no está ahora; espero a que salga", " isn't here now; waiting for it to spawn"))
+							if bossStart then returnTo(bossStart) end
+							bossStart = nil
+						end
+					end
+				end
+				releaseMove("Boss")
+				task.wait(1)
+			else
+				local hrp = getHRP()
+				if not bossStart and hrp then bossStart = hrp.CFrame end
+				if lastSeen ~= boss then
+					log(T("Auto Boss: atacando a ", "Auto Boss: attacking ") .. boss.Name)
+					lastSeen = boss
+				end
+				local slot = WEAPONS[weaponPick][2]
+				if slot ~= false then equipWeapon(slot) end
+				if slot and not slotsLogged then
+					local held = player.Character and player.Character:FindFirstChildOfClass("Tool")
+					if not (held and held:GetAttribute("WeaponSlot") == slot) then
+						slotsLogged = true
+						local seen = {}
+						for _, t in (player:FindFirstChild("Backpack") or player):GetChildren() do
+							if t:IsA("Tool") and t:GetAttribute("WeaponSlot") then table.insert(seen, t.Name .. "=" .. t:GetAttribute("WeaponSlot")) end
+						end
+						log(T("Auto Boss: no tengo arma de tipo ", "Auto Boss: no weapon of type ") .. slot .. " (" .. table.concat(seen, ", ") .. ")", "warn")
+					end
+				end
+				if modePick == 1 then attackAbove(boss) else attack(boss) end
+				if os.clock() - lastSkill > 2 then
+					lastSkill = os.clock()
+					for _, key in skillKeys() do
+						VIM:SendKeyEvent(true, key, false, game)
+						VIM:SendKeyEvent(false, key, false, game)
+						task.wait(0.15)
+					end
+				end
+			end
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Inicio
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+local DISCORD_URL = nil -- poner aquí la invitación cuando exista
+local hubStart = os.clock()
+local rows = {}
+local function row(key) rows[key] = note(pageHome, " ") end
+
+local function span(seconds)
+	seconds = math.max(0, math.floor(seconds))
+	local h, m, s = seconds // 3600, seconds % 3600 // 60, seconds % 60
+	if h > 0 then return string.format("%dh %02dm", h, m) end
+	if m > 0 then return string.format("%dm %02ds", m, s) end
+	return s .. "s"
+end
+
+section(pageHome, L("Servidor", "Server"), 1)
+for _, k in { "players", "ping", "fps", "uptime", "clock", "xp" } do row(k) end
+button(pageHome, L("Copiar enlace de este servidor", "Copy this server's link"), function()
+	local link = string.format("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s", game.PlaceId, game.JobId)
+	if setclipboard then setclipboard(link) end
+	log(T("Enlace copiado: tus amigos entran a este mismo servidor", "Link copied: your friends join this same server"), "ok", true)
+end, L("Copia un enlace que mete a quien lo abra en este mismo servidor.", "Copies a link that puts whoever opens it in this same server."))
+
+section(pageHome, L("Tú", "You"), 2)
+for _, k in { "level", "session", "compass", "merlin", "active", "summary" } do row(k) end
+
+section(pageHome, "El Hoyo Hub", 2)
+note(pageHome, L("Versión " .. HUB_VERSION, "Version " .. HUB_VERSION))
+button(pageHome, "Discord", function()
+	if DISCORD_URL then
+		if setclipboard then setclipboard(DISCORD_URL) end
+		log(T("Invitación de Discord copiada", "Discord invite copied"), "ok", true)
+	else
+		log(T("Aún no hay Discord: muy pronto", "No Discord yet: coming soon"), "warn", true)
+	end
+end, L("Copia la invitación al Discord del hub.", "Copies the hub's Discord invite."))
+
+section(pageHome, L("Novedades", "What's new"), 1)
+note(pageHome, L("v1.3: Auto Boss con Vokun y modo encima con hitbox grande, zumos a la vez y vigilando el inventario, Auto Expert, Auto Treasure Rain, vender peces, seguir y espectar jugadores, webhook de Discord, Server Hop con menos gente, modo AFK total y resumen de la sesión.",
+	"v1.3: Auto Boss with Vokun and on-top mode with a big hitbox, juices at once and inventory watch, Auto Expert, Auto Treasure Rain, sell fish, follow and spectate players, Discord webhook, Server Hop with fewest players, full AFK mode and a session summary."))
+note(pageHome, L("v1.2: nueva distribución (Inicio, Jefes, Jugador), Auto Boss, Movilidad (fly, speed, jump, noclip, click TP), Huida automática, Auto Claim Challenges, Auto Rewards, ESP a cualquier distancia, tiendas más rápidas y Anti-AFK reforzado.",
+	"v1.2: new layout (Home, Bosses, Player), Auto Boss, Movement (fly, speed, jump, noclip, click TP), Auto escape, Auto Claim Challenges, Auto Rewards, ESP at any distance, faster shops and a stronger Anti-AFK."))
+
+local frames, fps = 0, 0
+table.insert(cleanup, game:GetService("RunService").RenderStepped:Connect(function() frames += 1 end))
+task.spawn(function()
+	while alive do
+		fps, frames = frames, 0
+		local now = workspace:GetServerTimeNow()
+		local function set(key, text) if rows[key] then rows[key].Text = text end end
+		set("players", T("Jugadores: ", "Players: ") .. #Players:GetPlayers() .. " / " .. Players.MaxPlayers)
+		set("ping", "Ping: " .. math.floor(player:GetNetworkPing() * 2000) .. " ms") -- GetNetworkPing es solo ida
+		set("fps", "FPS: " .. fps)
+		set("uptime", T("Servidor abierto: ", "Server up: ") .. span(workspace.DistributedGameTime))
+		set("clock", workspace:GetAttribute("IsNight") and T("Ahora es de noche", "It's night now") or T("Ahora es de día", "It's day now"))
+		local xpEnds, xpMult = workspace:GetAttribute("XpEventEndsAt"), workspace:GetAttribute("XpEventMultiplier")
+		if type(xpEnds) == "number" and xpEnds > now then
+			set("xp", T("Evento de EXP x", "EXP event x") .. tostring(xpMult) .. T(", quedan ", ", ") .. span(xpEnds - now) .. T("", " left"))
+		else
+			set("xp", T("Sin evento de EXP", "No EXP event"))
+		end
+		local char = player.Character
+		set("level", T("Nivel: ", "Level: ") .. tostring(char and char:GetAttribute("Level") or "?"))
+		set("session", T("Sesión con el hub: ", "Session with the hub: ") .. span(os.clock() - hubStart))
+		local token = player:GetAttribute("CompassTokenAt")
+		set("compass", T("Próximo compass: ", "Next compass: ") .. ((type(token) == "number" and token > now) and span(token - now) or T("listo", "ready")))
+		local merlin = player:GetAttribute("MerlinCooldownEnd")
+		set("merlin", "Merlin: " .. ((type(merlin) == "number" and merlin > now) and span(merlin - now) or T("listo", "ready")))
+		local active = 0
+		for _, t in toggles do
+			if t.value then active += 1 end
+		end
+		set("active", T("Funciones encendidas: ", "Features on: ") .. active)
+		set("summary", string.format(T("Sesión: %d compass, %d cofres, %d frutas, %d zumos, %d peces, %d misiones, %d entregas",
+			"Session: %d compass, %d chests, %d fruits, %d juices, %d fish, %d quests, %d deliveries"),
+			session.compass, session.chests, session.fruits, session.juices, session.fish, session.quests, session.deliveries))
+		task.wait(1)
+	end
+end)
+end
+
+------------------------------------------------------------------ Jugadores: seguir y espectar (pestaña Jugador)
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+local targetName = ""
+local following, spectating = false, false
+
+local function findPlayer()
+	if targetName == "" then return nil end
+	local want = targetName:lower()
+	for _, p in Players:GetPlayers() do
+		if p ~= player and (p.Name:lower():find(want, 1, true) or p.DisplayName:lower():find(want, 1, true)) then return p end
+	end
+end
+local function targetRoot()
+	local p = findPlayer()
+	return p, p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+end
+
+section(pagePlayer, L("Jugadores", "Players"), 1)
+input(pagePlayer, L("Jugador", "Player"), L("nombre (vale un trozo)", "name (part is fine)"), "", function(text)
+	targetName = text:match("^%s*(.-)%s*$")
+	local p = findPlayer()
+	log(p and (T("Jugador elegido: ", "Player picked: ") .. p.Name) or T("No hay nadie con ese nombre", "Nobody with that name"), p and "info" or "warn")
+end, L("Escribe el nombre (o parte) del jugador para ir a él, seguirle o espectarle.", "Type the player's name (or part of it) to go to, follow or spectate them."))
+button(pagePlayer, L("Ir a él", "Go to them"), function()
+	local p, root = targetRoot()
+	if not root then return log(T("No veo a ese jugador (¿lejos o sin elegir?)", "Can't see that player (far away or not picked?)"), "warn") end
+	local hrp = getHRP()
+	if hrp then hrp.CFrame = root.CFrame * CFrame.new(0, 0, 4) end
+	log(T("Llevado junto a ", "Taken to ") .. p.Name)
+end, L("Te teletransporta detrás del jugador.", "Teleports you behind the player."))
+local function spectateSubject()
+	local p = findPlayer()
+	return p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+end
+local function myHumanoid()
+	return player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+end
+local followToggle = toggle(pagePlayer, L("Seguir", "Follow"), function(on)
+	following = on
+	if not on then releaseMove("Follow") end
+end, L("Te mantiene pegado detrás del jugador elegido. Mientras sigue, las demás funciones no te mueven.",
+	"Keeps you right behind the chosen player. While following, other features don't move you."), true)
+followToggle.transient = true
+local spectateToggle = toggle(pagePlayer, L("Espectar", "Spectate"), function(on)
+	spectating = on
+	local h = on and spectateSubject()
+	workspace.CurrentCamera.CameraSubject = h or myHumanoid()
+	if on and not h then log(T("No veo a ese jugador para espectarle", "Can't see that player to spectate"), "warn") end
+end, L("La cámara sigue al jugador elegido. Apágalo para volver a ti.", "The camera follows the chosen player. Turn it off to come back to you."), true)
+spectateToggle.transient = true
+
+task.spawn(function()
+	while alive do
+		task.wait(0.2)
+		if following then
+			local _, root = targetRoot()
+			local hrp = getHRP()
+			if root and hrp and claimMove("Follow") then
+				hrp.CFrame = root.CFrame * CFrame.new(0, 0, 4)
+				hrp.AssemblyLinearVelocity = Vector3.zero
+			elseif not root then
+				releaseMove("Follow") -- sin nadie a quien seguir, las demás funciones pueden volver a moverte
+			end
+		end
+		if spectating then -- el jugador reapareció (Humanoid nuevo): la cámara se iba con el cuerpo viejo
+			local cam, h = workspace.CurrentCamera, spectateSubject()
+			if h and cam.CameraSubject ~= h then cam.CameraSubject = h end
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Treasure Rain
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Evento: caen 15 cofres en una isla en poco tiempo (wiki). Normalmente hay ~70 cofres repartidos, así que no vale
+-- contar cuántos hay: se mira cuántos aparecen de golpe. shortcut: 8 nuevos en 20 s = lluvia; ajustar si salta sin evento.
+local rainOn = false
+local recent = {}
+local rainUntil = 0 -- hasta cuándo pide Auto Chest (os.clock)
+local inst = workspace:FindFirstChild("Instances")
+local chests = inst and inst:FindFirstChild("Chests")
+
+section(pageAuto, L("Compass y cofres", "Compass & chests"))
+toggle(pageAuto, "Auto Treasure Rain", function(on)
+	rainOn = on
+	if not on and rainUntil > 0 then
+		rainUntil = 0
+		want("Auto Chest", "Rain", false)
+	end
+end, L("Cuando caen muchos cofres de golpe (evento Treasure Rain), enciende Auto Chest unos minutos. Si Auto Chest ya estaba encendido, no lo apaga.",
+	"When lots of chests drop at once (Treasure Rain event), turns on Auto Chest for a few minutes. If Auto Chest was already on, it leaves it on."))
+if chests then
+	table.insert(cleanup, chests.ChildAdded:Connect(function()
+		if not rainOn then return end
+		local now = os.clock()
+		table.insert(recent, now)
+		while recent[1] and now - recent[1] > 20 do table.remove(recent, 1) end
+		if #recent >= 8 and rainUntil == 0 then
+			table.clear(recent)
+			rainUntil = now + 180 -- 3 min: la lluvia dura poco
+			log(T("¡Treasure Rain! Enciendo Auto Chest", "Treasure Rain! Turning on Auto Chest"), "ok", true)
+			sendWebhook(T("Treasure Rain en el servidor", "Treasure Rain in the server"))
+			want("Auto Chest", "Rain", true)
+		end
+	end))
+end
+-- Fin de la lluvia en el bucle (no task.delay): así apagar Treasure Rain o cerrar el hub lo cancela sin más
+task.spawn(function()
+	while alive do
+		task.wait(5)
+		if rainUntil > 0 and os.clock() > rainUntil then
+			rainUntil = 0
+			want("Auto Chest", "Rain", false)
+			log(T("Treasure Rain: terminado", "Treasure Rain: over"))
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Auto Expert
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Las misiones de The Expert salen en PlayerGui.MissionGui ("[Hard] Catch 7 fish.", barra "4 / 7"). Se leen sus
+-- textos y se pide (want) la función que toca: pescar -> Auto Pesca, cofres -> Auto Chest, paquetes -> Auto Merlin.
+-- shortcut: solo visto "Catch N fish"; los demás tipos se deducen por palabras y se apuntan en la consola.
+-- shortcut: la barra "a / b" se busca junto a la misión (mismo padre); sin confirmar la estructura de MissionGui,
+-- si no se encuentra la misión cuenta como pendiente hasta que desaparece (como en v1.3.0).
+local expertOn = false
+local active = {} -- interruptores que Auto Expert ha pedido
+local lastSeen = ""
+local RULES = {
+	{ words = { "fish", "catch" }, toggle = "Auto Pesca (beta)" },
+	{ words = { "chest" }, toggle = "Auto Chest" },
+	{ words = { "package", "deliver", "merlin" }, toggle = "Auto Merlin (beta)" },
+	{ words = { "compass", "treasure" }, toggle = "Auto Sam (compass)" },
+}
+
+-- Progreso "a / b" en la misma tarjeta que el texto de la misión; nil si no se ve
+local function progressOf(label)
+	local card = label.Parent
+	for _, d in card and card:GetDescendants() or {} do
+		if d ~= label and d:IsA("TextLabel") then
+			local a, b = d.Text:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
+			if a then return tonumber(a), tonumber(b) end
+		end
+	end
+	return nil
+end
+
+local function missions()
+	local gui = player.PlayerGui:FindFirstChild("MissionGui")
+	local out = {}
+	for _, d in gui and gui:GetDescendants() or {} do
+		if d:IsA("TextLabel") and d.Visible and d.Text:match("^%s*%[") then
+			local a, b = progressOf(d)
+			table.insert(out, { text = d.Text, done = a ~= nil and b ~= nil and b > 0 and a >= b, progress = a and (a .. "/" .. b) })
+		end
+	end
+	return out
+end
+
+local function releaseAll()
+	for name in active do want(name, "Expert", false) end
+	table.clear(active)
+end
+
+section(pageQuest, "The Expert", 1)
+toggle(pageQuest, "Auto Expert (beta)", function(on)
+	expertOn = on
+	if not on then releaseAll() end
+end, L("Lee las misiones de The Expert y enciende lo que haga falta (pescar, cofres, paquetes, compass). Al acabar las apaga, salvo las que encendiste tú.",
+	"Reads The Expert's missions and turns on what's needed (fishing, chests, packages, compass). When done it turns them off, except the ones you turned on."))
+
+task.spawn(function()
+	while alive do
+		task.wait(3)
+		if expertOn then
+			local list = missions()
+			local parts = {}
+			for _, m in list do table.insert(parts, m.text .. (m.progress and " (" .. m.progress .. ")" or "")) end
+			local text = table.concat(parts, " | ")
+			if text ~= lastSeen then
+				lastSeen = text
+				log("Expert: " .. (text ~= "" and text or T("sin misiones", "no missions")))
+			end
+			local needed = {}
+			for _, m in list do
+				if not m.done then
+					local lower = m.text:lower()
+					for _, rule in RULES do
+						for _, w in rule.words do
+							if lower:find(w, 1, true) then needed[rule.toggle] = true end
+						end
+					end
+				end
+			end
+			for name in needed do
+				if not active[name] then
+					active[name] = true
+					want(name, "Expert", true)
+				end
+			end
+			for name in active do
+				if not needed[name] then
+					active[name] = nil
+					want(name, "Expert", false)
+				end
+			end
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Vender peces
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- FishingService.RF.SellFish (EscaneoServicios) junto al Fish Merchant (FishMerchant). shortcut: sin grabar; se
+-- llama sin argumentos y se apunta lo que responde. Cocinar (x5) aún sin datos.
+local sellFish = getRemote("FishingService", "RF", "SellFish")
+local autoSellFish = false
+
+local function sellAllFish()
+	local npc = merchant("FishMerchant")
+	local hrp = getHRP()
+	if not (npc and hrp) then return log(T("Peces: no encuentro al Fish Merchant", "Fish: can't find the Fish Merchant"), "warn") end
+	if not claimMove("SellFish") then return end
+	local back = hrp.CFrame
+	if teleport(npc:GetPivot().Position + Vector3.new(0, 3, 4)) then
+		task.wait(0.4)
+		local ok, result = call(sellFish, "InvokeServer")
+		log(T("Peces: vender -> ", "Fish: sell -> ") .. tostring(result), (ok and result) and "ok" or "warn", ok and result)
+	end
+	returnTo(back)
+	releaseMove("SellFish")
+end
+
+section(pageAuto, L("Farmeo", "Farming"))
+button(pageAuto, L("Vender peces", "Sell fish"), sellAllFish, L("Va al Fish Merchant, vende los peces y vuelve.", "Goes to the Fish Merchant, sells your fish and comes back."))
+toggle(pageAuto, L("Auto vender peces (beta)", "Auto sell fish (beta)"), function(on) autoSellFish = on end,
+	L("Vende los peces cada 5 minutos.", "Sells your fish every 5 minutes."))
+task.spawn(function()
+	while alive do
+		task.wait(300)
+		if autoSellFish then pcall(sellAllFish) end
+	end
+end)
+end
+
+------------------------------------------------------------------ Webhook de Discord
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+local announced = setmetatable({}, { __mode = "k" }) -- frutas ya avisadas (claves débiles: no retiene las borradas)
+section(pageMisc, "Discord webhook")
+-- La URL es un secreto (quien la tenga puede escribir en tu canal): no se muestra entera ni se escribe en la consola.
+local function masked()
+	return validWebhook(config.webhook) and T("guardado (…", "saved (…") .. config.webhook:sub(-4) .. ")" or ""
+end
+input(pageMisc, "Webhook", "https://discord.com/api/webhooks/...", "", function(text)
+	text = text:match("^%s*(.-)%s*$")
+	if text == "" then return end -- vaciar la caja no borra el guardado: para eso está "Borrar webhook"
+	if not validWebhook(text) then
+		return log(T("Eso no es una URL de webhook de Discord (https://discord.com/api/webhooks/...)",
+			"That isn't a Discord webhook URL (https://discord.com/api/webhooks/...)"), "warn", true)
+	end
+	config.webhook = text
+	saveConfig()
+	log(T("Webhook guardado ", "Webhook saved ") .. masked() .. T(". Usa \"Enviar prueba\" para comprobarlo.", ". Use \"Send test\" to check it."), "ok", true)
+end, L("Pega la URL de un webhook de tu servidor de Discord para recibir avisos. Se guarda en ElHoyoHub.json, no en los perfiles.",
+	"Paste a webhook URL from your Discord server to get alerts. It's stored in ElHoyoHub.json, not in presets."))
+button(pageMisc, L("Enviar prueba", "Send test"), function()
+	sendWebhook(T("Mensaje de prueba", "Test message"), function(ok, why)
+		if ok then
+			log(T("Webhook: prueba enviada ", "Webhook: test sent ") .. masked(), "ok", true)
+		else
+			log("Webhook: " .. tostring(why), "warn", true)
+		end
+	end)
+end, L("Manda un mensaje de prueba al webhook guardado.", "Sends a test message to the saved webhook."))
+button(pageMisc, L("Borrar webhook", "Delete webhook"), function()
+	config.webhook = nil
+	saveConfig()
+	log(T("Webhook borrado", "Webhook deleted"), "ok", true)
+end, L("Olvida la URL guardada.", "Forgets the saved URL."))
+if config.webhook ~= nil and not validWebhook(config.webhook) then
+	table.insert(bootNotes, { "Webhook guardado no válido: no se usará hasta que pongas uno de Discord", "Saved webhook is invalid: it won't be used until you set a Discord one" })
+end
+toggle(pageMisc, L("Avisar: frutas raras en el suelo", "Alert: rare fruits on the ground"), function(on) wh.fruits = on end,
+	L("Manda un aviso cuando hay una Devil Fruit Rara o mejor tirada.", "Sends an alert when a Rare or better Devil Fruit is lying around."))
+toggle(pageMisc, L("Avisar: jefes", "Alert: bosses"), function(on) wh.bosses = on end,
+	L("Manda un aviso cuando aparece un jefe de la lista de Auto Boss.", "Sends an alert when a boss from the Auto Boss list appears."))
+toggle(pageMisc, L("Avisar: admins", "Alert: admins"), function(on) wh.admins = on end,
+	L("Manda un aviso cuando Detectar admins encuentra uno.", "Sends an alert when Detect admins finds one."))
+task.spawn(function()
+	while alive do
+		task.wait(5)
+		if wh.fruits then
+			for _, f in groundFruits() do
+				if f.rank >= 3 and not announced[f.tool] then
+					announced[f.tool] = true
+					sendWebhook(T("Fruta en el suelo: ", "Fruit on the ground: ") .. f.name)
+				end
+			end
+		end
+	end
+end)
+end
+
+------------------------------------------------------------------ Modo AFK total
+do -- bloque propio: sus variables no cuentan para el límite de 200 locales del script
+-- Enciende de una vez lo mejor para farmear sin estar (la zona segura primero, para que el resto vuelva a ella)
+local AFK_SET = { "Zona segura", "Anti-AFK", "Auto Respawn", "Huida automática", "Auto Sam (compass)", "Auto Chest",
+	"Auto Treasure Rain", "Auto Stats (beta)", "Auto Rewards", "Auto Claim Challenges (beta)", "Collect Devil Fruits" }
+section(pageHome, L("Modo AFK", "AFK mode"), 1)
+button(pageHome, L("Encender modo AFK total", "Turn on full AFK mode"), function()
+	local n = 0
+	for _, name in AFK_SET do
+		local t = toggles[name]
+		if t and not t.value then
+			t.set(true)
+			task.spawn(t.onChange, true)
+			n += 1
+			task.wait(0.2)
+		end
+	end
+	log(T("Modo AFK: encendidas ", "AFK mode: turned on ") .. n .. T(" funciones", " features"), "ok", true)
+end, L("Enciende zona segura, Anti-AFK, respawn, huida, Sam, cofres, Treasure Rain, Auto Stats, recompensas, challenges y frutas.",
+	"Turns on safe zone, Anti-AFK, respawn, escape, Sam, chests, Treasure Rain, Auto Stats, rewards, challenges and fruits."))
 end
 
 local waitingKey = false -- también lo usa la tecla para ocultar
@@ -3169,7 +4305,7 @@ local function loaderSource()
 end
 
 local function hasUrl()
-	return config.hubUrl ~= nil and config.hubUrl:match("^https?://") ~= nil
+	return type(config.hubUrl) == "string" and config.hubUrl:match("^https://") ~= nil -- solo https: el cargador ejecuta lo que descarga
 end
 
 -- Deja todo preparado según el ajuste actual; devuelve si se pudo escribir el archivo de autoexec
@@ -3223,28 +4359,14 @@ applyAutoexec() -- cada vez que se abre, deja preparado el siguiente servidor
 section(pageSettings, "Hub")
 note(pageSettings, L("Versión " .. HUB_VERSION, "Version " .. HUB_VERSION))
 button(pageSettings, L("Apagar todo", "Turn everything off"), function()
-	local n = 0
-	for _, t in toggles do
-		if t.value and not t.noSave then
-			t.set(false)
-			task.spawn(t.onChange, false)
-			n += 1
-		end
-	end
+	local n = turnAllOff(false)
 	log(T("Apagadas ", "Turned off ") .. n .. T(" funciones", " features"), "ok", true)
 end, L("Apaga todas las funciones encendidas sin cerrar el hub.", "Turns off every active feature without closing the hub."))
-button(pageSettings, L("Cerrar El Hoyo Hub", "Close El Hoyo Hub"), function() genv.ElHoyoHubClose() end,
-	L("Apaga todas las funciones y cierra el hub.", "Turns off every feature and closes the hub."))
+button(pageSettings, L("Cerrar El Hoyo Hub", "Close El Hoyo Hub"), function() closeHub() end,
+	L("Apaga todas las funciones, deja el personaje como estaba y cierra el hub.", "Turns off every feature, restores your character and closes the hub."))
 end
 
------------------------------------------------------------------- Ocultar, cursor, cerrar
-local function closeHub()
-	alive = false -- todos los bucles miran esto y se paran
-	for _, c in cleanup do c:Disconnect() end
-	pcall(UI.Unload, UI)
-	gui:Destroy()
-end
-
+------------------------------------------------------------------ Ocultar, cursor
 -- Mostrar / ocultar con la tecla elegida (la librería no la gestiona: ToggleKey = false)
 table.insert(cleanup, UIS.InputBegan:Connect(function(input)
 	if waitingKey or UIS:GetFocusedTextBox() then return end
@@ -3256,11 +4378,49 @@ table.insert(cleanup, game:GetService("RunService").RenderStepped:Connect(functi
 	if overOurGui() then UIS.MouseIconEnabled = true end
 end))
 
+------------------------------------------------------------------ Migraciones
+-- v1.3.1 (configVersion 2): las cajas de texto ya no van en los perfiles. Los perfiles viejos aún guardan lo que
+-- se escribió en ellas (la URL del webhook incluida) y la librería lo volvería a guardar: se quita del disco.
+-- Solo se borran valores de texto de esas cajas; interruptores y demás quedan igual.
+if (tonumber(config.configVersion) or 1) < CONFIG_VERSION then
+	local INPUT_KEYS = { "/Webhook", "/URL", "/Player", "/Skill keys" } -- final de la ruta de cada caja de texto
+	local cleaned = 0
+	if listfiles and readfile and writefile then
+		for _, dir in { "ElHoyoHub/configs", "ElHoyoHub/trash" } do
+			local okList, files = pcall(listfiles, dir)
+			for _, path in okList and files or {} do
+				local okRead, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+				if okRead and type(data) == "table" and type(data.values) == "table" then
+					local changed = false
+					for id, value in data.values do
+						local isInput = false
+						for _, suffix in INPUT_KEYS do
+							if type(id) == "string" and type(value) == "string" and id:sub(-#suffix) == suffix then isInput = true end
+						end
+						if isInput or (type(value) == "string" and value:find("/api/webhooks/", 1, true)) then
+							data.values[id] = nil
+							changed = true
+						end
+					end
+					if changed then
+						cleaned += 1
+						pcall(writefile, path, HttpService:JSONEncode(data))
+					end
+				end
+			end
+		end
+	end
+	if cleaned > 0 then table.insert(bootNotes, { "Perfiles limpiados (sin URLs ni textos guardados): " .. cleaned, "Presets cleaned (no URLs or saved text): " .. cleaned }) end
+	config.configVersion = CONFIG_VERSION
+	saveConfig()
+end
+
 ------------------------------------------------------------------ Inicio
-genv.ElHoyoHubClose = closeHub
+if not alive then return closeHub() end -- otra ejecución cerró este hub mientras cargaba: no dejar nada a medias
 fitBoxes()
 win:Finish() -- coloca todo y carga el último perfil usado (eso enciende sus funciones)
 log(T("El Hoyo Hub cargado (v", "El Hoyo Hub loaded (v") .. HUB_VERSION .. ")", "ok", true)
+for _, msg in bootNotes do log(T(msg[1], msg[2]), "warn") end
 for _, missing in missingRemotes do
 	log(T("No encuentro la señal ", "Can't find the signal ") .. missing .. T(" (¿actualización del juego?)", " (game update?)"), "error")
 end
@@ -3269,6 +4429,8 @@ end
 local ok, err = xpcall(ElHoyoHubMain, debug.traceback)
 if not ok then
 	warn("[El Hoyo Hub] " .. tostring(err))
+	-- lo que llegó a cargarse (bucles, ventana) se cierra: si no, quedaba funcionando a medias y sin botón de cerrar
+	pcall(function() local g = getgenv and getgenv(); if g and g.ElHoyoHubClose then g.ElHoyoHubClose() end end)
 	if setclipboard then pcall(setclipboard, tostring(err)) end
 	local sg = Instance.new("ScreenGui")
 	sg.Name = "ElHoyoHubError"
