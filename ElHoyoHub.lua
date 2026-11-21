@@ -1,4 +1,4 @@
--- El Hoyo Hub v1.5.2-rc1 (build a038d77e). ARCHIVO GENERADO por tools/build.js: no editar aquí,
+-- El Hoyo Hub v1.5.3-rc1 (build bbbe8f14). ARCHIVO GENERADO por tools/build.js: no editar aquí,
 -- el código está en src/ (ver ARCHITECTURE.md). Módulos: Lifecycle, Components, Config, Webhook, Tokens, Layout, Search, Notifications, ElHoyoUI, Console, Ownership, Protection, Knowledge, KnowledgeView, CatalogIndex, Profiles, Diagnostics, NpcFarm, Favorites.
 local import -- se asigna después de los módulos: así los módulos la ven (upvalue) y pueden importar otros
 local __modules = {}
@@ -700,6 +700,8 @@ Config.SCHEMA = {
 	{ id = "bountyRadius", type = "number", default = 2, range = { 1, 4 }, integer = true, category = "bounty", since = "1.5.1" },
 	{ id = "bountyLow", type = "number", default = 2, range = { 1, 3 }, integer = true, category = "bounty", since = "1.5.1" },
 	{ id = "bountyRecover", type = "number", default = 2, range = { 1, 3 }, integer = true, category = "bounty", since = "1.5.1" },
+	-- 1.5.3: de dónde se lee la vida (Huida y Bounty)
+	{ id = "healthSource", type = "string", default = "auto", options = { "auto", "humanoid", "attribute" }, category = "protection", since = "1.5.3" },
 }
 Config.BY_ID = {}
 Config.TYPES = {} -- compatibilidad con 1.3.2: tipo de cada clave
@@ -1103,24 +1105,64 @@ function Layout.placePopup(ax, ay, ah, w, h, view, margin)
 	return x, ay - 4 - hh, hh, "above"
 end
 
+-- Barra lateral SIN scroll propio (1.5.3). Todo tiene que verse de un vistazo: las filas se encogen hasta MIN_TAB
+-- y los grupos usan separaciones compactas. Si ni así cabe, modo acordeón: los títulos de TODOS los grupos siguen a
+-- la vista y solo se despliega el grupo activo (nada queda inaccesible; Ctrl+K y Ctrl+RePág/AvPág también llevan).
+Layout.SIDE.minTab = 22
+Layout.SIDE.maxTab = 34
+Layout.SIDE.specs = { { gap = 12, label = 16.5, minTab = 28 }, { gap = 6, label = 14, minTab = 22 } } -- holgado, compacto
+
+-- Medidas para `tabs` secciones visibles y `groups` grupos en `height` px. Devuelve { tab, gap, label, fits }.
+function Layout.sidebarFit(tabs, groups, height)
+	height = height or Layout.SIDE.height
+	for _, spec in Layout.SIDE.specs do
+		local fixed = groups * spec.label + math.max(0, groups - 1) * spec.gap
+		local tab = math.min(Layout.SIDE.maxTab, math.floor((height - fixed) / math.max(1, tabs)))
+		if tab >= spec.minTab then return { tab = tab, gap = spec.gap, label = spec.label, fits = true } end
+	end
+	local last = Layout.SIDE.specs[#Layout.SIDE.specs]
+	return { tab = Layout.SIDE.minTab, gap = last.gap, label = last.label, fits = false }
+end
+
 -- Barra lateral. items = { { kind = "group", key, collapsed } | { kind = "tab", group = key } } en orden.
--- Devuelve { y = { [i] = posición o nil si oculto }, total, maxScroll }. Mismos pasos que relayoutSide.
-function Layout.sidebar(items, height)
-	local S = Layout.SIDE
-	local ys, y, collapsed, first = {}, 0, {}, true
+-- active = clave del grupo de la sección activa (para el acordeón). Devuelve { y = { [i] = posición o nil si oculta },
+-- total, metrics, accordion, hidden = { [clave] = true } }. Mismos cálculos que relayoutSide de la librería.
+function Layout.sidebar(items, height, active)
+	height = height or Layout.SIDE.height
+	local groups, tabsIn = 0, {}
+	for _, it in items do
+		if it.kind == "group" then groups += 1; tabsIn[it.key] = 0
+		elseif it.group then tabsIn[it.group] = (tabsIn[it.group] or 0) + 1 end
+	end
+	local function visibleTabs(hidden)
+		local n = 0
+		for _, it in items do
+			if it.kind == "tab" and not (it.group and hidden[it.group]) then n += 1 end
+		end
+		return n
+	end
+	local hidden = {}
+	for _, it in items do if it.kind == "group" and it.collapsed then hidden[it.key] = true end end
+	local m = Layout.sidebarFit(visibleTabs(hidden), groups, height)
+	local accordion = false
+	if not m.fits then -- acordeón: solo el grupo activo desplegado
+		accordion = true
+		for _, it in items do if it.kind == "group" and it.key ~= active then hidden[it.key] = true end end
+		m = Layout.sidebarFit(visibleTabs(hidden), groups, height)
+	end
+	local ys, y, first = {}, 0, true
 	for i, it in items do
 		if it.kind == "group" then
-			collapsed[it.key] = it.collapsed == true
-			if not first then y += S.group end
+			if not first then y += m.gap end
 			first = false
 			ys[i] = y + 1
-			y = math.floor(y + S.groupLabel)
-		elseif not (it.group and collapsed[it.group]) then
+			y = math.floor(y + m.label)
+		elseif not (it.group and hidden[it.group]) then
 			ys[i] = y
-			y += S.tab
+			y += m.tab
 		end
 	end
-	return { y = ys, total = y, maxScroll = math.max(0, y - (height or S.height)) }
+	return { y = ys, total = y, metrics = m, accordion = accordion, hidden = hidden, maxScroll = 0 }
 end
 
 -- Desplazamiento para que una fila (y, alto) se vea entera en una ventana de `height`
@@ -4499,7 +4541,7 @@ function WindowMeta:Group(name)
 	local scope = self.sideScope
 	local function paint()
 		local text = tr(name)
-		if group.collapsed then text = text .. "  +" .. group.count end
+		if group.collapsed or group.autoFolded then text = text .. "  +" .. group.count end
 		setText(label, text, 11, FontSemi)
 		label.TextColor3, label.TextTransparency = T.Title, 1 - (0.5 + 0.3 * hot.v) * scope.alpha
 	end
@@ -4519,6 +4561,12 @@ function WindowMeta:Group(name)
 end
 
 function WindowMeta:toggleGroup(group, state)
+	-- acordeón (no cabe todo): pulsar un grupo plegado automáticamente lo despliega y pliega los demás (sin guardar)
+	if self.sideAccordion and state == nil and group.autoFolded then
+		self.focusGroup = group.key
+		self:relayoutSide()
+		return
+	end
 	if state == nil then state = not group.collapsed end
 	if group.collapsed == state then return end
 	group.collapsed = state
@@ -4527,7 +4575,7 @@ function WindowMeta:toggleGroup(group, state)
 	self.queueSettings()
 end
 
--- ¿Está este elemento dentro de la parte visible de la barra? (lo desplazado fuera no recibe clics)
+-- ¿Está este elemento dentro de la barra? (1.5.3: ya no hay scroll; se conserva por compatibilidad)
 function WindowMeta:inSide(frame)
 	local clip, p = self.sideClip, frame.AbsolutePosition
 	if not clip then return true end
@@ -4535,9 +4583,10 @@ function WindowMeta:inSide(frame)
 	return p.Y + frame.AbsoluteSize.Y * 0.5 >= c.Y and p.Y + frame.AbsoluteSize.Y * 0.5 <= c.Y + cs.Y
 end
 
-function WindowMeta:scrollSide(to)
-	self.sideScroll = math.clamp(to, 0, self.sideMax or 0)
-	setXY(self.sideInner, 0, -round(self.sideScroll))
+-- 1.5.3: la barra no se desplaza (todo cabe o acordeón); se conserva la función por compatibilidad
+function WindowMeta:scrollSide()
+	self.sideScroll = 0
+	setXY(self.sideInner, 0, 0)
 end
 
 function WindowMeta:selectTab(tab, instantly)
@@ -4555,13 +4604,11 @@ function WindowMeta:selectTab(tab, instantly)
 	self:setExpanded(tab.expandedOwner or (parent) or (tab.children and tab) or nil)
 	for _, t in self.tabs do t:paintActive() end
 	if instantly then self.pageAnim:set(1) else self.pageAnim:set(0); self.pageAnim:to(1) end
-	-- su grupo se despliega y la fila queda a la vista
+	-- su grupo se despliega (si el usuario lo había plegado) y, en acordeón, pasa a ser el desplegado
 	local top = parent or tab
 	if top.group and top.group.collapsed then self:toggleGroup(top.group, false) end
+	self.focusGroup = nil
 	self:relayoutSide()
-	if top.sideY and self.sideMax then
-		self:scrollSide(Library.Layout.scrollTo(top.sideY, Library.Tokens.size.tab, self.sideScroll or 0, Library.Layout.SIDE.height, self.sideMax))
-	end
 	self.saved.lastTab = tab.name
 	if self.queueSettings then self.queueSettings() end
 	if self.onTabChanged then task.spawn(self.onTabChanged, tab) end
@@ -4585,50 +4632,67 @@ function WindowMeta:setExpanded(owner)
 	if owner then owner.expandAnim:to(1) end
 end
 
+-- 1.5.3: SIN scroll propio. Las posiciones y el alto de fila salen de Library.Layout.sidebar (la misma función que
+-- prueban los tests): todas las secciones a la vista; si no caben ni con filas de 22 px, acordeón (los títulos de
+-- todos los grupos siguen visibles y se despliega el de la sección activa o el que pulses).
 function WindowMeta:relayoutSide()
-	local y = 0
-	local hidden = false
+	local simple, map = {}, {}
 	for _, item in self.sideItems do
 		if item.kind == "group" then
-			if not item.first then y += 12 end
-			setXY(item.frame, 10, y + 1)
-			setXY(item.hit, 0, y)
-			y = math.floor(y + 12.5 + 4)
-			hidden = item.collapsed
-		elseif item.kind == "tab" then
+			table.insert(simple, { kind = "group", key = item.key, collapsed = item.collapsed })
+			map[#simple] = item
+		elseif item.kind == "tab" and not item.tab.parentTab then
+			table.insert(simple, { kind = "tab", group = item.tab.group and item.tab.group.key or nil })
+			map[#simple] = item
+		end
+	end
+	local activeTop = self.current and (self.current.parentTab or self.current)
+	local focus = self.focusGroup or (activeTop and activeTop.group and activeTop.group.key)
+	local L = Library.Layout.sidebar(simple, Library.Layout.SIDE.height, focus)
+	local m = L.metrics
+	self.sideMetrics, self.sideAccordion = m, L.accordion
+	for i, s in simple do
+		local item = map[i]
+		if s.kind == "group" then
+			setXY(item.frame, 10, L.y[i])
+			setXY(item.hit, 0, L.y[i] - 1)
+			local auto = L.accordion and L.hidden[s.key] == true and not item.collapsed
+			if item.autoFolded ~= auto then
+				item.autoFolded = auto
+				item.paint()
+			end
+		else
 			local tab = item.tab
-			if tab.parentTab then
-				local parent = tab.parentTab
-				local v = parent.hiddenInGroup and 0 or parent.expandAnim.v
-				local full = #parent.children * 34
-				tab.row.Visible = v > 0.01
-				tab.rowScope.own = v
-				tab.rowScope:refresh()
-				setXY(tab.row, 0, (item.subIndex - 1) * 34)
-				if item.subIndex == #parent.children then
-					setWH(parent.subClip, 150, round(full * v))
-					y = parent.subBase + full * v
-				end
-			else
-				tab.hiddenInGroup = hidden
-				tab.row.Visible = not hidden
-				if tab.subClip then tab.subClip.Visible = not hidden end
-				if not hidden then
-					setXY(tab.row, 0, y)
-					tab.sideY = y
-					if tab.children then
-						tab.subBase = y + 34
-						setXY(tab.subClip, 0, tab.subBase)
-					end
-					y = y + 34
-				elseif tab.children then
-					tab.subBase = y
+			local hidden = L.y[i] == nil
+			tab.hiddenInGroup = hidden
+			tab.row.Visible = not hidden
+			if tab.subClip then tab.subClip.Visible = not hidden end
+			if not hidden then
+				tab:fit(m.tab)
+				setXY(tab.row, 0, L.y[i])
+				tab.sideY = L.y[i]
+				if tab.children then
+					tab.subBase = L.y[i] + m.tab
+					setXY(tab.subClip, 0, tab.subBase)
 				end
 			end
 		end
 	end
-	self.sideMax = math.max(0, y - Library.Layout.SIDE.height)
-	self:scrollSide(self.sideScroll or 0)
+	-- subsecciones (la API las conserva; el hub no las usa): debajo de su sección, con el mismo alto de fila
+	for _, item in self.sideItems do
+		if item.kind == "tab" and item.tab.parentTab then
+			local tab, parent = item.tab, item.tab.parentTab
+			local v = parent.hiddenInGroup and 0 or parent.expandAnim.v
+			tab:fit(m.tab)
+			tab.row.Visible = v > 0.01
+			tab.rowScope.own = v
+			tab.rowScope:refresh()
+			setXY(tab.row, 0, (item.subIndex - 1) * m.tab)
+			if item.subIndex == #parent.children then setWH(parent.subClip, 150, round(#parent.children * m.tab * v)) end
+		end
+	end
+	self.sideMax = 0
+	self:scrollSide()
 end
 
 function WindowMeta:Tab(o)
@@ -4661,6 +4725,17 @@ function WindowMeta:Tab(o)
 	active.cb, hover.cb = paint, paint
 	scope:paint(paint)
 	tab.row, tab.rowScope = row, scope
+	-- 1.5.3: alto de fila que decide relayoutSide (todas las secciones a la vista); el contenido queda centrado
+	function tab:fit(h)
+		if tab.fitH == h then return end
+		tab.fitH = h
+		setWH(row, 150, h)
+		setXY(pill, 6 + indent, 1)
+		setWH(pill, 138 - indent, h - 2)
+		setXY(bar, 6 + indent, math.floor((h - 14) / 2))
+		glyph:center(6 + indent + 9 + 8, h / 2)
+		setXY(label.clip, 6 + indent + 32, math.floor((h - 30) / 2))
+	end
 	function tab:paintActive()
 		local on = win.current == tab or (tab.children and win.current and win.current.parentTab == tab)
 		active:to(on and 1 or 0)
@@ -5904,11 +5979,10 @@ function Library:CreateWindow(o)
 	tracked(o.Brand or "EL HOYO", 60, 15, 14, FontSemi, 0.935, 1)
 	tracked(o.SubBrand or "HUB", 60, 31, 11, FontSemi, 2.17, 0.62)
 
-	-- la barra lateral recorta y se desplaza con la rueda (1.5.0)
+	-- la barra lateral recorta (1.5.3: sin scroll propio; todo cabe o acordeón)
 	win.sideClip = Box(frame, 10, 70, 150, Library.Layout.SIDE.height)
 	win.sideClip.ClipsDescendants = true
 	win.sideInner = Box(win.sideClip, 0, 0, 150, Library.Layout.SIDE.height)
-	Wheel(sideScope, win.sideClip, function(z) win:scrollSide((win.sideScroll or 0) - z * Library.Tokens.size.tab) end)
 	-- al cambiar el tamaño de la pantalla: reajustar la escala y que la ventana siga a la vista
 	local camera = workspace.CurrentCamera
 	if camera then
@@ -6957,6 +7031,121 @@ function Protection.read(humanoid, attrs)
 	-- Indicio de que el juego lleva la vida en su atributo y no en el Humanoid (hipótesis: hay que verlo en el juego)
 	r.mismatch = (r.ok and r.attrHealth ~= nil and math.abs(r.attrHealth - r.health) > 0.5) == true
 	return r
+end
+
+------------------------------------------------------------------ Fuentes de vida (1.5.3)
+-- Prueba real del usuario (1.5.2): la vida que enseñaba el hub NO coincidía con la real y la Huida no saltó al bajar
+-- del 30 %. Aquí se reúnen TODAS las fuentes candidatas que se encuentran por nombre (sin inventar rutas): el Humanoid,
+-- y cualquier atributo o valor (NumberValue/IntValue) cuyo nombre contenga "health" o sea "hp", del personaje, del
+-- Humanoid o del jugador. Cada una con su porcentaje si se sabe su máximo.
+-- snap = { humanoid = { Health, MaxHealth } | nil, attrs = { character = {...}, humanoid = {...}, player = {...} },
+--          values = { { path, name, value } } }
+local function isHealthName(n)
+	n = tostring(n):lower()
+	return (n:find("health", 1, true) ~= nil or n == "hp") and n:find("max", 1, true) == nil and n:find("regen", 1, true) == nil
+end
+local function maxFor(tbl, name)
+	for _, k in { "Max" .. name, name .. "Max", "MaxHealth", "HealthMax", "MaxHP" } do
+		if type(tbl) == "table" and tonumber(tbl[k]) then return tonumber(tbl[k]), k end
+	end
+	return nil
+end
+Protection.isHealthName = isHealthName
+
+function Protection.sources(snap)
+	snap = snap or {}
+	local out = {}
+	local hum = snap.humanoid
+	local humMax = hum and tonumber(hum.MaxHealth)
+	if hum and tonumber(hum.Health) then
+		local h = tonumber(hum.Health)
+		table.insert(out, { id = "humanoid", label = "Humanoid.Health", value = h, max = humMax,
+			pct = humMax and humMax > 0 and h / humMax or nil, maxFrom = "Humanoid.MaxHealth" })
+	end
+	for _, where in { "character", "humanoid", "player" } do
+		local tbl = snap.attrs and snap.attrs[where]
+		if type(tbl) == "table" then
+			local names = {}
+			for name in tbl do table.insert(names, name) end
+			table.sort(names)
+			for _, name in names do
+				local v = tonumber(tbl[name])
+				if v and isHealthName(name) then
+					local max, from = maxFor(tbl, name)
+					if not max and humMax and humMax > 0 then max, from = humMax, "Humanoid.MaxHealth (supuesto)" end
+					table.insert(out, { id = where .. ":" .. name, label = "atributo " .. name .. " (" .. where .. ")", value = v, max = max,
+						pct = max and max > 0 and v / max or nil, maxFrom = from })
+				end
+			end
+		end
+	end
+	for _, val in snap.values or {} do
+		local v = tonumber(val.value)
+		if v and isHealthName(val.name) then
+			local max = humMax
+			table.insert(out, { id = "value:" .. tostring(val.path), label = "valor " .. tostring(val.path), value = v, max = max,
+				pct = max and max > 0 and v / max or nil, maxFrom = max and "Humanoid.MaxHealth (supuesto)" or nil })
+		end
+	end
+	return out
+end
+
+Protection.MODES = { "auto", "humanoid", "attribute" }
+
+-- Elige la fuente. mode "humanoid" = el Humanoid; "attribute" = el atributo Health del personaje (documentado);
+-- "auto" = el Humanoid, salvo que otra fuente con porcentaje marque menos vida mientras el Humanoid sigue lleno
+-- (exactamente lo que vio el usuario): entonces esa, y se queda con ella (sticky) mientras exista.
+-- Devuelve fuente (o nil) y motivo.
+function Protection.select(sources, mode, sticky)
+	local byId = {}
+	for _, s in sources do byId[s.id] = s end
+	local hum = byId.humanoid
+	if mode == "humanoid" then return hum, hum and "elegida: Humanoid" or "no hay Humanoid" end
+	if mode == "attribute" then
+		local a = byId["character:Health"]
+		return a, a and "elegida: atributo Health" or "el personaje no tiene atributo Health"
+	end
+	if sticky and byId[sticky] and byId[sticky].pct then return byId[sticky], "auto: se mantiene " .. byId[sticky].label end
+	if hum and hum.pct then
+		local best
+		for _, s in sources do
+			if s.id ~= "humanoid" and s.pct and s.pct < hum.pct - 0.02 and hum.pct >= 0.98 and (not best or s.pct < best.pct) then best = s end
+		end
+		if best then return best, "auto: el Humanoid sigue lleno y " .. best.label .. " marca menos vida" end
+		return hum, "auto: Humanoid (ninguna otra fuente marca menos vida)"
+	end
+	for _, s in sources do
+		if s.pct then return s, "auto: no hay Humanoid legible; se usa " .. s.label end
+	end
+	return nil, "no se encuentra ninguna fuente de vida legible"
+end
+
+-- Lectura con la forma de read() a partir de una fuente (para step)
+function Protection.fromSource(s)
+	if not s or not s.pct then return { ok = false } end
+	return { ok = true, health = s.value, max = s.max, pct = s.pct, source = s.id }
+end
+
+-- Grabación para la prueba real: samples = { { [id] = valor } }. Devuelve por fuente: mínimo, máximo y si cambió.
+function Protection.summarize(samples)
+	local stats = {}
+	for _, sample in samples do
+		for id, v in sample do
+			local s = stats[id] or { id = id, min = v, max = v, first = v, last = v, n = 0 }
+			s.min, s.max, s.last, s.n = math.min(s.min, v), math.max(s.max, v), v, s.n + 1
+			stats[id] = s
+		end
+	end
+	local out = {}
+	for _, s in stats do
+		s.changed = s.max - s.min > 0.5
+		table.insert(out, s)
+	end
+	table.sort(out, function(a, b)
+		if a.changed ~= b.changed then return a.changed end
+		return a.id < b.id
+	end)
+	return out
 end
 
 -- Un paso de la máquina de estados. state = { escaping, since, character } (se modifica).
@@ -8429,10 +8618,10 @@ function import(name) -- declarada antes de los módulos (local import): un mód
 	end
 	return m
 end
-local HUB_BUILD = "a038d77e"
+local HUB_BUILD = "bbbe8f14"
 -- El Hoyo Hub
 -- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
-local HUB_VERSION = "1.5.2-rc1" -- Release Candidate: falta pasar las pruebas en el juego (TESTING.md)
+local HUB_VERSION = "1.5.3-rc1" -- Release Candidate: falta pasar las pruebas en el juego (TESTING.md)
 local UI_MIN_VERSION = 5 -- ElHoyoUI.lua con Library.Version menor no vale (cambió algo que el hub necesita)
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
@@ -8736,6 +8925,7 @@ end
 -- de 11. Los ids de los perfiles salen de "Pestaña/Caja/Nombre": añadir o reordenar secciones no los cambia; lo que
 -- se movió de sitio está en data/ui_moves.json y en Profiles.ALIASES (migración explícita).
 local pagesX = {} -- secciones nuevas de 1.5.0, en una tabla para no sumar locales a ElHoyoHubMain
+local hubShared = {} -- 1.5.3: lo que comparten secciones (lectura de vida: Huida y Bounty)
 win:Group(uiText(L("PRINCIPAL", "MAIN")))
 pagesX.dash = addTab(L("Panel", "Dashboard"), "TH")
 local pageHome = addTab(L("Inicio", "Home"), "STAR")
@@ -11821,18 +12011,31 @@ local escapeOn = false
 local limit = LIMITS[tonumber(config.escapeAt) or 2] or 35
 local state = { escaping = false }
 local lastReading, lastReason = nil, "apagada"
+local lastSources, lastChosen, lastChoice, sticky = {}, nil, "", nil
 local temp
 
-local function characterParts()
+local function attrsOf(obj)
+	if not obj then return nil end
+	local ok, all = pcall(function() return obj:GetAttributes() end)
+	return ok and all or nil
+end
+-- 1.5.3: todo lo que podría ser la vida, encontrado por NOMBRE (nada inventado): Humanoid, atributos del personaje,
+-- del Humanoid y del jugador, y NumberValue/IntValue con "health"/"hp" en el nombre dentro del personaje o del jugador.
+local function healthSnapshot()
 	local char = player.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local attrs = nil
-	if char then
-		local ok, all = pcall(function() return char:GetAttributes() end)
-		attrs = ok and all or nil
+	local snap = { humanoid = hum and { Health = hum.Health, MaxHealth = hum.MaxHealth } or nil,
+		attrs = { character = attrsOf(char), humanoid = attrsOf(hum), player = attrsOf(player) }, values = {} }
+	for _, root in { char, player } do
+		for _, d in root and root:GetDescendants() or {} do
+			if (d:IsA("NumberValue") or d:IsA("IntValue")) and Protection.isHealthName(d.Name) and #snap.values < 10 then
+				table.insert(snap.values, { path = d:GetFullName():gsub("^Players%.[^%.]+%.", "Player."), name = d.Name, value = d.Value })
+			end
+		end
 	end
-	return char, hum, attrs
+	return char, snap
 end
+hubShared.healthSnapshot = healthSnapshot
 
 -- Subir: a la zona segura o a una plataforma temporal. El turno de movimiento se QUITA (preempt) y al acabar se
 -- devuelve a quien lo tuviera (antes se ponía a nil y la función que movía se quedaba sin él).
@@ -11878,24 +12081,90 @@ do
 		saveConfig()
 	end, L("Porcentaje de vida que hace saltar la huida.", "Health percentage that triggers the escape."))
 end
--- 1.5.2: qué vida se está leyendo y por qué espera (para comprobar en el juego si el Humanoid refleja tu vida)
-note(pagePlayer, function()
-	local r = lastReading
-	if not r then return T("Vida: sin leer", "Health: not read") end
-	local hum = r.ok and string.format("Humanoid %d/%d", math.floor(r.health), math.floor(r.max)) or "Humanoid -"
-	local attr = r.attrHealth and string.format(T(" · atributo Health %d", " · Health attribute %d"), math.floor(r.attrHealth)) or ""
-	return T("Vida: ", "Health: ") .. hum .. attr .. (r.mismatch and T("  ⚠ no coinciden", "  ⚠ they differ") or "") .. "\n" .. tostring(lastReason)
-end, 2)
+-- 1.5.3: de qué fuente sale la vida (Auto / Humanoid / atributo Health), guardado en config.healthSource
+do
+	local MODE_NAMES = { L("Auto (recomendado)", "Auto (recommended)"), "Humanoid", L("Atributo Health", "Health attribute") }
+	combo(pagePlayer, L("Fuente de vida", "Health source"), MODE_NAMES,
+		table.find(Protection.MODES, config.healthSource) or 1, function(i)
+		config.healthSource = Protection.MODES[i]
+		sticky = nil
+		saveConfig()
+	end, L("De dónde se lee tu vida. Auto usa el Humanoid salvo que otra fuente marque menos vida con el Humanoid lleno.",
+		"Where your health is read from. Auto uses the Humanoid unless another source shows less health while the Humanoid is full."))
+end
+-- Diagnóstico de vida: TODAS las fuentes a la vez, la elegida, el umbral, el estado y por qué no salta
+local function healthText()
+	local out = {}
+	for _, src in lastSources do
+		table.insert(out, string.format("%s%s: %s%s", src == lastChosen and "▶ " or "   ", src.label,
+			src.max and string.format("%g/%g", math.floor(src.value * 10) / 10, src.max) or tostring(src.value),
+			src.pct and string.format(" = %d%%", math.floor(src.pct * 100 + 0.5)) or T(" (sin máximo)", " (no max)")))
+	end
+	if #out == 0 then table.insert(out, T("Sin fuentes de vida legibles (¿sin personaje?)", "No readable health sources (no character?)")) end
+	table.insert(out, T("Fuente: ", "Source: ") .. tostring(lastChoice))
+	table.insert(out, string.format(T("Umbral %d%% · Huida %s · %s", "Threshold %d%% · Escape %s · %s"), limit,
+		escapeOn and "ON" or "OFF", tostring(lastReason)))
+	return table.concat(out, "\n")
+end
+local healthLabel = note(pagePlayer, healthText, 7)
+-- Grabación para la prueba real: 20 s de todas las fuentes y de los textos "N / M" de la pantalla mientras recibes
+-- daño; dice cuáles cambiaron (la vida real es la que baja) y lo copia para pegarlo en el chat.
+local recording = false
+button(pagePlayer, L("Grabar vida 20 s (recibe daño)", "Record health 20 s (take damage)"), function()
+	if recording then return end
+	recording = true
+	log(T("Vida: grabando 20 s; recibe algo de daño ahora", "Health: recording 20 s; take some damage now"), "info", true)
+	local samples, texts, textCount = {}, {}, 0
+	for _ = 1, 40 do
+		local _, snap = healthSnapshot()
+		local sample = {}
+		for _, src in Protection.sources(snap) do sample[src.id] = src.value end
+		local gui = player:FindFirstChild("PlayerGui")
+		for _, d in gui and gui:GetDescendants() or {} do
+			if d:IsA("TextLabel") and d.Visible then
+				local a, b = tostring(d.Text):match("^%s*(%d+%.?%d*)%s*/%s*(%d+%.?%d*)%s*$")
+				if a then
+					local key = "texto " .. d:GetFullName():gsub("^Players%.[^%.]+%.", "")
+					if texts[key] or textCount < 12 then -- como mucho 12 textos distintos
+						if not texts[key] then textCount += 1 end
+						texts[key] = true
+						sample[key] = tonumber(a)
+					end
+				end
+			end
+		end
+		table.insert(samples, sample)
+		task.wait(0.5)
+	end
+	recording = false
+	local lines = { "El Hoyo Hub " .. HUB_VERSION .. " — grabación de vida (20 s)" }
+	for _, st in Protection.summarize(samples) do
+		table.insert(lines, string.format("%s %s: %g -> %g (mín %g, máx %g)", st.changed and "CAMBIÓ" or "igual ", st.id, st.first, st.last, st.min, st.max))
+	end
+	local text = table.concat(lines, "\n")
+	for _, l in lines do log(l) end
+	setConsole(true)
+	if setclipboard then pcall(setclipboard, text) end
+	log(T("Vida: grabación copiada al portapapeles. Pégamela para elegir la fuente correcta.",
+		"Health: recording copied to the clipboard. Paste it to me to pick the right source."), "ok", true)
+end, L("Graba 20 s todas las fuentes de vida mientras recibes daño y dice cuál baja de verdad.",
+	"Records every health source for 20 s while you take damage and tells which one really drops."))
 life.spawnAs("Huida automática", function()
 	local warned = false
+	local lastChar
 	while life.alive do
 		task.wait(0.2)
-		local char, hum, attrs = characterParts()
-		lastReading = Protection.read(hum, attrs)
-		if lastReading.mismatch and not warned then
+		local char, snap = healthSnapshot()
+		if char ~= lastChar then sticky, lastChar = nil, char end -- personaje nuevo: se vuelve a elegir la fuente
+		lastSources = Protection.sources(snap)
+		local chosen, choice = Protection.select(lastSources, config.healthSource or "auto", sticky)
+		if chosen and chosen.id ~= "humanoid" and (config.healthSource or "auto") == "auto" then sticky = chosen.id end
+		lastChosen, lastChoice = chosen, choice
+		lastReading = Protection.fromSource(chosen)
+		hubShared.health = lastReading -- Bounty usa la misma lectura
+		if chosen and chosen.id ~= "humanoid" and not warned then
 			warned = true
-			log(T("Huida: la vida del Humanoid no coincide con el atributo Health del personaje. Si la huida no salta, es probable que el juego use su propia vida (compruébalo en Jugador > Protección).",
-				"Escape: the Humanoid's health doesn't match the character's Health attribute. If the escape never triggers, the game probably uses its own health (check Player > Protection)."), "warn")
+			log(T("Vida: se usa ", "Health: using ") .. chosen.label .. " (" .. choice .. T("). Compruébalo con \"Grabar vida 20 s\".", "). Check it with \"Record health 20 s\"."), "warn", true)
 		end
 		local action, why = Protection.step(state, { enabled = escapeOn, limit = limit, reading = lastReading, character = char,
 			now = os.clock(), alive = life.alive })
@@ -11903,6 +12172,7 @@ life.spawnAs("Huida automática", function()
 		if action == "start" then startEscape() elseif action == "stop" then stopEscape(why) end
 		local comp = comps:get("Huida automática")
 		if comp and escapeOn and comp.state ~= "Error" then comp:set("Waiting", why) end
+		if healthLabel and main.Visible and win.current == pagePlayer.tab then healthLabel.Text = healthText() end
 	end
 end)
 end)()
@@ -13251,7 +13521,8 @@ life.spawnAs(KEY, function()
 	while life.alive do
 		task.wait(0.25)
 		local char = player.Character
-		local reading = Protection.read(char and char:FindFirstChildOfClass("Humanoid"), nil)
+		-- 1.5.3: la misma vida que la Huida (fuente elegida); si la Huida aún no ha leído, el Humanoid
+		local reading = hubShared.health or Protection.read(char and char:FindFirstChildOfClass("Humanoid"), nil)
 		local point = pointVec()
 		local target = enabled and point and NpcFarm.pickTarget(candidates(), point, NpcFarm.pick(NpcFarm.RADII, config.bountyRadius)) or nil
 		-- ceder el turno si otra función lo ha pedido hace nada (Sam, venta…): esta vuelta no se mueve
