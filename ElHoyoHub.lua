@@ -1,4 +1,4 @@
--- El Hoyo Hub v1.5.3-rc1 (build bbbe8f14). ARCHIVO GENERADO por tools/build.js: no editar aquí,
+-- El Hoyo Hub v1.5.4-rc1 (build 62ad6e91). ARCHIVO GENERADO por tools/build.js: no editar aquí,
 -- el código está en src/ (ver ARCHITECTURE.md). Módulos: Lifecycle, Components, Config, Webhook, Tokens, Layout, Search, Notifications, ElHoyoUI, Console, Ownership, Protection, Knowledge, KnowledgeView, CatalogIndex, Profiles, Diagnostics, NpcFarm, Favorites.
 local import -- se asigna después de los módulos: así los módulos la ven (upvalue) y pueden importar otros
 local __modules = {}
@@ -1163,6 +1163,47 @@ function Layout.sidebar(items, height, active)
 		end
 	end
 	return { y = ys, total = y, metrics = m, accordion = accordion, hidden = hidden, maxScroll = 0 }
+end
+
+------------------------------------------------------------------ Cajas de una página (1.5.4)
+-- Prueba real (1.5.3): había que desplazar DENTRO de cajas como Movilidad. Ahora cada caja mide lo que su contenido
+-- (altura natural, nunca recortada) y las cajas se apilan en dos columnas, una debajo de otra con GAP px. Si todo
+-- junto supera el alto de la página, hay UN solo scroll: el de la página entera.
+Layout.PAGE = { w = 600, h = 509, gap = 8, columnGap = 8 }
+
+-- Altura natural de una caja con n filas de control (la misma cuenta que TabMeta:layout: flow.y − spacing + padY +
+-- cabecera 18, con flow.y = padY + n·(fila + spacing)). Solo para pruebas y estimaciones.
+function Layout.boxNatural(n, rowH, spacing, padY)
+	rowH, spacing, padY = rowH or 25, spacing or 8, padY or 8
+	return padY + n * (rowH + spacing) - spacing + padY + 18
+end
+
+-- boxes = { { column = 1 | 2 | "auto", natural = alto, height = "auto" | número fijo } } en orden de creación.
+-- "auto" va a la columna que esté más baja en ese momento (sin huecos grandes). Devuelve
+-- { boxes = { { column, x, y, h } }, columns = { alto1, alto2 }, total, maxScroll }.
+function Layout.stack(boxes, opts)
+	opts = opts or {}
+	local P = Layout.PAGE
+	local gap, view = opts.gap or P.gap, opts.view or P.h
+	local widths = opts.widths or { (P.w - P.columnGap) / 2, (P.w - P.columnGap) / 2 }
+	local cursors, out = { 0, 0 }, {}
+	for i, b in boxes do
+		local col = b.column
+		if col ~= 1 and col ~= 2 then col = cursors[2] < cursors[1] and 2 or 1 end
+		local h = (type(b.height) == "number" and b.height > 0) and b.height or b.natural
+		h = math.max(0, math.floor(h))
+		local x = col == 1 and 0 or math.floor(widths[1] + P.columnGap)
+		out[i] = { column = col, x = x, y = cursors[col], h = h }
+		cursors[col] += h + gap
+	end
+	local total = math.max(0, math.max(cursors[1], cursors[2]) - gap)
+	return { boxes = out, columns = { math.max(0, cursors[1] - gap), math.max(0, cursors[2] - gap) }, total = total,
+		maxScroll = math.max(0, total - view) }
+end
+
+-- Scroll de la página: nuevo desplazamiento tras girar la rueda z (positivo = hacia arriba), siempre en [0, max]
+function Layout.scrollBy(y, z, maxScroll, step)
+	return math.clamp(y - z * (step or 60), 0, math.max(0, maxScroll))
 end
 
 -- Desplazamiento para que una fila (y, alto) se vea entera en una ventana de `height`
@@ -4322,8 +4363,11 @@ function TabMeta:Columns(weights) self.weights = weights end
 
 function TabMeta:Box(o)
 	local win, page = self.win, self.page
-	local box = { name = o.Name, column = o.Column or 1, height = o.Height or "auto", tab = self, spacing = o.RowSpacing or 8, padY = o.PadY or 8 }
-	local holder = Box(page, 0, 0, 100, 100)
+	local column = o.Column or 1
+	-- "auto" (1.5.4): la columna la decide layout() (la más baja); necesita columnas del mismo ancho
+	if column == "auto" and self.weights then column = (#self.boxes % 2) + 1 end
+	local box = { name = o.Name, column = column, height = o.Height or "auto", tab = self, spacing = o.RowSpacing or 8, padY = o.PadY or 8 }
+	local holder = Box(self.canvas or page, 0, 0, 100, 100)
 	local fill = Box(holder, 0, 18, 100, 80, T.Group, 9)
 	local lineFrame = Box(holder, 1, 19, 98, 78, nil, 8)
 	local line = Stroke(lineFrame, T.Border)
@@ -4350,7 +4394,7 @@ function TabMeta:Box(o)
 	local total = 0
 	for i = 1, 2 do total += columns and columns[i] or 1 end
 	local usable = 600 - 8
-	local width = usable * (columns and columns[box.column] or 1) / total
+	local width = usable * (columns and columns[box.column] or 1) / total -- "auto" = 1 de 2 (iguales)
 	box.width = width
 	flow.w, flow.rw = width - 24, width - 24
 	setWH(holder, width, 100)
@@ -4394,47 +4438,49 @@ function TabMeta:Box(o)
 	return box
 end
 
+-- 1.5.4: cada caja mide lo que su contenido (sin recortes ni scroll propio) y se apilan con Library.Layout.stack (la
+-- misma función que prueban los tests). Si no cabe todo, la página entera se desplaza. Se puede volver a llamar si
+-- el contenido cambia (las cajas de debajo bajan).
 function TabMeta:layout()
 	local columns = self.weights
 	local total, widths = 0, {}
 	for i = 1, 2 do total += columns and columns[i] or 1 end
 	local usable = 600 - 8
 	for i = 1, 2 do widths[i] = usable * (columns and columns[i] or 1) / total end
-	local cursors = { 0, 0 }
-	local gridH = 509
-	for _, box in self.boxes do
-		local i = box.column
+	local input = {}
+	for i, box in self.boxes do
 		local natural = box.flow.y - box.spacing + box.padY + 18
-		local remaining = gridH - cursors[i]
-		local h
-		if box.height == "auto" then
-			h = math.min(natural, remaining - 2)
-		elseif box.height > 0 then
-			h = box.height
-		elseif box.height < 0 then
-			h = (remaining - 2) * -box.height
-		else
-			h = remaining - 2
-		end
-		h = math.floor(h)
-		box.boxHeight = h
-		local x = i == 1 and 0 or (widths[1] + 8)
-		setXY(box.holder, math.floor(x), cursors[i])
+		box.natural = natural
+		input[i] = { column = box.column, natural = natural, height = box.height }
+	end
+	local L = Library.Layout.stack(input, { widths = widths, view = Library.Layout.PAGE.h })
+	for i, box in self.boxes do
+		local p = L.boxes[i]
+		local h = p.h
+		box.boxHeight, box.placedColumn = h, p.column
+		setXY(box.holder, p.x, p.y)
 		setWH(box.holder, box.width, h)
 		setWH(box.fill, box.width, h - 18)
 		setWH(box.lineFrame, box.width - 2, h - 20)
 		setWH(box.content, box.width, h - 18)
-		if box.scroller then
+		if box.scroller then -- cajas con scroll propio (API antigua): ya caben enteras, así que no se desplazan
 			local viewH = h - 18
-			setWH(box.inner, box.width, math.max(natural - 18, viewH))
-			box.scroller.max = math.max(0, natural - 18 - viewH)
+			setWH(box.inner, box.width, math.max(box.natural - 18, viewH))
+			box.scroller.max = math.max(0, box.natural - 18 - viewH)
+			box.scroller.y = math.min(box.scroller.y, box.scroller.max)
+			setXY(box.inner, 0, -box.scroller.y)
 			setXY(box.fadeBottom, 0, viewH - math.min(40, viewH * 0.25))
 			setWH(box.fadeTop, box.width, math.min(40, viewH * 0.25))
 			setWH(box.fadeBottom, box.width, math.min(40, viewH * 0.25))
 			box.paintFades()
 		end
-		cursors[i] += h + 8
 	end
+	if self.canvas then
+		setWH(self.canvas, 600, math.max(Library.Layout.PAGE.h, L.total))
+		self.pageScroll.max = L.maxScroll
+		self:scrollTo(self.pageScroll.y)
+	end
+	self.stackInfo = L
 end
 
 -- One line of a framed list: accent border while selected, optional trailing action.
@@ -4763,6 +4809,30 @@ function WindowMeta:Tab(o)
 	tab.pageScope = newScope(self.pagesScope)
 	tab.pageScope.inert = true
 	tab.scope = tab.pageScope
+	-- 1.5.4: las cajas van en un lienzo que se desplaza dentro de la página (UN scroll por página, ninguno por caja).
+	-- La página recorta lo de fuera y su scope (clip) impide clics en lo que no se ve.
+	page.ClipsDescendants = true
+	tab.canvas = Box(page, 0, 0, 600, 509)
+	tab.pageScroll = { y = 0, max = 0 }
+	tab.pageScope.clip = page
+	local scrollBar = Box(page, 600 - 3, 0, 3, 40, Accent, 2)
+	scrollBar.Visible = false
+	tab.scrollBar = scrollBar
+	function tab:scrollTo(y)
+		local sc = tab.pageScroll
+		sc.y = math.clamp(y, 0, sc.max)
+		setXY(tab.canvas, 0, -round(sc.y))
+		scrollBar.Visible = sc.max > 0
+		if sc.max > 0 then
+			local viewH = Library.Layout.PAGE.h
+			local barH = math.max(24, round(viewH * viewH / (viewH + sc.max)))
+			setWH(scrollBar, 3, barH)
+			setXY(scrollBar, 600 - 3, round((viewH - barH) * sc.y / sc.max))
+			scrollBar.BackgroundColor3, scrollBar.BackgroundTransparency = Accent, 0.45
+		end
+	end
+	-- la rueda sobre cualquier parte de la página (las zonas con rueda propia, como el mapa, van antes)
+	Wheel(tab.pageScope, page, function(z) tab:scrollTo(Library.Layout.scrollBy(tab.pageScroll.y, z, tab.pageScroll.max)) end)
 	local entry = { kind = "tab", tab = tab }
 	table.insert(self.tabs, tab)
 	if parentTab then
@@ -8618,10 +8688,10 @@ function import(name) -- declarada antes de los módulos (local import): un mód
 	end
 	return m
 end
-local HUB_BUILD = "bbbe8f14"
+local HUB_BUILD = "62ad6e91"
 -- El Hoyo Hub
 -- Versión: subir HUB_VERSION en cada cambio que se suba a GitHub (así se ve si el executor cargó el nuevo)
-local HUB_VERSION = "1.5.3-rc1" -- Release Candidate: falta pasar las pruebas en el juego (TESTING.md)
+local HUB_VERSION = "1.5.4-rc1" -- Release Candidate: falta pasar las pruebas en el juego (TESTING.md)
 local UI_MIN_VERSION = 5 -- ElHoyoUI.lua con Library.Version menor no vale (cambió algo que el hub necesita)
 -- Todo el hub va dentro de una función protegida: si algo falla al cargar, en vez de no abrirse sin más,
 -- sale una ventana con el error (y se copia al portapapeles) para poder arreglarlo.
@@ -8818,7 +8888,8 @@ local function section(page, label, column)
 	local key = type(label) == "table" and label.en or label
 	local box = page.byName[key]
 	if not box then
-		box = page.tab:Box({ Name = uiText(label), Column = column or ((#page.boxes % 2) + 1), Scrollable = true })
+		-- 1.5.4: sin scroll propio (la caja crece) y, si la sección no fija columna, "auto" = la columna más baja
+		box = page.tab:Box({ Name = uiText(label), Column = column or "auto", Scrollable = false })
 		table.insert(page.boxes, box)
 		page.byName[key] = box
 	end
@@ -8947,29 +9018,10 @@ pagesX.diag = addTab(L("Diagnóstico", "Diagnostics"), "PROJECT_DIAGRAM")
 local pageMisc = addTab("Misc", "SLIDERS_H")
 local pageSettings = addTab(L("Ajustes", "Settings"), "COG")
 
--- Antes de terminar la ventana: si las cajas de una columna no caben en la página, se reparten el alto
--- según lo que ocupa cada una (todas tienen scroll, así que no se pierde nada).
-local fitBoxes
-do
-local PAGE_H = 509 -- alto útil de una página de la librería
-function fitBoxes()
-	for _, page in pages do
-		local columns = { {}, {} }
-		for _, box in page.boxes do table.insert(columns[box.column], box) end
-		for _, list in columns do
-			local available = PAGE_H - 8 * math.max(0, #list - 1)
-			local natural, total = {}, 0
-			for i, box in list do
-				natural[i] = box.flow.y - box.spacing + box.padY + 18
-				total += natural[i]
-			end
-			if total > available then
-				for i, box in list do box.height = math.floor(math.max(80, available * natural[i] / total)) end
-			end
-		end
-	end
-end
-end
+-- Antes (≤ 1.5.3) se repartía aquí el alto de la página entre las cajas, cada una con scroll propio.
+-- 1.5.4: ya no se reparte: cada caja mide lo que su contenido y la página entera se desplaza (un solo scroll,
+-- ElHoyoUI TabMeta:layout + Layout.stack). Se conserva la función (se llama antes de win:Finish()).
+local function fitBoxes() end
 
 ------------------------------------------------------------------ Utilidades del juego
 local function getHRP()
